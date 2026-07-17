@@ -1,11 +1,12 @@
 """SSH Server Connection Implementation."""
 import io
+import logging
 import os
 import re
 import time
 from pathlib import Path
 from typing import List, Optional
-from models.types import ModelInfo
+from llama_launcher.models.types import ModelInfo
 from .connection import IServerConnection
 from .types import (
     ConnectionState,
@@ -20,6 +21,8 @@ try:
     import paramiko
 except ImportError:
     paramiko = None
+
+logger = logging.getLogger(__name__)
 
 
 class SSHServerConnection(IServerConnection):
@@ -103,13 +106,13 @@ class SSHServerConnection(IServerConnection):
             try:
                 self._sftp.close()
             except Exception:
-                pass
+                logger.debug("Suppressed exception", exc_info=True)
             self._sftp = None
         if self._client:
             try:
                 self._client.close()
             except Exception:
-                pass
+                logger.debug("Suppressed exception", exc_info=True)
             self._client = None
         self._state = ConnectionState.DISCONNECTED
 
@@ -190,7 +193,7 @@ class SSHServerConnection(IServerConnection):
                     modified_time=float(item.st_mtime),
                 ))
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
         return entries
 
     def create_directory(self, remote_path: str) -> bool:
@@ -244,7 +247,7 @@ class SSHServerConnection(IServerConnection):
                 if pids:
                     return pids[0]
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
         return None
 
     def get_status(self) -> ServerStatus:
@@ -268,7 +271,7 @@ class SSHServerConnection(IServerConnection):
                     status.ram_mb = float(parts[1]) / 1024.0
                     status.uptime_seconds = float(parts[2])
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
 
         port = self._config.server_port or 8080
         try:
@@ -278,7 +281,7 @@ class SSHServerConnection(IServerConnection):
             if ss_out.strip():
                 status.listening_port = port
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
 
         try:
             nvidia_out = self.execute_and_capture(
@@ -294,7 +297,7 @@ class SSHServerConnection(IServerConnection):
                         status.gpu_memory_mb = float(vals[1])
                         break
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
 
         return status
 
@@ -345,13 +348,13 @@ class SSHServerConnection(IServerConnection):
             try:
                 self._log_channel.close()
             except Exception:
-                pass
+                logger.debug("Suppressed exception", exc_info=True)
             self._log_channel = None
         if self._log_transport:
             try:
                 self._log_transport.close()
             except Exception:
-                pass
+                logger.debug("Suppressed exception", exc_info=True)
             self._log_transport = None
 
     def start_live_log(self, callback) -> bool:
@@ -401,7 +404,7 @@ class SSHServerConnection(IServerConnection):
                                 callback(line)
                         time.sleep(0.1)
                 except Exception:
-                    pass
+                    logger.debug("Suppressed exception", exc_info=True)
 
             import threading
             self._log_thread = threading.Thread(target=_reader, daemon=True)
@@ -430,7 +433,7 @@ class SSHServerConnection(IServerConnection):
                     if info:
                         models.append(info)
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
         return models
 
     def _parse_remote_model(self, file_path: str) -> Optional[ModelInfo]:
@@ -442,12 +445,12 @@ class SSHServerConnection(IServerConnection):
             size_mb = 0.0
 
         file_name = Path(file_path).name
-        suffix = file_path[file_path.rfind(":") + 1:]
-        if suffix.lower() == ".gguf":
+        suffix = Path(file_path).suffix.lower()
+        if suffix == ".gguf":
             file_format = "gguf"
-        elif suffix.lower() == ".bin":
+        elif suffix == ".bin":
             file_format = "bin"
-        elif suffix.lower() == ".safetensors":
+        elif suffix == ".safetensors":
             file_format = "safetensors"
         else:
             file_format = "unknown"

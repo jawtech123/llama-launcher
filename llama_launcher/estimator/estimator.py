@@ -9,6 +9,7 @@ Estimation methodology:
 - Runtime overhead: fixed estimates based on backend type
 - Multi-GPU: supports layer and row split modes across up to 8 GPUs
 """
+import logging
 import os
 import struct
 import platform
@@ -16,8 +17,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from core.config import LlamaConfig
-from gpu.types import GPUInfo
+from llama_launcher.core.config import LlamaConfig
+from llama_launcher.gpu.types import GPUInfo
 from .types import (
     ResourceEstimate,
     VramBreakdown,
@@ -25,6 +26,8 @@ from .types import (
     ModelMetadata,
     GpuBreakdown,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +473,7 @@ class _GgufReader:
                         break
 
         except (Exception, TimeoutError):
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
         finally:
             # Cancel the alarm
             if _timeout_handler is not None:
@@ -579,7 +582,7 @@ class _GgufReader:
             try:
                 return int(kv_data[key])
             except (ValueError, TypeError):
-                pass
+                logger.debug("Suppressed exception", exc_info=True)
         return 0
 
 
@@ -694,7 +697,7 @@ def _get_system_ram_mb() -> float:
                     if line.startswith("MemTotal:"):
                         return int(line.split()[1]) / 1024
     except Exception:
-        pass
+        logger.debug("Suppressed exception", exc_info=True)
     return 16384.0
 
 

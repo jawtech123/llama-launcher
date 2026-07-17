@@ -1,4 +1,5 @@
 """Server Management GUI Components."""
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -14,16 +15,18 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread
 
-from remote.types import (
+from llama_launcher.remote.types import (
     ServerConfig, ServerStatus, FileEntry,
     ConnectionType, AuthMethod, ConnectionState,
     ServerProcessState,
 )
-from remote.manager import ServerManager
-from remote.ssh_key import (
+from llama_launcher.remote.manager import ServerManager
+from llama_launcher.remote.ssh_key import (
     generate_key_pair, install_key_to_server,
     default_key_exists, DEFAULT_KEY_DIR, DEFAULT_KEY_NAME,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class _ServerStateWorker(QThread):
@@ -357,7 +360,7 @@ class SSHKeyInstallDialog(QDialog):
                 return
 
         try:
-            from remote.ssh_key import read_public_key
+            from llama_launcher.remote.ssh_key import read_public_key
             pub_key = read_public_key(key_path)
             self.status_label.setText("Installing key...")
             QApplication.processEvents()
@@ -438,6 +441,7 @@ class ServerListWidget(QWidget):
         worker = _ServerStateWorker(self._manager)
         worker.setParent(self)
         worker.done.connect(self._on_states_done)
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _on_states_done(self, results):
@@ -525,7 +529,34 @@ class ServerStatusWidget(QWidget):
         self._selected_server: Optional[str] = None
         self._status_timer: Optional[QTimer] = None
         self._live_console = None
+        self._command_provider = None
         self._build_ui()
+
+    def set_command_provider(self, provider) -> None:
+        """Set a callable returning the current llama-server command string."""
+        self._command_provider = provider
+
+    def _launch_command(self) -> str:
+        """Command used for Start/Restart: the launcher's current config.
+
+        Falls back to a bare server binary if no provider is wired. The
+        configured server binary replaces argv[0] when it differs from the
+        default "llama-server".
+        """
+        conn = self._manager.get_connection(self._selected_server) if self._manager else None
+        binary = conn.config.llama_server_path if conn else "llama-server"
+
+        if self._command_provider is not None:
+            try:
+                cmd = self._command_provider()
+            except Exception:
+                logger.exception("Command provider failed")
+                return binary
+            if binary and binary != "llama-server":
+                parts = cmd.split(" ", 1)
+                return binary + (" " + parts[1] if len(parts) > 1 else "")
+            return cmd
+        return binary
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -664,6 +695,7 @@ class ServerStatusWidget(QWidget):
         worker = _ServerStatusWorker(self._manager, self._selected_server)
         worker.setParent(self)
         worker.done.connect(self._on_status_done)
+        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def _on_status_done(self, status, error_msg):
@@ -728,10 +760,7 @@ class ServerStatusWidget(QWidget):
         conn = self._manager.get_connection(self._selected_server)
         if not conn:
             return
-        config = conn.config
-        cmd = f"{config.llama_server_path} --model {config.model_directory}"
-        if config.port:
-            cmd += f" --port {config.port}"
+        cmd = self._launch_command()
         if QMessageBox.question(
             self, "Start Server",
             f"Start llama-server on {self._selected_server}?\n\n{cmd}",
@@ -759,8 +788,7 @@ class ServerStatusWidget(QWidget):
         conn = self._manager.get_connection(self._selected_server)
         if not conn:
             return
-        config = conn.config
-        cmd = f"{config.llama_server_path} --model {config.model_directory}"
+        cmd = self._launch_command()
         result = self._manager.restart_server(self._selected_server, cmd)
         if result:
             QMessageBox.information(self, "Restarted",
@@ -786,7 +814,7 @@ class ServerStatusWidget(QWidget):
     def _on_start_console(self):
         if not self._selected_server:
             return
-        from remote.console import LiveConsole
+        from llama_launcher.remote.console import LiveConsole
         if self._live_console:
             self._live_console.stop()
         self._live_console = LiveConsole(self._manager, self._selected_server)
@@ -841,7 +869,7 @@ class ServerStatusWidget(QWidget):
             if entry.is_directory:
                 item.setText(1, "-")
             else:
-                from utils.helpers import format_bytes
+                from llama_launcher.utils.helpers import format_bytes
                 item.setText(1, format_bytes(entry.size_bytes))
             import datetime
             item.setText(2, datetime.datetime.fromtimestamp(
@@ -926,6 +954,10 @@ class ServerManagementWidget(QWidget):
         super().__init__(parent)
         self._manager = manager
         self._build_ui()
+
+    def set_command_provider(self, provider) -> None:
+        """Wire a callable returning the current llama-server command string."""
+        self.status_widget.set_command_provider(provider)
 
     def _build_ui(self):
         layout = QHBoxLayout(self)

@@ -1,6 +1,6 @@
 """Multi-Server Manager."""
 from typing import Dict, List, Optional
-from models.types import ModelInfo
+from llama_launcher.models.types import ModelInfo
 from .types import (
     ServerConfig,
     ServerStatus,

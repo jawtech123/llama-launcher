@@ -1,12 +1,13 @@
 """Local Server Connection Implementation."""
+import logging
 import os
-import re
+import shlex
 import signal
 import subprocess
 from pathlib import Path
 from typing import List, Optional
-from models.types import ModelInfo
-from models.scanner import scan_models as _scan_filesystem
+from llama_launcher.models.types import ModelInfo
+from llama_launcher.models.scanner import scan_models as _scan_filesystem
 from .connection import IServerConnection
 from .types import (
     ConnectionState,
@@ -15,6 +16,8 @@ from .types import (
     ServerProcessState,
     FileEntry,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class LocalServerConnection(IServerConnection):
@@ -62,9 +65,6 @@ class LocalServerConnection(IServerConnection):
     def disconnect(self) -> None:
         # Don't reset to DISCONNECTED — keep cached CONNECTED/ERROR state
         # so subsequent connection_state checks don't spawn subprocesses.
-        if self._log_process:
-            self._log_process.terminate()
-            self._log_process = None
         if self._log_process:
             self._log_process.terminate()
             self._log_process = None
@@ -185,7 +185,7 @@ class LocalServerConnection(IServerConnection):
             if result.returncode == 0 and result.stdout.strip():
                 return [int(p) for p in result.stdout.strip().split("\n")]
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
         return []
 
     def get_status(self) -> ServerStatus:
@@ -213,12 +213,12 @@ class LocalServerConnection(IServerConnection):
                     status.ram_mb = float(parts[1]) / 1024.0
                     status.uptime_seconds = float(parts[2])
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
 
         port = self._config.server_port or 8080
         try:
             ss_out = subprocess.run(
-                f"ss -tlnp | grep :{port}",
+                f"ss -tlnp | grep -E ':{int(port)} '",
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -227,7 +227,7 @@ class LocalServerConnection(IServerConnection):
             if ss_out.returncode == 0:
                 status.listening_port = port
         except Exception:
-            pass
+            logger.debug("ss port check failed", exc_info=True)
 
         try:
             nvidia_out = subprocess.run(
@@ -246,13 +246,13 @@ class LocalServerConnection(IServerConnection):
                         status.gpu_memory_mb = float(vals[1])
                         break
         except Exception:
-            pass
+            logger.debug("Suppressed exception", exc_info=True)
 
         return status
 
     def start_server(self, command: str) -> bool:
         log_path = str(Path(self._config.working_directory).expanduser() / self._config.log_file)
-        start_cmd = f"nohup {command} > {log_path} 2>&1 & echo $!"
+        start_cmd = f"nohup {command} > {shlex.quote(log_path)} 2>&1 & echo $!"
 
         try:
             result = subprocess.run(
@@ -266,8 +266,10 @@ class LocalServerConnection(IServerConnection):
             if result.returncode == 0 and result.stdout.strip():
                 self._stored_pid = int(result.stdout.strip())
                 return True
+            logger.warning("start_server failed (rc=%s): %s", result.returncode, result.stderr.strip())
             return False
         except Exception:
+            logger.exception("start_server raised")
             return False
 
     def stop_server(self) -> bool:
@@ -296,7 +298,7 @@ class LocalServerConnection(IServerConnection):
         log_path = str(Path(self._config.working_directory).expanduser() / self._config.log_file)
         try:
             result = subprocess.run(
-                f"tail -n {lines} {log_path}",
+                f"tail -n {int(lines)} {shlex.quote(log_path)}",
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -304,6 +306,7 @@ class LocalServerConnection(IServerConnection):
             )
             return result.stdout
         except Exception:
+            logger.debug("tail_log failed", exc_info=True)
             return ""
 
     def scan_model_directory(self, directory: str) -> List[ModelInfo]:

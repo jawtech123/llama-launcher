@@ -1,9 +1,12 @@
 """GPU Auto-Detection Module."""
+import logging
 import subprocess
 import sys
 import re
 from typing import Optional
 from .types import GPUInfo
+
+logger = logging.getLogger(__name__)
 
 
 def detect_gpu() -> GPUInfo:
@@ -63,14 +66,14 @@ def _detect_cuda() -> Optional[GPUInfo]:
                         vram_str = parts[1].replace('MiB', '').strip()
                         vram_mb = int(vram_str)
                     except ValueError:
-                        pass
+                        logger.debug("Suppressed exception", exc_info=True)
 
                 if len(parts) >= 3:
                     try:
                         free_str = parts[2].replace('MiB', '').strip()
                         available_vram_mb = int(free_str)
                     except ValueError:
-                        pass
+                        logger.debug("Suppressed exception", exc_info=True)
 
                 if len(parts) >= 4:
                     driver_version = parts[3].strip()
@@ -100,7 +103,7 @@ def _detect_cuda() -> Optional[GPUInfo]:
                 gpu_infos=gpu_infos,
             )
     except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+        logger.debug("Suppressed exception", exc_info=True)
     return None
 
 
@@ -137,7 +140,7 @@ def _detect_metal() -> Optional[GPUInfo]:
                         vram_mb = mem_bytes // (1024 * 1024)
                         available_vram_mb = int(vram_mb * 0.6)
                 except Exception:
-                    pass
+                    logger.debug("Suppressed exception", exc_info=True)
 
                 return GPUInfo(
                     backend="metal",
@@ -147,7 +150,7 @@ def _detect_metal() -> Optional[GPUInfo]:
                     supported=True,
                 )
     except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+        logger.debug("Suppressed exception", exc_info=True)
     return None
 
 
@@ -191,14 +194,14 @@ def _detect_vulkan() -> Optional[GPUInfo]:
                         try:
                             vram_mb = int(parts[0].replace('MiB', '').strip())
                         except ValueError:
-                            pass
+                            logger.debug("Suppressed exception", exc_info=True)
                     if len(parts) >= 2:
                         try:
                             available_vram_mb = int(parts[1].replace('MiB', '').strip())
                         except ValueError:
-                            pass
+                            logger.debug("Suppressed exception", exc_info=True)
             except Exception:
-                pass
+                logger.debug("Suppressed exception", exc_info=True)
 
             return GPUInfo(
                 backend="vulkan",
@@ -209,7 +212,7 @@ def _detect_vulkan() -> Optional[GPUInfo]:
                 gpu_count=max(gpu_count, 1),
             )
     except (subprocess.SubprocessError, FileNotFoundError):
-        pass
+        logger.debug("Suppressed exception", exc_info=True)
 
     # Fallback: check for Vulkan device node
     try:
@@ -224,6 +227,6 @@ def _detect_vulkan() -> Optional[GPUInfo]:
                     supported=True,
                 )
     except Exception:
-        pass
+        logger.debug("Suppressed exception", exc_info=True)
 
     return None

@@ -1,37 +1,39 @@
 """PySide6 GUI Main Window."""
-import sys
-import subprocess
+import dataclasses
 import json
+import logging
 import shlex
+import subprocess
+import sys
 from pathlib import Path
 
-try:
-    from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
-                                   QHBoxLayout, QTabWidget, QPushButton, QTextEdit,
-                                   QLineEdit, QLabel, QComboBox, QFileDialog, QGroupBox,
-                                   QListWidget, QListWidgetItem, QSpinBox, QCheckBox,
-                                   QDialog, QFormLayout, QInputDialog, QMessageBox,
-                                   QScrollArea, QDoubleSpinBox, QToolButton, QStyle, QGridLayout)
-    from PySide6.QtGui import QFont
-    from PySide6.QtCore import Qt, QProcess, QTimer, Slot, QThread, Signal
-except ImportError:
-    print("PySide6 not installed. Install with: pip install PySide6")
-    sys.exit(1)
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                               QHBoxLayout, QTabWidget, QPushButton, QTextEdit,
+                               QLineEdit, QLabel, QComboBox, QFileDialog, QGroupBox,
+                               QListWidget, QListWidgetItem, QSpinBox, QCheckBox,
+                               QDialog, QFormLayout, QInputDialog, QMessageBox,
+                               QScrollArea, QDoubleSpinBox, QToolButton, QStyle, QGridLayout)
+from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QProcess, QTimer, Slot, QThread, Signal
 
-from core.config import LlamaConfig
-from core.validator import validate_config
-from core.builder import build_command
-from core.presets import PresetManager
-from gpu.detector import detect_gpu
-from gpu.types import GPUInfo
-from models.scanner import scan_models
-from models.storage import load_models as load_cached_models, save_models as save_cached_models
-from remote.manager import ServerManager
-from remote.types import ServerConfig, ConnectionType, ConnectionState
-from gui.server_management import ServerManagementWidget
-from gui.resource_usage_panel import ResourceUsagePanel
-from estimator import ResourceEstimator
-from utils.helpers import get_file_size_mb
+from llama_launcher.core.config import LlamaConfig
+from llama_launcher.core.validator import validate_config
+from llama_launcher.core.builder import build_command
+from llama_launcher.core.parser import parse_launch_command as _parse_launch_command
+from llama_launcher.core.presets import PresetManager
+from llama_launcher.gpu.detector import detect_gpu
+from llama_launcher.gpu.types import GPUInfo
+from llama_launcher.models.scanner import scan_models
+from llama_launcher.models.storage import load_models as load_cached_models, save_models as save_cached_models
+from llama_launcher.remote.manager import ServerManager
+from llama_launcher.remote.types import ServerConfig, ConnectionType, ConnectionState
+from llama_launcher.gui.server_management import ServerManagementWidget
+from llama_launcher.gui.resource_usage_panel import ResourceUsagePanel
+from llama_launcher.estimator import ResourceEstimator
+from llama_launcher.utils.helpers import get_file_size_mb
+from llama_launcher.utils.paths import config_file
+
+logger = logging.getLogger(__name__)
 
 
 class _ModelScanWorker(QThread):
@@ -55,7 +57,7 @@ class _ModelScanWorker(QThread):
                 try:
                     results.extend(self.manager.scan_server_models(self.server_name, dir_path))
                 except Exception:
-                    pass
+                    logger.debug("Model scan failed for %s on %s", dir_path, self.server_name, exc_info=True)
         self.scan_done.emit(self.server_name, results)
 
 
@@ -138,7 +140,7 @@ class _GpuDetectWorker(QThread):
                                 f"Power: {parts[7]}W / {parts[8]}W\n"
                             )
                 except Exception:
-                    pass
+                    logger.debug("nvidia-smi extended info unavailable", exc_info=True)
         except Exception as e:
             info_text = f"GPU detection failed: {e}\n{traceback.format_exc()}"
         self.detect_done.emit(info_text, gpu_info_dict)
@@ -166,7 +168,7 @@ class _GpuStatsWorker(QThread):
                     self.stats_done.emit(line)
                     return
         except Exception:
-            pass
+            logger.debug("nvidia-smi stats poll failed", exc_info=True)
         self.stats_done.emit("")
 
 
@@ -230,14 +232,12 @@ class BinaryContextSpinBox(QSpinBox):
 
 class LlamaLauncherGUI(QMainWindow):
     """Main GUI Window for llama-launcher."""
-    
-    FOLDERS_FILE = Path.home() / ".llama_launcher_folders.json"
-    
+
     def __init__(self):
         super().__init__()
         self.config = LlamaConfig(model_path="", context_size=4096, gpu_layers=-1,
                                   threads=0, port=8080, host="127.0.0.1", backend="auto",
-                                  use_mmap=True, kv_cache_type="f16", batch_size=512)
+                                  use_mmap=True, kv_cache_type="f16", batch_size=2048)
         self.models = []
         self.server_manager = ServerManager()
         self.gpu_info: GPUInfo = GPUInfo(backend="cpu", device_name="Detecting...")
@@ -305,18 +305,37 @@ class LlamaLauncherGUI(QMainWindow):
             QTimer.singleShot(100, lambda: self.load_preset(presets[0]))
 
     def closeEvent(self, event):
-        """Clean up server connections on exit."""
+        """Clean up timers, workers, and server connections on exit."""
+        for timer_name in ('_preset_style_timer', '_gpu_stats_timer'):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
         self.server_manager.disconnect_all()
-        if hasattr(self, '_preset_style_timer'):
-            self._preset_style_timer.stop()
-        if hasattr(self, '_gpu_stats_timer'):
-            self._gpu_stats_timer.stop()
-        for w in getattr(self, '_active_workers', []):
+        for w in list(self._active_workers):
             if w.isRunning():
                 w.wait(1000)
-        if hasattr(self, '_scan_worker') and self._scan_worker.isRunning():
-            self._scan_worker.wait(1000)
+        scan_worker = getattr(self, '_scan_worker', None)
+        if scan_worker is not None and scan_worker.isRunning():
+            scan_worker.wait(1000)
         event.accept()
+
+    def _start_worker(self, worker: QThread) -> None:
+        """Start a worker thread with proper lifecycle management.
+
+        Workers delete themselves on finish and are pruned from the tracking
+        list, so ``_active_workers`` only ever holds running threads.
+        """
+        worker.setParent(self)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(lambda: self._prune_worker(worker))
+        self._active_workers.append(worker)
+        worker.start()
+
+    def _prune_worker(self, worker: QThread) -> None:
+        try:
+            self._active_workers.remove(worker)
+        except ValueError:
+            logger.debug("Suppressed exception", exc_info=True)
 
     def _create_info_label(self, text, tooltip):
         """Create a label with an information icon."""
@@ -411,7 +430,7 @@ class LlamaLauncherGUI(QMainWindow):
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
         self.refresh_gpu_btn = QPushButton("Refresh GPU Info")
-        self.refresh_gpu_btn.clicked.connect(self._detect_gpu_async)
+        self.refresh_gpu_btn.clicked.connect(lambda: self._detect_gpu_async(force=True))
         btn_layout.addWidget(self.refresh_gpu_btn)
         
         layout.addLayout(btn_layout)
@@ -527,7 +546,7 @@ class LlamaLauncherGUI(QMainWindow):
         # Batch Size
         self.batch_spin = QSpinBox()
         self.batch_spin.setRange(32, 4096)
-        self.batch_spin.setValue(512)
+        self.batch_spin.setValue(2048)
         self.batch_spin.setToolTip("Physical maximum batch size for internal batching operations. Default: 512.")
         self.batch_spin.setMinimumWidth(120)
         config_form.addRow(self._create_info_label("Batch Size:", "Physical max batch size."), self.batch_spin)
@@ -2067,22 +2086,18 @@ class LlamaLauncherGUI(QMainWindow):
         self.save_folders()
         
     def load_folders(self):
-        """Load saved folders from file."""
-        if self.FOLDERS_FILE.exists():
-            try:
-                with open(self.FOLDERS_FILE, 'r') as f:
-                    folders = json.load(f)
-                for folder in folders:
-                    # Check if folder already exists in list
-                    exists = False
-                    for i in range(self.folders_list.count()):
-                        if self.folders_list.item(i).text() == folder:
-                            exists = True
-                            break
-                    if not exists:
-                        self.folders_list.addItem(folder)
-            except Exception:
-                pass
+        """Load saved folders from the config directory."""
+        folders_file = config_file("folders.json")
+        if not folders_file.exists():
+            return
+        try:
+            with open(folders_file, 'r') as f:
+                folders = json.load(f)
+            for folder in folders:
+                if not self.folders_list.findItems(folder, Qt.MatchExactly):
+                    self.folders_list.addItem(folder)
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("Could not load folders file %s: %s", folders_file, e)
 
     def _post_init_scan(self):
         """Run model scan after window is shown (non-blocking)."""
@@ -2090,12 +2105,15 @@ class LlamaLauncherGUI(QMainWindow):
             self.scan_models()
                 
     def save_folders(self):
-        """Save folders to file."""
+        """Save folders to the config directory."""
         folders = []
         for i in range(self.folders_list.count()):
             folders.append(self.folders_list.item(i).text())
-        with open(self.FOLDERS_FILE, 'w') as f:
-            json.dump(folders, f, indent=2)
+        try:
+            with open(config_file("folders.json"), 'w') as f:
+                json.dump(folders, f, indent=2)
+        except OSError:
+            logger.exception("Could not save folders file")
             
     def browse_model(self):
         """Browse for model file."""
@@ -2136,12 +2154,16 @@ class LlamaLauncherGUI(QMainWindow):
             return
 
         is_local_only = not server_name
+        existing = getattr(self, '_scan_worker', None)
+        if existing is not None and existing.isRunning():
+            logger.debug("Model scan already in progress; ignoring request")
+            return
         self._scan_worker = _ModelScanWorker(
             self.server_manager, server_name, dirs_to_scan, is_local_only
         )
-        self._scan_worker.setParent(self)
         self._scan_worker.scan_done.connect(self._on_scan_done)
-        self._scan_worker.start()
+        self._scan_worker.finished.connect(lambda: setattr(self, '_scan_worker', None))
+        self._start_worker(self._scan_worker)
 
     def _on_scan_done(self, scan_server_name, models):
         server_name = self._get_browser_server()
@@ -2251,10 +2273,8 @@ class LlamaLauncherGUI(QMainWindow):
         preset_names = [self.preset_combo.itemText(i) for i in range(self.preset_combo.count())]
         server_names = self.server_manager.get_all_names()
         worker = _PresetStyleWorker(preset_names, server_names, self.server_manager)
-        worker.setParent(self)
         worker.style_done.connect(self._on_preset_style_done)
-        self._active_workers.append(worker)
-        worker.start()
+        self._start_worker(worker)
 
     def _on_preset_style_done(self, results):
         offline_set = {name for name, offline in results if offline}
@@ -2295,10 +2315,6 @@ class LlamaLauncherGUI(QMainWindow):
             self.model_list.addItem(list_item)
             self.model_combo.addItem(model.file_path, model.file_path)
 
-    def detect_gpu_info(self):
-        """Detect and display GPU information."""
-        self._detect_gpu_worker()
-
     def _deferred_init(self):
         """Run blocking init tasks after UI is shown."""
         self.scan_models()
@@ -2307,25 +2323,24 @@ class LlamaLauncherGUI(QMainWindow):
         self._preset_style_timer.start(15000)
         QTimer.singleShot(300, self._detect_gpu_async)
 
-    def auto_detect_gpu(self):
-        """Auto-detect GPU info non-blocking."""
-        QTimer.singleShot(100, self._detect_gpu_async)
+    def _detect_gpu_async(self, force: bool = False):
+        """Run GPU detection in a background thread.
 
-    def _detect_gpu_async(self):
-        """Run GPU detection in a background thread (skip if already detected)."""
-        if self.gpu_info.backend != "cpu" or self.gpu_info.device_name != "Detecting...":
+        Args:
+            force: Re-detect even if detection already succeeded (used by the
+                "Refresh GPU Info" button).
+        """
+        if not force and (self.gpu_info.backend != "cpu" or self.gpu_info.device_name != "Detecting..."):
             return
         worker = _GpuDetectWorker()
-        worker.setParent(self)
         worker.detect_done.connect(self._on_gpu_detect_done)
-        self._active_workers.append(worker)
-        worker.start()
+        self._start_worker(worker)
 
     def _on_gpu_detect_done(self, info_text, gpu_info_dict):
         self.gpu_info_label.setText(info_text)
         if gpu_info_dict:
             self.gpu_info = GPUInfo(**gpu_info_dict)
-            if gpu_info_dict.get('backend') == 'cuda':
+            if gpu_info_dict.get('backend') == 'cuda' and getattr(self, '_gpu_stats_timer', None) is None:
                 self._gpu_stats_timer = QTimer(self)
                 self._gpu_stats_timer.timeout.connect(self._gpu_poll_stats)
                 self._gpu_stats_timer.start(30000)
@@ -2333,10 +2348,8 @@ class LlamaLauncherGUI(QMainWindow):
 
     def _gpu_poll_stats(self):
         worker = _GpuStatsWorker()
-        worker.setParent(self)
         worker.stats_done.connect(self._on_gpu_stats_done)
-        self._active_workers.append(worker)
-        worker.start()
+        self._start_worker(worker)
 
     def _on_gpu_stats_done(self, stats_text):
         if not stats_text:
@@ -2348,48 +2361,6 @@ class LlamaLauncherGUI(QMainWindow):
         else:
             existing = existing + stats_text
         self.gpu_info_label.setText(existing)
-
-    def _detect_gpu_worker(self):
-        """Detect GPU and update UI."""
-        gpu_info = detect_gpu()
-        self.gpu_info = gpu_info
-        gi = gpu_info
-        info_text = (
-            f"Backend: {gi.backend}\n"
-            f"Device: {gi.device_name or 'Unknown'}\n"
-            f"VRAM: {gi.vram_mb} MB\n"
-        )
-        if gi.available_vram_mb > 0 and gi.available_vram_mb != gi.vram_mb:
-            info_text += f"Available VRAM: {gi.available_vram_mb} MB\n"
-        if gi.driver_version:
-            info_text += f"Driver: {gi.driver_version}\n"
-        info_text += f"Supported: {gi.supported}"
-
-        # Extended nvidia-smi info
-        if gi.backend == "cuda":
-            try:
-                nvidia_sm = subprocess.run(
-                    ['nvidia-smi', '--query-gpu=driver_version,name,temperature.gpu,clocks.gr,clocks.mem,utilization.gpu,utilization.memory,power.draw,power.limit',
-                     '--format=csv,noheader,nounits'],
-                    capture_output=True, text=True, timeout=2
-                )
-                if nvidia_sm.returncode == 0 and nvidia_sm.stdout.strip():
-                    parts = [p.strip() for p in nvidia_sm.stdout.strip().split(',')[0].replace('\n', ',').split(',')]
-                    if len(parts) >= 9:
-                        info_text += (
-                            f"\n--- NVIDIA-SMI Info ---\n"
-                            f"Driver Version: {parts[0]}\n"
-                            f"Device: {parts[1]}\n"
-                            f"Temperature: {parts[2]}°C\n"
-                            f"GPU Clock: {parts[3]} MHz | Memory Clock: {parts[4]} MHz\n"
-                            f"GPU Util: {parts[5]}% | Mem Util: {parts[6]}%\n"
-                            f"Power: {parts[7]}W / {parts[8]}W\n"
-                        )
-            except Exception:
-                pass
-
-        self.gpu_info_label.setText(info_text)
-        self._update_resource_estimate()
 
     def load_preset(self, preset_name):
         """Load a preset configuration."""
@@ -3011,10 +2982,8 @@ class LlamaLauncherGUI(QMainWindow):
                 self.config.context_size < estimate.training_context_length):
                 self._set_ctx_from_model(estimate.training_context_length)
                 self._ctx_auto_set = False
-        except Exception as e:
-            import sys, traceback
-            print(f"ERROR _update_resource_estimate: {e}", file=sys.stderr)
-            traceback.print_exc(file=sys.stderr)
+        except Exception:
+            logger.exception("Failed to update resource estimate")
             
     def launch_server(self):
         """Launch llama-server."""
@@ -3041,7 +3010,6 @@ class LlamaLauncherGUI(QMainWindow):
             self.server_process.finished.connect(self.on_server_finished)
             
             # Parse command for QProcess
-            import shlex
             args = shlex.split(cmd)
             if not args:
                 raise Exception("Empty command")
@@ -3648,13 +3616,15 @@ class LlamaLauncherGUI(QMainWindow):
             self.config.ui_mcp_proxy = self.adv_ui_mcp_proxy_check.isChecked()
 
     def on_context_editing_finished(self):
-        """Handle context size editing finished and round to binary."""
+        """Snap a hand-typed context size to the nearest binary size.
+
+        setValue() emits valueChanged, which propagates to the advanced tab and
+        the command preview via the existing signal connections.
+        """
         value = self.ctx_spin.value()
         rounded = self.ctx_spin.round_to_binary_context(value)
         if rounded != value:
-            self.ctx_spin.blockSignals(True)
             self.ctx_spin.setValue(rounded)
-            self.ctx_spin.blockSignals(False)
 
     def _sync_ctx_to_adv(self, value):
         """Sync basic context spin to advanced context spin."""
@@ -3727,333 +3697,11 @@ class LlamaLauncherGUI(QMainWindow):
         QMessageBox.information(self, "Success", f"Preset '{preset_name}' saved successfully.")
 
     def parse_launch_command(self, command_str):
-        """Parse a llama-server command string and return a dict of parameters and unrecognized flags."""
-        try:
-            args = shlex.split(command_str)
-        except ValueError:
-            args = command_str.split()
-        
-        params = {}
-        unrecognized_flags = []
-        i = 0
-        
-        flag_map = {
-            # Model paths
-            '--model': 'model_path',
-            '-m': 'model_path',
-            '--mmproj': 'mmproj_model_path',
-            '--mmproj-model': 'mmproj_model_path',
-            '--draft-model': 'draft_model_path',
-            '--draft': 'draft_model_path',
-            # Common params - threads and batching
-            '--threads': 'threads',
-            '-t': 'threads',
-            '--threads-batch': 'threads_batch',
-            '-tb': 'threads_batch',
-            '--cpu-mask': 'cpu_mask',
-            '--cpu-range': 'cpu_range',
-            '--cpu-strict': 'cpu_strict',
-            '--prio': 'prio',
-            '--poll': 'poll',
-            '--cpu-mask-batch': 'cpu_mask_batch',
-            '--cpu-range-batch': 'cpu_range_batch',
-            '--cpu-strict-batch': 'cpu_strict_batch',
-            '--prio-batch': 'prio_batch',
-            '--poll-batch': 'poll_batch',
-            # Common params - context and predict
-            '--ctx-size': 'context_size',
-            '-c': 'context_size',
-            '--predict': 'predict',
-            '-n': 'predict',
-            '--n-predict': 'predict',
-            '--batch-size': 'batch_size',
-            '-b': 'batch_size',
-            '--ubatch-size': 'ubatch_size',
-            '-ub': 'ubatch_size',
-            '--keep': 'keep',
-            '--swa-full': 'swa_full',
-            '--no-swa-full': 'swa_full',
-            '--flash-attn': 'flash_attn',
-            '-fa': 'flash_attn',
-            '--perf': 'perf',
-            '--no-perf': 'perf',
-            '--escape': 'escape',
-            '--no-escape': 'escape',
-            # Common params - RoPE and YaRN
-            '--rope-scaling': 'rope_scaling',
-            '--rope-scale': 'rope_scale',
-            '--rope-freq-base': 'rope_freq_base',
-            '--rope-freq-scale': 'rope_freq_scale',
-            '--yarn-orig-ctx': 'yarn_orig_ctx',
-            '--yarn-ext-factor': 'yarn_ext_factor',
-            '--yarn-attn-factor': 'yarn_attn_factor',
-            '--yarn-beta-slow': 'yarn_beta_slow',
-            '--yarn-beta-fast': 'yarn_beta_fast',
-            # Common params - cache and memory
-            '--kv-offload': 'kv_offload',
-            '--no-kv-offload': 'kv_offload',
-            '--repack': 'repack',
-            '--no-repack': 'repack',
-            '--no-host': 'no_host',
-            '--host': 'no_host',
-            '--cache-type-k': 'cache_type_k',
-            '-ctk': 'cache_type_k',
-            '--cache-type-v': 'cache_type_v',
-            '-ctv': 'cache_type_v',
-            '--kv-cache-type': 'kv_cache_type',
-            '--defrag-thold': 'defrag_thold',
-            '--mlock': 'mlock',
-            '--no-mlock': 'mlock',
-            '--mmap': 'use_mmap',
-            '--no-mmap': 'use_mmap',
-            '--direct-io': 'direct_io',
-            '--no-direct-io': 'direct_io',
-            # Common params - GPU and NUMA
-            '--numa': 'numa',
-            '--device': 'device',
-            '--override-tensor': 'override_tensor',
-            '--cpu-moe': 'cpu_moe',
-            '--no-cpu-moe': 'cpu_moe',
-            '--n-cpu-moe': 'n_cpu_moe',
-            '--gpu-layers': 'gpu_layers',
-            '-ngl': 'gpu_layers',
-            '--n-gpu-layers': 'gpu_layers',
-            '--split-mode': 'split_mode',
-            '-sm': 'split_mode',
-            '--tensor-split': 'tensor_split',
-            '-ts': 'tensor_split',
-            '--main-gpu': 'main_gpu',
-            '-mg': 'main_gpu',
-            '--fit': 'fit',
-            '--fit-target': 'fit_target',
-            '--fit-ctx': 'fit_ctx',
-            '--check-tensors': 'check_tensors',
-            '--no-check-tensors': 'check_tensors',
-            '--override-kv': 'override_kv',
-            '--op-offload': 'op_offload',
-            # LoRA and control vectors
-            '--lora': 'lora',
-            '--lora-scaled': 'lora_scaled',
-            '--control-vector': 'control_vector',
-            '--control-vector-scaled': 'control_vector_scaled',
-            '--control-vector-layer-range': 'control_vector_layer_range',
-            # Model sources
-            '--model-url': 'model_url',
-            '--docker-repo': 'docker_repo',
-            '--hf-repo': 'hf_repo',
-            '--hf-file': 'hf_file',
-            '--hf-repo-v': 'hf_repo_v',
-            '--hf-file-v': 'hf_file_v',
-            '--hf-token': 'hf_token',
-            # Logging
-            '--log-disable': 'log_disable',
-            '--log-file': 'log_file',
-            '--log-colors': 'log_colors',
-            '--verbose': 'verbose',
-            '--offline': 'offline',
-            '--verbosity': 'verbosity',
-            '--log-prefix': 'log_prefix',
-            '--log-timestamps': 'log_timestamps',
-            # Spec draft cache types
-            '--spec-draft-type-k': 'spec_draft_type_k',
-            '--spec-draft-type-v': 'spec_draft_type_v',
-            # Sampling params
-            '--samplers': 'samplers',
-            '--seed': 'seed',
-            '--sampler-seq': 'sampler_seq',
-            '--ignore-eos': 'ignore_eos',
-            '--no-ignore-eos': 'ignore_eos',
-            '--temp': 'temp',
-            '--temperature': 'temp',
-            '--top-k': 'top_k',
-            '--top-p': 'top_p',
-            '--min-p': 'min_p',
-            '--top-n-sigma': 'top_n_sigma',
-            '--xtc-probability': 'xtc_probability',
-            '--xtc-threshold': 'xtc_threshold',
-            '--typical-p': 'typical_p',
-            '--repeat-last-n': 'repeat_last_n',
-            '--repeat-penalty': 'repeat_penalty',
-            '--presence-penalty': 'presence_penalty',
-            '--frequency-penalty': 'frequency_penalty',
-            '--dry-multiplier': 'dry_multiplier',
-            '--dry-base': 'dry_base',
-            '--dry-allowed-length': 'dry_allowed_length',
-            '--dry-penalty-last-n': 'dry_penalty_last_n',
-            '--dry-sequence-breaker': 'dry_sequence_breaker',
-            '--adaptive-target': 'adaptive_target',
-            '--adaptive-decay': 'adaptive_decay',
-            '--dynatemp-range': 'dynatemp_range',
-            '--dynatemp-exp': 'dynatemp_exp',
-            '--mirostat': 'mirostat',
-            '--mirostat-lr': 'mirostat_lr',
-            '--mirostat-ent': 'mirostat_ent',
-            '--logit-bias': 'logit_bias',
-            '--grammar': 'grammar',
-            '--grammar-file': 'grammar_file',
-            '--json-schema': 'json_schema',
-            '--json-schema-file': 'json_schema_file',
-            '--backend-sampling': 'backend_sampling',
-            # Speculative params
-            '--spec-draft-hf': 'spec_draft_hf',
-            '--spec-draft-threads': 'spec_draft_threads',
-            '--spec-draft-threads-batch': 'spec_draft_threads_batch',
-            '--spec-draft-cpu-mask': 'spec_draft_cpu_mask',
-            '--spec-draft-cpu-range': 'spec_draft_cpu_range',
-            '--spec-draft-cpu-strict': 'spec_draft_cpu_strict',
-            '--spec-draft-prio': 'spec_draft_prio',
-            '--spec-draft-poll': 'spec_draft_poll',
-            '--spec-draft-cpu-mask-batch': 'spec_draft_cpu_mask_batch',
-            '--spec-draft-cpu-strict-batch': 'spec_draft_cpu_strict_batch',
-            '--spec-draft-prio-batch': 'spec_draft_prio_batch',
-            '--spec-draft-poll-batch': 'spec_draft_poll_batch',
-            '--spec-draft-override-tensor': 'spec_draft_override_tensor',
-            '--spec-draft-cpu-moe': 'spec_draft_cpu_moe',
-            '--spec-draft-n-cpu-moe': 'spec_draft_n_cpu_moe',
-            '--spec-draft-n-max': 'draft_n_max',
-            '--spec-draft-n-min': 'draft_n_min',
-            '--draft-n-max': 'draft_n_max',
-            '--draft-n-min': 'draft_n_min',
-            '--spec-draft-p-split': 'spec_draft_p_split',
-            '--spec-draft-p-min': 'spec_draft_p_min',
-            '--spec-draft-backend-sampling': 'spec_draft_backend_sampling',
-            '--spec-draft-device': 'spec_draft_device',
-            '--spec-draft-ngl': 'spec_draft_ngl',
-            '--spec-draft-model': 'spec_draft_model',
-            '--spec-type': 'spec_type',
-            '--spec-ngram-mod-n-min': 'spec_ngram_mod_n_min',
-            '--spec-ngram-mod-n-max': 'spec_ngram_mod_n_max',
-            '--spec-ngram-mod-n-match': 'spec_ngram_mod_n_match',
-            '--spec-ngram-simple-size-n': 'spec_ngram_simple_size_n',
-            '--spec-ngram-simple-size-m': 'spec_ngram_simple_size_m',
-            '--spec-ngram-simple-min-hits': 'spec_ngram_simple_min_hits',
-            '--spec-ngram-map-k-size-n': 'spec_ngram_map_k_size_n',
-            '--spec-ngram-map-k-size-m': 'spec_ngram_map_k_size_m',
-            '--spec-ngram-map-k-min-hits': 'spec_ngram_map_k_min_hits',
-            '--spec-ngram-map-k4v-size-n': 'spec_ngram_map_k4v_size_n',
-            '--spec-ngram-map-k4v-size-m': 'spec_ngram_map_k4v_size_m',
-            '--spec-ngram-map-k4v-min-hits': 'spec_ngram_map_k4v_min_hits',
-            # Cache and context
-            '--lookup-cache-static': 'lookup_cache_static',
-            '--lookup-cache-dynamic': 'lookup_cache_dynamic',
-            '--ctx-checkpoints': 'ctx_checkpoints',
-            '--checkpoint-min-step': 'checkpoint_min_step',
-            '--cache-ram': 'cache_ram',
-            '--kv-unified': 'kv_unified',
-            '--no-kv-unified': 'kv_unified',
-            '--cache-idle-slots': 'cache_idle_slots',
-            '--context-shift': 'context_shift',
-            # Generation and server
-            '--reverse-prompt': 'reverse_prompt',
-            '--special': 'special',
-            '--warmup': 'warmup',
-            '--spm-infill': 'spm_infill',
-            '--pooling': 'pooling',
-            '--parallel': 'parallel',
-            '--cont-batching': 'cont_batching',
-            '--no-cont-batching': 'cont_batching',
-            # Multimodal
-            '--mmproj': 'mmproj_model_path',
-            '--mmproj-url': 'mmproj_url',
-            '--mmproj-auto': 'mmproj_auto',
-            '--mmproj-offload': 'mmproj_offload',
-            '--image-min-tokens': 'image_min_tokens',
-            '--image-max-tokens': 'image_max_tokens',
-            '--mtmd-batch-max-tokens': 'mtmd_batch_max_tokens',
-            # Server and UI
-            '--alias': 'alias',
-            '--tags': 'tags',
-            '--embd-normalize': 'embd_normalize',
-            '--port': 'port',
-            '-p': 'port',
-            '--host': 'host',
-            '-h': 'host',
-            '--reuse-port': 'reuse_port',
-            '--path': 'path',
-            '--api-prefix': 'api_prefix',
-            '--ui-config': 'ui_config',
-            '--ui-config-file': 'ui_config_file',
-            '--ui-mcp-proxy': 'ui_mcp_proxy',
-            '--tools': 'tools',
-            '--agent': 'agent',
-            '--ui': 'ui',
-            '--no-ui': 'ui',
-            '--embeddings': 'embeddings',
-            '--reranking': 'reranking',
-            # Backend and jinja
-            '--backend': 'backend',
-            '--jinja': 'jinja',
-            '--no-jinja': 'jinja',
-        }
-        
-        while i < len(args):
-            arg = args[i]
-            
-            # Handle --flag=value or -f=value format
-            if '=' in arg and (arg.startswith('--') or arg.startswith('-')):
-                key, value = arg.split('=', 1)
-                config_key = flag_map.get(key)
-                if config_key:
-                    if config_key in ['context_size', 'gpu_layers', 'threads', 'threads_batch', 'port', 'batch_size', 'ubatch_size', 'top_k', 'repeat_last_n', 'rope_scale', 'rope_freq_base', 'predict', 'keep', 'defrag_thold', 'yarn_orig_ctx', 'fit_ctx']:
-                        try:
-                            params[config_key] = int(value)
-                        except ValueError:
-                            params[config_key] = value
-                    elif config_key in ['temp', 'top_p', 'min_p', 'repeat_penalty', 'presence_penalty', 'frequency_penalty', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_slow', 'yarn_beta_fast']:
-                        try:
-                            params[config_key] = float(value)
-                        except ValueError:
-                            params[config_key] = value
-                    elif config_key in ['use_mmap', 'mlock', 'kv_offload', 'swa_full', 'perf', 'escape', 'repack', 'no_host', 'direct_io', 'cpu_moe', 'check_tensors', 'flash_attn', 'jinja', 'parallel', 'cont_batching', 'embeddings', 'reranking', 'ui', 'log_disable', 'offline', 'verbose']:
-                        params[config_key] = value.lower() != 'false' and value.lower() != '0' and value.lower() != 'off'
-                    else:
-                        params[config_key] = value
-                else:
-                    unrecognized_flags.append(arg)
-                i += 1
-                continue
-            
-            if arg.startswith('--') or arg.startswith('-'):
-                config_key = flag_map.get(arg)
-                if config_key:
-                    if i + 1 < len(args) and not args[i+1].startswith('-'):
-                        value = args[i+1]
-                        i += 2
-                        
-                        if config_key in ['context_size', 'gpu_layers', 'threads', 'threads_batch', 'port', 'batch_size', 'ubatch_size', 'top_k', 'repeat_last_n', 'rope_scale', 'rope_freq_base', 'predict', 'keep', 'defrag_thold', 'yarn_orig_ctx', 'fit_ctx']:
-                            try:
-                                params[config_key] = int(value)
-                            except ValueError:
-                                params[config_key] = value
-                        elif config_key in ['temp', 'top_p', 'min_p', 'repeat_penalty', 'presence_penalty', 'frequency_penalty', 'yarn_ext_factor', 'yarn_attn_factor', 'yarn_beta_slow', 'yarn_beta_fast']:
-                            try:
-                                params[config_key] = float(value)
-                            except ValueError:
-                                params[config_key] = value
-                        elif config_key in ['use_mmap', 'mlock', 'kv_offload', 'swa_full', 'perf', 'escape', 'repack', 'no_host', 'direct_io', 'cpu_moe', 'check_tensors', 'flash_attn', 'jinja', 'parallel', 'cont_batching', 'embeddings', 'reranking', 'ui', 'log_disable', 'offline', 'verbose']:
-                            if arg.startswith('--no-'):
-                                params[config_key] = False
-                            else:
-                                params[config_key] = True
-                        else:
-                            params[config_key] = value
-                    else:
-                        if config_key in ['use_mmap', 'mlock', 'kv_offload', 'swa_full', 'perf', 'escape', 'repack', 'no_host', 'direct_io', 'cpu_moe', 'check_tensors', 'flash_attn', 'jinja', 'parallel', 'cont_batching', 'embeddings', 'reranking', 'ui', 'log_disable', 'offline', 'verbose']:
-                            if arg.startswith('--no-'):
-                                params[config_key] = False
-                            else:
-                                params[config_key] = True
-                        i += 1
-                else:
-                    unrecognized_flags.append(arg)
-                    i += 1
-            else:
-                if 'model_path' not in params and not arg.startswith('-'):
-                    if arg.endswith(('.gguf', '.bin', '.safetensors')) or '/' in arg or '\\' in arg:
-                        params['model_path'] = arg
-                i += 1
-                
-        return params, unrecognized_flags
+        """Parse a llama-server command string into (params, unrecognized_flags).
+
+        Delegates to :func:`llama_launcher.core.parser.parse_launch_command`.
+        """
+        return _parse_launch_command(command_str)
 
     def create_server_management_tab(self):
         """Create server management tab for local and remote servers."""
@@ -4067,9 +3715,19 @@ class LlamaLauncherGUI(QMainWindow):
         self.server_management_widget.list_widget.servers_changed.connect(
             self._on_servers_changed
         )
+        self.server_management_widget.set_command_provider(self._build_launch_command)
         layout.addWidget(self.server_management_widget)
 
         self.tab_widget.addTab(tab, "Server Management")
+
+    def _build_launch_command(self) -> str:
+        """Build the llama-server command for the current configuration.
+
+        Used by the Server Management tab so Start/Restart runs the same
+        command shown in the Command Preview.
+        """
+        self.update_config_from_ui()
+        return build_command(self.config)
 
     def create_import_launch_command_tab(self):
         """Create import launch command tab."""
@@ -4141,36 +3799,24 @@ class LlamaLauncherGUI(QMainWindow):
             if name in PresetManager.get_all_presets():
                 QMessageBox.warning(self, "Error", f"Preset '{name}' already exists.")
                 return
-            
-            # Create config from parsed parameters with defaults
+
+            # Build config from all parsed parameters that map to config fields
+            valid_fields = {f.name for f in dataclasses.fields(LlamaConfig)}
+            filtered = {k: v for k, v in params.items() if k in valid_fields}
+            dropped = sorted(set(params) - valid_fields)
+            if dropped:
+                logger.warning("Import: ignoring unknown parameters: %s", ", ".join(dropped))
+
+            # Backfill kv_cache_type from cache_type_k for backwards compatibility
+            if 'kv_cache_type' not in filtered and 'cache_type_k' in filtered:
+                filtered['kv_cache_type'] = filtered['cache_type_k']
+
             config = LlamaConfig(
-                model_path=params.get('model_path', ''),
-                mmproj_model_path=params.get('mmproj_model_path', None),
-                draft_model_path=params.get('draft_model_path', None),
-                context_size=params.get('context_size', 4096),
-                gpu_layers=params.get('gpu_layers', -1),
-                threads=params.get('threads', 0),
-                threads_batch=params.get('threads_batch', -1),
-                port=params.get('port', 8080),
-                host=params.get('host', '127.0.0.1'),
-                backend=params.get('backend', 'auto'),
-                use_mmap=params.get('use_mmap', True),
-                kv_cache_type=params.get('kv_cache_type', params.get('cache_type_k', 'f16')),
-                cache_type_k=params.get('cache_type_k', 'f16'),
-                cache_type_v=params.get('cache_type_v', 'f16'),
-                batch_size=params.get('batch_size', 2048),
-                ubatch_size=params.get('ubatch_size', 512),
-                temp=params.get('temp', 0.8),
-                top_p=params.get('top_p', 0.95),
-                top_k=params.get('top_k', 40),
-                repeat_penalty=params.get('repeat_penalty', 1.0),
-                flash_attn=params.get('flash_attn', 'auto'),
-                parallel=params.get('parallel', -1),
-                jinja=params.get('jinja', False),
+                **filtered,
                 name=name,
                 description=f"Imported from command: {command_str[:50]}..."
             )
-            
+
             PresetManager.save_custom_preset(name, config)
             QMessageBox.information(self, "Success", f"Preset '{name}' created successfully.")
             self.refresh_preset_list_if_needed()

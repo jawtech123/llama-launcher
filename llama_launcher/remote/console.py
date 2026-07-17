@@ -127,7 +127,7 @@ class LiveConsole(QObject):
         if self._worker and self._worker.isRunning():
             self.stop()
 
-        from remote.local import LocalServerConnection
+        from llama_launcher.remote.local import LocalServerConnection
         if isinstance(conn, LocalServerConnection):
             import pathlib
             log_path = str(

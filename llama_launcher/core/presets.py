@@ -1,14 +1,22 @@
 """Preset System for LlamaConfig."""
 import dataclasses
 import json
+import logging
 from pathlib import Path
+
+from llama_launcher.utils.paths import config_file, secure_file
 from .config import LlamaConfig
+
+logger = logging.getLogger(__name__)
 
 
 class PresetManager:
     """Manages preset configurations for llama-server."""
 
-    CUSTOM_PRESETS_FILE = Path.home() / ".llama_launcher_presets.json"
+    @classmethod
+    def _presets_file(cls) -> Path:
+        """Path to the custom presets store (may contain secrets like HF tokens)."""
+        return config_file("presets.json")
 
     BUILTIN_PRESETS = {
         "Small 8GB": LlamaConfig(
@@ -75,19 +83,22 @@ class PresetManager:
     @classmethod
     def _load_custom_presets(cls) -> dict:
         """Load custom presets from file."""
-        if cls.CUSTOM_PRESETS_FILE.exists():
+        presets_file = cls._presets_file()
+        if presets_file.exists():
             try:
-                with open(cls.CUSTOM_PRESETS_FILE, 'r') as f:
+                with open(presets_file, 'r') as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning("Could not read presets file %s: %s", presets_file, e)
         return {}
 
     @classmethod
     def _save_custom_presets(cls, presets: dict):
-        """Save custom presets to file."""
-        with open(cls.CUSTOM_PRESETS_FILE, 'w') as f:
+        """Save custom presets to file (user-private: may contain HF tokens)."""
+        presets_file = cls._presets_file()
+        with open(presets_file, 'w') as f:
             json.dump(presets, f, indent=2)
+        secure_file(presets_file)
 
     @classmethod
     def get_all_presets(cls) -> list:

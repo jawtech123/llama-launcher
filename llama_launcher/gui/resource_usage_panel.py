@@ -6,7 +6,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QObject
 from PySide6.QtGui import QColor, QPalette, QFont
 
-from estimator.types import ResourceEstimate
+from llama_launcher.estimator.types import ResourceEstimate
 
 
 class _AnimatedValue(QObject):

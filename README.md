@@ -1,86 +1,100 @@
 # llama-launcher
 
-A production-quality desktop + CLI application that generates and manages `llama-server` launch configurations.
+A desktop + CLI application that generates, saves, and launches `llama-server` (llama.cpp) configurations.
 
 ## Features
 
-- **Config-First Architecture**: All UI (CLI + GUI) manipulates a shared `LlamaConfig` object
-- **GPU Auto-Detection**: Detects CUDA (NVIDIA), Metal (Apple), and Vulkan backends
-- **VRAM-Based Optimizer**: Suggests optimal settings based on model size and GPU VRAM
-- **Preset System**: Built-in presets (basic, fast, quality, advanced) with JSON export/import
-- **Model Scanner**: Scans filesystem for `.gguf`, `.bin`, `.safetensors` files
-- **Quantization Recommender**: Recommends Q2/Q3/Q4/Q5/Q8 based on VRAM and target speed/quality
-- **Benchmark System**: Throughput tests, latency tests, and VRAM saturation testing
-- **GUI & CLI Interfaces**: PySide6 desktop app and command-line tool
+- **GUI (PySide6)**: Basic + Advanced configuration tabs, GPU info, model browser,
+  live command preview & launch, server management (local + SSH), and launch-command import.
+- **Config-First Architecture**: every UI action manipulates a shared `LlamaConfig`;
+  commands are produced by a single `build_command(config)` and parsed back by `core/parser.py`.
+- **GPU Auto-Detection**: CUDA (NVIDIA), Metal (Apple), Vulkan, with CPU fallback.
+- **Resource Estimation**: VRAM/RAM usage estimated from GGUF metadata before launch.
+- **Preset System**: built-in presets (Small 8GB, Medium 12GB, Large 32GB) plus custom presets.
+- **Remote Servers**: manage llama-server on remote hosts over SSH (status, logs, file browser, key install).
+- **Structured Logging**: console + rotating log file; no silent failures.
 
 ## Installation
 
 ```bash
 pip install .
-# or
-pip install PySide6
+pip install ".[dev]"   # with test tooling
 ```
 
-## CLI Usage
+A convenience script is provided for running from a source checkout:
+
+```bash
+./start.sh
+```
+
+## Usage
+
+### GUI
+
+```bash
+llama-launcher-gui          # installed entry point
+python -m llama_launcher    # from the source checkout
+```
+
+### CLI
 
 ```bash
 # Detect GPU
 llama-launcher detect
 
-# Scan models in directory
+# Scan models in a directory
 llama-launcher scan /path/to/models
 
-# Optimize config for VRAM
-llama-launcher optimize --model path/to/model.gguf --context 4096
+# Show the launch command for a config (dry run)
+llama-launcher launch --model model.gguf --context 8192 --gpu-layers 99 --threads 8 --dry-run
 
-# Recommend quantization
-llama-launcher quant --family llama --vram 12288 --target balanced
-
-# Launch server with preset
-llama-launcher launch --preset fast --model model.gguf --dry-run
-
-# Launch server with custom config
-llama-launcher launch --model model.gguf --context 8192 --gpu-layers 99 --threads 8
-
-# Export/import profiles
-llama-launcher profile export --model model.gguf --output profile.json --name my-profile
-llama-launcher profile import --input profile.json
+# Launch using a saved preset
+llama-launcher launch --preset "Small 8GB" --model model.gguf
 ```
 
-## GUI Usage
+## Tests
 
 ```bash
-python -m gui.main_window
+python -m pytest
 ```
 
-The GUI includes:
-- Model Browser (filesystem scanner)
-- GPU Info Panel
-- Preset Selector
-- Advanced Config Editor
-- Benchmark Tab
-- Command Preview & Launch Button
+## Configuration & Data
+
+Runtime state lives in `~/.config/llama-launcher/` (honors `XDG_CONFIG_HOME`):
+
+- `presets.json` — custom presets (chmod 600, may contain HF tokens)
+- `servers.json` — server definitions (chmod 600, contains credentials)
+- `models.json` — per-server model scan cache
+- `folders.json` — model browser source folders
+- `logs/` — rotating application logs
+
+Legacy `~/.llama_launcher_*.json` files are migrated automatically on first run.
 
 ## Architecture
 
 ```
-llama-launcher/
-├── core/          # Config schema, validator, builder, presets
+llama_launcher/
+├── core/          # LlamaConfig schema, validator, command builder, command parser, presets
 ├── gpu/           # GPU auto-detection (CUDA, Metal, Vulkan)
-├── optimizer/     # VRAM-based configuration optimizer
-├── benchmarks/    # Benchmark execution and results
-├── quant/         # Quantization recommendation engine
-├── models/        # Model filesystem scanner
-├── profiles/      # Profile export/import (JSON)
+├── estimator/     # GGUF metadata reader + VRAM/RAM estimation
+├── models/        # Model filesystem scanner + per-server scan cache
+├── remote/        # ServerManager: local (subprocess) and SSH (paramiko) connections
+├── gui/           # PySide6 main window, server management, resource usage panel
 ├── cli/           # CLI entry point
-├── gui/           # PySide6 GUI application
-└── utils/         # Utility functions
+├── utils/         # Config dir management, logging setup, helpers
+├── app.py         # GUI bootstrap
+└── __main__.py    # python -m llama_launcher
 ```
+
+Retired subsystems (benchmarks, quant recommender, VRAM optimizer, legacy profiles)
+are preserved under `_attic/` and are not part of the package.
 
 ## Configuration Flow
 
 ```
-UI → Config → Validator → Optimizer → Builder → Command
+UI → LlamaConfig → Validator → Builder → Command
+Command → Parser → LlamaConfig (import)
 ```
 
-All commands are generated via `build_command(config: LlamaConfig) -> str`.
+All commands are generated via `build_command(config: LlamaConfig) -> str` and
+parsed via `parse_launch_command(command: str) -> (params, unrecognized)`.

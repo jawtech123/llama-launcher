@@ -1,6 +1,6 @@
 [project]
 name = "llama-launcher"
-version = "1.0.0"
+version = "2.0.0"
 description = "A desktop + CLI application that generates and manages llama-server launch configurations"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -9,8 +9,14 @@ dependencies = [
     "paramiko>=3.0.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
-llama-launcher = "cli.main:main"
+llama-launcher = "llama_launcher.cli.main:main"
+llama-launcher-gui = "llama_launcher.app:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -18,3 +24,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
+include = ["llama_launcher*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

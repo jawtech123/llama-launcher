@@ -1,7 +1,7 @@
 """Abstract Server Connection Interface."""
 from abc import ABC, abstractmethod
 from typing import List, Optional
-from models.types import ModelInfo
+from llama_launcher.models.types import ModelInfo
 from .types import (
     ConnectionState,
     ServerConfig,

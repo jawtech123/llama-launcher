@@ -1,10 +1,18 @@
 """Server Configuration JSON Persistence."""
 import json
+import logging
 from pathlib import Path
 from typing import Dict, List
+
+from llama_launcher.utils.paths import config_file, secure_file
 from .types import ServerConfig, ConnectionType, AuthMethod
 
-SERVERS_FILE = Path.home() / ".llama_launcher_servers.json"
+logger = logging.getLogger(__name__)
+
+
+def _servers_file() -> Path:
+    """Path to the servers store (user-private: contains credentials)."""
+    return config_file("servers.json")
 
 
 def _config_to_dict(config: ServerConfig) -> Dict:
@@ -54,26 +62,30 @@ def _dict_to_config(d: Dict) -> ServerConfig:
 
 def load_servers() -> List[ServerConfig]:
     """Load all saved server configurations."""
-    if not SERVERS_FILE.exists():
+    servers_file = _servers_file()
+    if not servers_file.exists():
         return []
     try:
-        with open(SERVERS_FILE, "r") as f:
+        with open(servers_file, "r") as f:
             data = json.load(f)
         servers = []
         for entry in data.get("servers", []):
             servers.append(_dict_to_config(entry))
         return servers
-    except Exception:
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        logger.warning("Could not read servers file %s: %s", servers_file, e)
         return []
 
 
 def save_servers(servers: List[ServerConfig]) -> None:
-    """Persist all server configurations."""
+    """Persist all server configurations (user-private: credentials)."""
     data = {
         "servers": [_config_to_dict(s) for s in servers],
     }
-    with open(SERVERS_FILE, "w") as f:
+    servers_file = _servers_file()
+    with open(servers_file, "w") as f:
         json.dump(data, f, indent=2)
+    secure_file(servers_file)
 
 
 def save_server(config: ServerConfig) -> None:
