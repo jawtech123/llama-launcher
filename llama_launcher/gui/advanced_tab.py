@@ -31,6 +31,7 @@ def create_field_widget(field: Field, parent: QWidget = None) -> Tuple[QWidget, 
         w.setRange(int(field.minimum), int(field.maximum))
         if field.special_text:
             w.setSpecialValueText(field.special_text)
+        w.setMaximumWidth(150)
         return w, w.value, w.setValue, w.valueChanged
 
     if field.kind == "float":
@@ -38,11 +39,13 @@ def create_field_widget(field: Field, parent: QWidget = None) -> Tuple[QWidget, 
         w.setRange(field.minimum, field.maximum)
         w.setSingleStep(field.step)
         w.setDecimals(field.decimals)
+        w.setMaximumWidth(150)
         return w, w.value, w.setValue, w.valueChanged
 
     if field.kind == "choice":
         w = QComboBox(parent)
         w.addItems(list(field.choices))
+        w.setMaximumWidth(200)
         return w, w.currentText, w.setCurrentText, w.currentTextChanged
 
     if field.kind == "bool":

@@ -26,6 +26,7 @@ class ModelMetadata:
     total_params: int = 0
     quant_types: dict[str, int] = field(default_factory=dict)
     tensor_count: int = 0
+    attn_interval: int = 1  # >1 for hybrid SSM/attention archs (e.g. qwen35)
 
 
 @dataclass

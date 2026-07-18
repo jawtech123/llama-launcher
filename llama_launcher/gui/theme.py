@@ -130,6 +130,42 @@ def apply_dark_theme(app: QApplication) -> None:
             text-align: center;
         }}
         QProgressBar::chunk {{ background-color: {ACCENT}; }}
+        QSpinBox, QDoubleSpinBox {{
+            min-width: 90px;
+            max-width: 150px;
+        }}
+        QSpinBox::up-button, QDoubleSpinBox::up-button,
+        QSpinBox::down-button, QDoubleSpinBox::down-button {{
+            background-color: {BG_HOVER};
+            border-left: 1px solid #555558;
+            width: 18px;
+        }}
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{
+            background-color: #4a4a50;
+        }}
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+            image: none;
+            width: 0px;
+            height: 0px;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-bottom: 6px solid {FG_TEXT};
+        }}
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+            image: none;
+            width: 0px;
+            height: 0px;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid {FG_TEXT};
+        }}
+        QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{
+            border-bottom-color: {FG_MUTED};
+        }}
+        QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{
+            border-top-color: {FG_MUTED};
+        }}
     """)
 
 

@@ -1,10 +1,12 @@
 """PySide6 GUI Main Window: shell + wiring between tabs and services."""
 import logging
 import shlex
+import shutil
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QProcess, QSettings, QThread, QTimer
 from PySide6.QtWidgets import (
-    QMainWindow, QMessageBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QInputDialog, QMainWindow, QMessageBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 from PySide6.QtGui import QFont
 
@@ -62,7 +64,7 @@ class LlamaLauncherGUI(QMainWindow):
     # ------------------------------------------------------------------
 
     def _ensure_local_server(self):
-        """Ensure a default local server exists."""
+        """Ensure a default local server exists with a resolvable binary."""
         configs = self.server_manager.get_all_configs()
         has_local = any(
             c.friendly_name == "Local Machine" and c.connection_type == ConnectionType.LOCAL
@@ -73,15 +75,52 @@ class LlamaLauncherGUI(QMainWindow):
                 friendly_name="Local Machine",
                 connection_type=ConnectionType.LOCAL,
                 hostname="localhost",
-                llama_server_path="llama-server",
+                llama_server_path=self._find_local_llama_server(),
                 working_directory="~",
                 enabled=True,
             )
             self.server_manager.add_server(local_config)
+            return
+
+        # Repair an existing local config whose binary is not resolvable.
+        for c in configs:
+            if c.friendly_name == "Local Machine" and c.connection_type == ConnectionType.LOCAL:
+                binary = c.llama_server_path or "llama-server"
+                resolved = shutil.which(binary) or (
+                    binary if Path(binary).is_file() else None
+                )
+                if resolved is None:
+                    found = self._find_local_llama_server()
+                    if found != binary:
+                        c.llama_server_path = found
+                        self.server_manager.add_server(c)  # persists update
+                break
+
+    @staticmethod
+    def _find_local_llama_server() -> str:
+        """Locate a llama-server binary: PATH first, then common build locations."""
+        found = shutil.which("llama-server")
+        if found:
+            return found
+        for candidate in (
+            "/workspace/llama.cpp/build/bin/llama-server",
+            "/usr/local/bin/llama-server",
+            str(Path.home() / "llama.cpp/build/bin/llama-server"),
+        ):
+            if Path(candidate).is_file():
+                return candidate
+        return "llama-server"
 
     def init_ui(self):
         """Initialize the user interface."""
         self.setWindowTitle("llama-launcher")
+        # Guarantee standard title-bar buttons on every platform/WM.
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowCloseButtonHint
+        )
         self.resize(1100, 750)
 
         central = QWidget()
@@ -274,22 +313,41 @@ class LlamaLauncherGUI(QMainWindow):
                 self, "Preset Error", f"Failed to load preset '{preset_name}': {e}")
 
     def save_current_preset(self):
-        """Save the live config to the currently selected preset."""
-        preset_name = (
+        """Save the live config as a preset (prompts for a name, Save-As style)."""
+        current = (
             self.advanced_tab.preset_combo.currentText()
             if self.tab_widget.currentWidget() is self.advanced_tab
             else self.basic_tab.preset_combo.currentText()
         )
-        if not preset_name:
+        name, ok = QInputDialog.getText(
+            self, "Save Preset", "Preset name:", text=current)
+        if not ok or not name.strip():
             return
-        PresetManager.save_custom_preset(preset_name, self.config)
-        QMessageBox.information(self, "Success", f"Preset '{preset_name}' saved successfully.")
+        name = name.strip()
+        if name in PresetManager.BUILTIN_PRESETS:
+            reply = QMessageBox.question(
+                self, "Override Built-in Preset",
+                f"'{name}' is a built-in preset. Save a custom override?\n"
+                f"(The built-in can be restored by deleting the override.)",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+        PresetManager.save_custom_preset(name, self.config)
+        self.refresh_preset_list_if_needed()
+        for combo in (self.basic_tab.preset_combo, self.advanced_tab.preset_combo):
+            combo.blockSignals(True)
+            combo.setCurrentText(name)
+            combo.blockSignals(False)
+        self._settings.setValue("last_preset", name)
+        QMessageBox.information(self, "Success", f"Preset '{name}' saved successfully.")
 
     def open_preset_manager(self):
         """Open preset manager dialog for CRUD operations."""
         dialog = PresetManagerDialog(lambda: self.config, self)
-        if dialog.exec() == 1:
-            self.refresh_preset_list_if_needed()
+        dialog.exec()
+        # Refresh regardless of how the dialog was closed (X included).
+        self.refresh_preset_list_if_needed()
 
     def refresh_preset_list_if_needed(self):
         """Refresh preset combo contents after preset CRUD."""
@@ -600,7 +658,7 @@ class LlamaLauncherGUI(QMainWindow):
         """Launch llama-server locally with the current configuration."""
         try:
             validate_config(self.config)
-            cmd = build_command(self.config)
+            cmd = self._resolve_server_binary(build_command(self.config))
         except Exception as e:
             self._mark_model_invalid("model_path" in str(e))
             QMessageBox.warning(self, "Cannot Launch", str(e))
@@ -619,16 +677,39 @@ class LlamaLauncherGUI(QMainWindow):
         self.server_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.server_process.readyRead.connect(self.on_server_output)
         self.server_process.finished.connect(self.on_server_finished)
+        self.server_process.errorOccurred.connect(self.on_server_error)
 
         try:
             args = shlex.split(cmd)
             self.server_process.start(args[0], args[1:])
             if not self.server_process.waitForStarted(3000):
-                raise RuntimeError("Failed to start llama-server process")
+                raise RuntimeError(
+                    f"Could not start '{args[0]}'.\n\n"
+                    f"Make sure the llama-server binary exists and is executable. "
+                    f"Set the correct path in Server Management > Edit Server > Server Exec."
+                )
             self.preview_tab.set_running(True)
         except Exception as e:
             logger.exception("Launch failed")
             self.preview_tab.append_log(f"\nLaunch Error: {e}\n")
+            QMessageBox.warning(self, "Launch Failed", str(e))
+
+    def on_server_error(self, error):
+        """Surface QProcess errors (e.g. binary not found) in the log."""
+        proc = self.server_process
+        detail = proc.errorString() if proc is not None else str(error)
+        logger.error("llama-server process error: %s", detail)
+        self.preview_tab.append_log(f"\nProcess Error: {detail}\n")
+
+    def _resolve_server_binary(self, cmd: str) -> str:
+        """Substitute argv[0] with the selected server's configured binary path."""
+        server = self._get_current_server()
+        conn = self.server_manager.get_connection(server) if server else None
+        binary = conn.config.llama_server_path if conn else ""
+        if binary and binary != "llama-server":
+            parts = cmd.split(" ", 1)
+            return binary + (" " + parts[1] if len(parts) > 1 else "")
+        return cmd
 
     def stop_server(self):
         """Stop the locally launched llama-server process."""

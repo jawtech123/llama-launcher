@@ -383,12 +383,13 @@ class SSHServerConnection(IServerConnection):
 
     def start_server(self, command: str) -> bool:
         log_path = f"{self._config.working_directory}/{self._config.log_file}"
-        # < /dev/null detaches the child from the SSH channel's stdin so the
-        # channel can close immediately (otherwise stdout.read() hangs until
-        # the timeout waiting for channel EOF).
+        # "(cd ... && exec ...)" makes $! the PID of llama-server itself --
+        # without exec, the backgrounded AND-list forks a subshell and $!
+        # tracks the wrapper, leaving the real process orphaned on stop.
+        # < /dev/null detaches the child from the SSH channel's stdin.
         start_cmd = (
-            f"cd {self._config.working_directory} && "
-            f"nohup {command} > {log_path} 2>&1 < /dev/null & echo $!"
+            f"(cd {self._config.working_directory} && "
+            f"exec nohup {command} > {log_path} 2>&1 < /dev/null) & echo $!"
         )
 
         try:

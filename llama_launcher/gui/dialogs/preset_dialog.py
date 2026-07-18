@@ -1,6 +1,7 @@
 """Preset manager dialog (CRUD operations)."""
 import logging
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget, QMessageBox,
     QPushButton, QVBoxLayout,
@@ -20,6 +21,12 @@ class PresetManagerDialog(QDialog):
             get_current_config: zero-arg callable returning the live LlamaConfig.
         """
         super().__init__(parent)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinMaxButtonsHint
+            | Qt.WindowCloseButtonHint
+        )
         self._get_current_config = get_current_config
         self.setWindowTitle("Manage Presets")
         self.setGeometry(300, 300, 500, 400)
@@ -33,15 +40,18 @@ class PresetManagerDialog(QDialog):
         self.add_btn = QPushButton("Add New")
         self.delete_btn = QPushButton("Delete Selected")
         self.save_btn = QPushButton("Save Current Config as Preset")
+        self.close_btn = QPushButton("Close")
 
         self.add_btn.clicked.connect(self.add_preset)
         self.delete_btn.clicked.connect(self.delete_preset)
         self.save_btn.clicked.connect(self.save_current_as_preset)
+        self.close_btn.clicked.connect(self.accept)
 
         btn_layout.addWidget(self.add_btn)
         btn_layout.addWidget(self.delete_btn)
         btn_layout.addWidget(self.save_btn)
         btn_layout.addStretch()
+        btn_layout.addWidget(self.close_btn)
 
         layout.addWidget(QLabel("Existing Presets:"))
         layout.addWidget(self.preset_list)

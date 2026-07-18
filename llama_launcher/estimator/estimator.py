@@ -308,6 +308,8 @@ class _GgufReader:
         "gemma2": "llama.feed_forward_length",
     }
 
+
+
     @staticmethod
     def read_full_metadata(model_path: str) -> ModelMetadata:
         """Read complete model metadata from GGUF file header.
@@ -330,7 +332,7 @@ class _GgufReader:
         except OSError:
             return meta
 
-        _MAX_HEADER_READ = 4 * 1024 * 1024  # 4 MB safety limit for header
+        _MAX_HEADER_READ = 32 * 1024 * 1024  # 32 MB: covers large tokenizer metadata sections
         _bytes_read = 0
 
         # Timeout: abort GGUF read if it takes more than 2 seconds
@@ -388,24 +390,26 @@ class _GgufReader:
                 for _ in range(max_kv):
                     if _bytes_read >= _MAX_HEADER_READ:
                         break
-                    key_len, = struct.unpack("<Q", f.read(8))
-                    _bytes_read += 8
-                    if key_len > 2048:
+                    try:
+                        key_len, = struct.unpack("<Q", f.read(8))
+                        _bytes_read += 8
+                        if key_len > 2048:
+                            break
+                        key = f.read(key_len).decode("utf-8", errors="replace")
+                        _bytes_read += key_len
+                        # NOTE: GGUF metadata keys are NOT 8-byte padded (spec).
+
+                        value_type, = struct.unpack("<i", f.read(4))
+                        _bytes_read += 4
+
+                        value = _GgufReader._read_value(f, value_type, version)
+                        _bytes_read += _GgufReader._value_byte_size(value_type, value)
+
+                        kv_data[key] = value
+                    except (struct.error, OSError, UnicodeDecodeError):
+                        # Truncated/unreadable tail (e.g. header sample) --
+                        # keep everything parsed so far instead of losing it.
                         break
-                    key = f.read(key_len).decode("utf-8", errors="replace")
-                    _bytes_read += key_len
-                    padding = (8 - (key_len % 8)) % 8
-                    if padding:
-                        f.seek(padding, os.SEEK_CUR)
-                        _bytes_read += padding
-
-                    value_type, = struct.unpack("<i", f.read(4))
-                    _bytes_read += 4
-
-                    value = _GgufReader._read_value(f, value_type, version)
-                    _bytes_read += _GgufReader._value_byte_size(value_type, value)
-
-                    kv_data[key] = value
 
                     if needed_keys.issubset(kv_data.keys()):
                         break
@@ -438,6 +442,12 @@ class _GgufReader:
                 if arch in ("gemma", "gemma2") and meta.ff_dim > 0 and meta.heads > 0:
                     meta.kv_dim = meta.ff_dim // meta.heads
 
+                # Hybrid SSM/attention architectures (e.g. qwen35): only every
+                # Nth layer is full attention and needs KV cache.
+                interval = kv_data.get(f"{arch}.full_attention_interval", 1)
+                if isinstance(interval, int) and interval > 1:
+                    meta.attn_interval = interval
+
                 # ---- Read tensor information (metadata only, first few tensors) ----
                 # We read only the first few tensors to get quantization type info.
                 # Weight size comes from file size, NOT from tensor data, to avoid
@@ -457,10 +467,7 @@ class _GgufReader:
                             break
                         name = f.read(name_len).decode("utf-8", errors="replace")
                         _bytes_read += name_len
-                        name_padding = (8 - (name_len % 8)) % 8
-                        if name_padding:
-                            f.seek(name_padding, os.SEEK_CUR)
-                            _bytes_read += name_padding
+                        # NOTE: GGUF tensor names are NOT 8-byte padded (spec).
 
                         # Number of dimensions
                         n_dims, = struct.unpack("<I", f.read(4))
@@ -532,17 +539,18 @@ class _GgufReader:
         if value_type == 8:  # STRING
             strlen, = struct.unpack("<Q", f.read(8))
             strlen = min(strlen, 65536)
-            raw = f.read(strlen)
-            if raw.endswith(b"\x00"):
-                raw = raw[:-1]
-            return raw
+            # GGUF strings are length-prefixed with no NUL terminator (spec).
+            return f.read(strlen)
         elif value_type == 9:  # ARRAY
             arr_type, = struct.unpack("<i", f.read(4))
             arr_count, = struct.unpack("<Q", f.read(8))
-            arr_count = min(arr_count, 500)
+            # Consume every item to keep the stream in sync; keep the first
+            # 500 for inspection (tokenizer arrays can have 100k+ entries).
             items = []
-            for _ in range(arr_count):
-                items.append(_GgufReader._read_value(f, arr_type, version))
+            for idx in range(arr_count):
+                item = _GgufReader._read_value(f, arr_type, version)
+                if idx < 500:
+                    items.append(item)
             return items
         elif value_type in (0, 4, 10):  # UINT8, UINT32, UINT64
             sizes = {0: "<B", 4: "<I", 10: "<Q"}
@@ -568,7 +576,7 @@ class _GgufReader:
         """Estimate bytes consumed by a GGUF value (for seeking past arrays)."""
         if value_type == 8:  # STRING
             if isinstance(value, bytes):
-                return 8 + len(value) + 1
+                return 8 + len(value)
             return 0
         elif value_type == 9:  # ARRAY
             return 0  # Handled recursively
@@ -576,6 +584,10 @@ class _GgufReader:
             return {0: 1, 2: 2, 4: 4, 6: 4, 7: 1}[value_type]
         elif value_type in (1, 3):  # INT8, INT16
             return {1: 1, 3: 2}[value_type]
+        elif value_type in (5, 10, 11):  # INT32, UINT64, INT64
+            return {5: 4, 10: 8, 11: 8}[value_type]
+        elif value_type == 12:  # FLOAT64
+            return 8
         elif value_type in (5, 11):  # INT32, INT64
             return {5: 4, 11: 8}[value_type]
         elif value_type == 10:  # UINT64
@@ -620,6 +632,19 @@ class _GgufReader:
 # ---------------------------------------------------------------------------
 # Architecture defaults (fallback when GGUF can't be read)
 # ---------------------------------------------------------------------------
+
+
+# Modern Qwen architectures use their arch name as the GGUF key prefix
+# (e.g. "qwen35.context_length"). Register them against the llama-style keys.
+for _arch in ("qwen3", "qwen3moe", "qwen35", "qwen35moe"):
+    _GgufReader._CONTEXT_KEYS[_arch] = f"{_arch}.context_length"
+    _GgufReader._LAYER_KEYS[_arch] = f"{_arch}.block_count"
+    _GgufReader._HEAD_KEYS[_arch] = f"{_arch}.attention.head_count"
+    _GgufReader._KV_HEAD_KEYS[_arch] = f"{_arch}.attention.head_count_kv"
+    _GgufReader._EMBEDDING_KEYS[_arch] = f"{_arch}.embedding_length"
+    _GgufReader._HEAD_DIM_KEYS[_arch] = f"{_arch}.attention.key_length"
+    _GgufReader._FF_DIM_KEYS[_arch] = f"{_arch}.feed_forward_length"
+del _arch
 
 @dataclass
 class _ArchDefaults:
@@ -851,8 +876,11 @@ class ResourceEstimator:
             est.multi_gpu = True
 
         # ---- 2. KV CACHE CALCULATION ----
+        # Hybrid SSM/attention archs (qwen35): KV cache only exists on the
+        # full-attention layers (every attn_interval-th layer).
+        kv_layers = layers // meta.attn_interval if meta.attn_interval > 1 else layers
         kv_cache_bytes_per_token = self._compute_kv_cache_per_token(
-            layers, kv_heads, head_dim, kv_dim,
+            kv_layers, kv_heads, head_dim, kv_dim,
             config.cache_type_k, config.cache_type_v,
             meta.arch,
         )
@@ -890,11 +918,12 @@ class ResourceEstimator:
         else:
             backend_overhead_mb = self.CPU_RUNTIME_MB
 
-        # Flash attention workspace
+        # Flash attention workspace: llama.cpp reuses a small shared buffer
+        # for flash attention; no per-layer workspace is needed.
         flash_attn_workspace_mb = 0.0
-        if config.flash_attn in ("enable", "auto") and gpu_info and gpu_info.backend in ("cuda", "hip"):
+        if config.flash_attn in ("on", "auto") and gpu_info and gpu_info.backend in ("cuda", "hip"):
             flash_attn_workspace_mb = (
-                ubatch * embedding_length * layers * self.FLASH_ATTN_WORKSPACE_FACTOR
+                ubatch * embedding_length * self.FLASH_ATTN_WORKSPACE_FACTOR
             ) / (1024 * 1024)
             backend_overhead_mb += flash_attn_workspace_mb
 
@@ -1177,12 +1206,12 @@ class ResourceEstimator:
 
         # Attention workspace (non-flash attention)
         attn_workspace = 0.0
-        if flash_attn != "enable":
+        if flash_attn != "on":
             # Conservative estimate: ubatch * ubatch * sizeof(f16) for QK^T intermediate
             attn_workspace = (ubatch * ubatch * 2 * n_layers) / (1024 * 1024)
 
         total_mb = layer_activations + token_embeddings + attn_workspace
-        return total_mb * 1.5  # 50% headroom for temporary allocations
+        return total_mb * 1.25  # 25% headroom for temporary allocations
 
     def _calculate_safety_margin(self, total_vram_used_mb: float) -> float:
         """Calculate safety margin as percentage of total estimated VRAM."""

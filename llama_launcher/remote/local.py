@@ -309,9 +309,13 @@ class LocalServerConnection(IServerConnection):
 
     def start_server(self, command: str) -> bool:
         log_path = str(Path(self._config.working_directory).expanduser() / self._config.log_file)
-        # < /dev/null detaches the child so subprocess.run sees pipe EOF
-        # immediately instead of waiting for the background process.
-        start_cmd = f"nohup {command} > {shlex.quote(log_path)} 2>&1 < /dev/null & echo $!"
+        # "(cd ... && exec ...)" makes $! the PID of llama-server itself
+        # (otherwise $! tracks a wrapper subshell). < /dev/null detaches it
+        # so subprocess.run sees pipe EOF immediately.
+        start_cmd = (
+            f"(cd {shlex.quote(str(Path(self._config.working_directory).expanduser()))} && "
+            f"exec nohup {command} > {shlex.quote(log_path)} 2>&1 < /dev/null) & echo $!"
+        )
 
         try:
             result = subprocess.run(
