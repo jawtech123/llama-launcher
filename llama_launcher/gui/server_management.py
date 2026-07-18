@@ -396,6 +396,7 @@ class ServerListWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._manager: Optional[ServerManager] = None
+        self._workers: list = []
         self._build_ui()
 
     def _build_ui(self):
@@ -435,14 +436,32 @@ class ServerListWidget(QWidget):
         QTimer.singleShot(10, self._refresh_list)
 
     def _refresh_list(self):
-        if not self._manager:
+        if not self._manager or getattr(self, '_closing', False):
             return
         self._manager.load_saved_servers()
         worker = _ServerStateWorker(self._manager)
         worker.setParent(self)
         worker.done.connect(self._on_states_done)
         worker.finished.connect(worker.deleteLater)
+        self._track(worker)
         worker.start()
+
+    def _track(self, worker) -> None:
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
+
+    def _untrack(self, worker) -> None:
+        try:
+            self._workers.remove(worker)
+        except ValueError:
+            pass
+
+    def shutdown(self) -> None:
+        """Wait for any running background workers (called on app close)."""
+        self._closing = True
+        for w in list(self._workers):
+            if w.isRunning():
+                w.wait(1000)
 
     def _on_states_done(self, results):
         self.list_widget.clear()
@@ -530,6 +549,7 @@ class ServerStatusWidget(QWidget):
         self._status_timer: Optional[QTimer] = None
         self._live_console = None
         self._command_provider = None
+        self._workers: list = []
         self._build_ui()
 
     def set_command_provider(self, provider) -> None:
@@ -692,11 +712,31 @@ class ServerStatusWidget(QWidget):
     def _refresh_status(self):
         if not self._manager or not self._selected_server:
             return
+        if getattr(self, '_closing', False):
+            return
         worker = _ServerStatusWorker(self._manager, self._selected_server)
         worker.setParent(self)
         worker.done.connect(self._on_status_done)
         worker.finished.connect(worker.deleteLater)
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
         worker.start()
+
+    def _untrack(self, worker) -> None:
+        try:
+            self._workers.remove(worker)
+        except ValueError:
+            pass
+
+    def shutdown(self) -> None:
+        """Stop timers/console and wait for workers (called on app close)."""
+        self._closing = True
+        if self._status_timer:
+            self._status_timer.stop()
+        self._on_stop_console()
+        for w in list(self._workers):
+            if w.isRunning():
+                w.wait(1000)
 
     def _on_status_done(self, status, error_msg):
         if error_msg:
@@ -982,6 +1022,11 @@ class ServerManagementWidget(QWidget):
 
     def _on_server_selected(self, name: str):
         self.status_widget.select_server(name)
+
+    def shutdown(self) -> None:
+        """Stop child widgets' timers and background workers."""
+        self.list_widget.shutdown()
+        self.status_widget.shutdown()
 
     @Slot()
     def refresh(self):

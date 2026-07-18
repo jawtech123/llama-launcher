@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from llama_launcher.utils.paths import config_file, secure_file
-from .config import LlamaConfig
+from .config import LlamaConfig, migrate_config_dict
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,6 @@ class PresetManager:
             context_size=8192,
             cache_type_k="q8_0",
             cache_type_v="q8_0",
-            kv_cache_type="q8_0",
         ),
         "Medium 12GB": LlamaConfig(
             name="Medium 12GB",
@@ -71,7 +70,7 @@ class PresetManager:
         """Load a configuration from a profile JSON file."""
         with open(path, 'r') as f:
             profile_data = json.load(f)
-        config_data = profile_data.get("config", {})
+        config_data = migrate_config_dict(profile_data.get("config", {}))
         valid_fields = {f.name for f in dataclasses.fields(LlamaConfig)}
         filtered = {k: v for k, v in config_data.items() if k in valid_fields}
         return LlamaConfig(
@@ -120,7 +119,7 @@ class PresetManager:
         custom_presets = cls._load_custom_presets()
         if preset_name not in custom_presets:
             raise ValueError(f"Custom preset '{preset_name}' not found.")
-        config_data = custom_presets[preset_name]
+        config_data = migrate_config_dict(custom_presets[preset_name])
         valid_fields = {f.name for f in dataclasses.fields(LlamaConfig)}
         filtered = {k: v for k, v in config_data.items() if k in valid_fields}
         return LlamaConfig(**filtered)

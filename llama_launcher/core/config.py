@@ -1,6 +1,9 @@
 """Llama Configuration Schema."""
+import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -8,10 +11,10 @@ class LlamaConfig:
     """Shared configuration object for llama-server launch configurations."""
     # Model paths
     model_path: str = ""
-    mmproj_model_path: Optional[str] = None
-    draft_model_path: Optional[str] = None
-    
-    # Common params - threads and batching
+    mmproj_model_path: str = ""
+    draft_model_path: str = ""
+
+    # Threads and batching
     threads: int = 0
     threads_batch: int = -1
     cpu_mask: str = ""
@@ -24,20 +27,19 @@ class LlamaConfig:
     cpu_strict_batch: int = 0
     prio_batch: int = 0
     poll_batch: int = 0
-    
-    # Common params - context and predict
+
+    # Context and predict
     context_size: int = 4096
     predict: int = -1
     batch_size: int = 2048
-    logical_batch_size: int = 2048
     ubatch_size: int = 512
     keep: int = 0
     swa_full: bool = False
     flash_attn: str = "auto"
     perf: bool = False
     escape: bool = True
-    
-    # Common params - RoPE and YaRN
+
+    # RoPE and YaRN
     rope_scaling: str = "none"
     rope_scale: int = 1
     rope_freq_base: int = 0
@@ -47,20 +49,19 @@ class LlamaConfig:
     yarn_attn_factor: float = -1.0
     yarn_beta_slow: float = -1.0
     yarn_beta_fast: float = -1.0
-    
-    # Common params - cache and memory
+
+    # Cache and memory
     kv_offload: bool = True
     repack: bool = True
     no_host: bool = False
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
-    kv_cache_type: str = "f16"
     defrag_thold: int = 0
     mlock: bool = False
     use_mmap: bool = True
     direct_io: bool = False
-    
-    # Common params - GPU and NUMA
+
+    # GPU and NUMA
     numa: str = ""
     device: str = ""
     override_tensor: str = ""
@@ -68,7 +69,7 @@ class LlamaConfig:
     n_cpu_moe: int = 0
     gpu_layers: int = -1
     split_mode: str = "layer"
-    tensor_split: Optional[str] = None
+    tensor_split: str = ""
     main_gpu: int = 0
     fit: str = "on"
     fit_target: str = ""
@@ -76,15 +77,15 @@ class LlamaConfig:
     check_tensors: bool = False
     override_kv: str = ""
     op_offload: bool = True
-    
-    # Common params - LoRA and control vectors
+
+    # LoRA and control vectors
     lora: str = ""
     lora_scaled: str = ""
     control_vector: str = ""
     control_vector_scaled: str = ""
     control_vector_layer_range: str = ""
-    
-    # Common params - model sources
+
+    # Model sources
     model_url: str = ""
     docker_repo: str = ""
     hf_repo: str = ""
@@ -92,8 +93,8 @@ class LlamaConfig:
     hf_repo_v: str = ""
     hf_file_v: str = ""
     hf_token: str = ""
-    
-    # Common params - logging
+
+    # Logging
     log_disable: bool = False
     log_file: str = ""
     log_colors: str = "auto"
@@ -102,12 +103,12 @@ class LlamaConfig:
     verbosity: int = 3
     log_prefix: bool = True
     log_timestamps: bool = True
-    
+
     # Spec draft cache types
     spec_draft_type_k: str = "f16"
     spec_draft_type_v: str = "f16"
-    
-    # Sampling params
+
+    # Sampling
     samplers: str = "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature"
     seed: int = -1
     sampler_seq: str = "edskypmxt"
@@ -142,8 +143,8 @@ class LlamaConfig:
     json_schema: str = ""
     json_schema_file: str = ""
     backend_sampling: bool = False
-    
-    # Speculative params - draft model
+
+    # Speculative decoding
     spec_draft_hf: str = ""
     spec_draft_threads: int = 0
     spec_draft_threads_batch: int = -1
@@ -161,8 +162,6 @@ class LlamaConfig:
     spec_draft_n_cpu_moe: int = 0
     spec_draft_n_max: int = 3
     spec_draft_n_min: int = 0
-    draft_n_max: int = 3
-    draft_n_min: int = 0
     spec_draft_p_split: float = 0.1
     spec_draft_p_min: float = 0.0
     spec_draft_backend_sampling: bool = True
@@ -182,8 +181,8 @@ class LlamaConfig:
     spec_ngram_map_k4v_size_n: int = 12
     spec_ngram_map_k4v_size_m: int = 48
     spec_ngram_map_k4v_min_hits: int = 1
-    
-    # Example-specific params - cache and context
+
+    # Cache and context extras
     lookup_cache_static: str = ""
     lookup_cache_dynamic: str = ""
     ctx_checkpoints: int = 32
@@ -192,8 +191,8 @@ class LlamaConfig:
     kv_unified: bool = True
     cache_idle_slots: bool = True
     context_shift: bool = False
-    
-    # Example-specific params - generation and server
+
+    # Generation and server
     reverse_prompt: str = ""
     special: bool = False
     warmup: bool = True
@@ -201,17 +200,16 @@ class LlamaConfig:
     pooling: str = "none"
     parallel: int = -1
     cont_batching: bool = True
-    
-    # Example-specific params - multimodal
-    mmproj: str = ""
+
+    # Multimodal
     mmproj_url: str = ""
     mmproj_auto: bool = True
     mmproj_offload: bool = True
     image_min_tokens: int = 0
     image_max_tokens: int = 0
     mtmd_batch_max_tokens: int = 1024
-    
-    # Example-specific params - server and UI
+
+    # Server and UI
     alias: str = ""
     tags: str = ""
     embd_normalize: int = 2
@@ -228,11 +226,11 @@ class LlamaConfig:
     ui: bool = True
     embeddings: bool = False
     reranking: bool = False
-    
+
     # Backend and jinja
     backend: str = "auto"
     jinja: bool = False
-    
+
     # Target server for remote execution
     target_server: Optional[str] = None
 
@@ -240,3 +238,58 @@ class LlamaConfig:
     name: Optional[str] = None
     description: Optional[str] = None
     extra_flags: List[str] = field(default_factory=list)
+
+
+#: Legacy config-dict key -> migration applied by :func:`migrate_config_dict`.
+_RENAMED_KEYS = {
+    "mmproj": "mmproj_model_path",
+    "draft_n_max": "spec_draft_n_max",
+    "draft_n_min": "spec_draft_n_min",
+}
+
+#: Keys removed from the schema entirely.
+_DROPPED_KEYS = {"logical_batch_size", "kv_cache_type"}
+
+_FLASH_ATTN_LEGACY = {"enable": "on", "true": "on", "disable": "off", "false": "off"}
+
+
+def migrate_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Migrate a raw config dict (preset/profile/import) to the current schema.
+
+    Handles renamed fields, dropped fields, and legacy enum values. Unknown
+    keys are passed through; callers filter against dataclass fields.
+    """
+    import dataclasses
+
+    migrated = dict(data)
+    defaults = {f.name: f.default for f in dataclasses.fields(LlamaConfig)}
+
+    # Old preset files often contain BOTH the legacy and the new key. Prefer
+    # the new key's value when it was explicitly set; otherwise take legacy.
+    for old, new in _RENAMED_KEYS.items():
+        if old in migrated:
+            old_val = migrated.pop(old)
+            new_val = migrated.get(new)
+            if old_val not in (None, "") and (new_val in (None, "") or new_val == defaults.get(new)):
+                migrated[new] = old_val
+
+    # kv_cache_type (legacy single combo) maps to both K and V cache types
+    kv = migrated.pop("kv_cache_type", None)
+    if kv:
+        migrated.setdefault("cache_type_k", kv)
+        migrated.setdefault("cache_type_v", kv)
+
+    for key in _DROPPED_KEYS & set(migrated):
+        logger.debug("Dropping removed config key %s during migration", key)
+        migrated.pop(key, None)
+
+    fa = migrated.get("flash_attn")
+    if isinstance(fa, str) and fa.lower() in _FLASH_ATTN_LEGACY:
+        migrated["flash_attn"] = _FLASH_ATTN_LEGACY[fa.lower()]
+
+    # Optional[str] fields became plain str; normalize None -> ""
+    for key in ("mmproj_model_path", "draft_model_path", "tensor_split"):
+        if migrated.get(key) is None:
+            migrated[key] = ""
+
+    return migrated

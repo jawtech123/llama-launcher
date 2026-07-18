@@ -28,7 +28,7 @@ def test_non_default_values_are_emitted():
     )
     tokens = shlex.split(build_command(cfg))
     assert "--ctx-size" in tokens and tokens[tokens.index("--ctx-size") + 1] == "8192"
-    assert "-ngl" in tokens and tokens[tokens.index("-ngl") + 1] == "33"
+    assert "--gpu-layers" in tokens and tokens[tokens.index("--gpu-layers") + 1] == "33"
     assert "--threads" in tokens and tokens[tokens.index("--threads") + 1] == "8"
     assert "--port" in tokens and tokens[tokens.index("--port") + 1] == "9090"
     assert "--host" in tokens and tokens[tokens.index("--host") + 1] == "0.0.0.0"
@@ -46,22 +46,23 @@ def test_paths_with_spaces_are_quoted_and_roundtrip():
 
 
 def test_invalid_legacy_flags_are_never_emitted():
-    cfg = LlamaConfig(model_path="/m.gguf", kv_cache_type="q8_0", logical_batch_size=4096)
+    cfg = LlamaConfig(model_path="/m.gguf", cache_type_k="q8_0", cache_type_v="q8_0")
     cmd = build_command(cfg)
     assert "--kv-cache-type" not in cmd
     assert "--logical-batch-size" not in cmd
+    assert cmd.count("--cache-type-k") == 1
+    assert cmd.count("--cache-type-v") == 1
 
 
-def test_mmproj_emitted_exactly_once_when_both_fields_set():
-    cfg = LlamaConfig(model_path="/m.gguf", mmproj_model_path="/a.gguf", mmproj="/b.gguf")
+def test_mmproj_emitted_exactly_once():
+    cfg = LlamaConfig(model_path="/m.gguf", mmproj_model_path="/a.gguf")
     tokens = shlex.split(build_command(cfg))
     assert tokens.count("--mmproj") == 1
     assert tokens[tokens.index("--mmproj") + 1] == "/a.gguf"
 
 
 def test_spec_draft_n_emitted_exactly_once():
-    cfg = LlamaConfig(model_path="/m.gguf", draft_n_max=5, spec_draft_n_max=7,
-                      draft_n_min=1, spec_draft_n_min=2)
+    cfg = LlamaConfig(model_path="/m.gguf", spec_draft_n_max=7, spec_draft_n_min=2)
     tokens = shlex.split(build_command(cfg))
     assert tokens.count("--spec-draft-n-max") == 1
     assert tokens[tokens.index("--spec-draft-n-max") + 1] == "7"

@@ -23,7 +23,7 @@ def test_missing_model_path_rejected():
     ("threads", 9999),
     ("port", 0),
     ("port", 70000),
-    ("batch_size", 1),
+    ("batch_size", 0),
     ("batch_size", 99999),
 ])
 def test_range_validation(field, value):
@@ -36,6 +36,10 @@ def test_backend_validation():
         validate_config(LlamaConfig(model_path="/m.gguf", backend="tpu"))
 
 
-def test_kv_cache_type_validation():
-    with pytest.raises(ValidationError, match="kv_cache_type"):
-        validate_config(LlamaConfig(model_path="/m.gguf", kv_cache_type="q3_k_xx"))
+def test_cache_type_validation():
+    with pytest.raises(ValidationError, match="cache_type_k"):
+        validate_config(LlamaConfig(model_path="/m.gguf", cache_type_k="q3_k_xx"))
+
+
+def test_sycl_backend_is_accepted():
+    validate_config(LlamaConfig(model_path="/m.gguf", backend="sycl"))

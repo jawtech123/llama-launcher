@@ -11,12 +11,12 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QHBoxLayout, QTabWidget, QPushButton, QTextEdit,
                                QLineEdit, QLabel, QComboBox, QFileDialog, QGroupBox,
                                QListWidget, QListWidgetItem, QSpinBox, QCheckBox,
-                               QDialog, QFormLayout, QInputDialog, QMessageBox,
-                               QScrollArea, QDoubleSpinBox, QToolButton, QStyle, QGridLayout)
+                               QDialog, QFormLayout, QInputDialog, QMessageBox)
 from PySide6.QtGui import QFont
-from PySide6.QtCore import Qt, QProcess, QTimer, Slot, QThread, Signal
+from PySide6.QtCore import Qt, QProcess, QTimer, QThread, Signal
 
-from llama_launcher.core.config import LlamaConfig
+from llama_launcher.core.config import LlamaConfig, migrate_config_dict
+from llama_launcher.core.fields import CACHE_TYPES
 from llama_launcher.core.validator import validate_config
 from llama_launcher.core.builder import build_command
 from llama_launcher.core.parser import parse_launch_command as _parse_launch_command
@@ -27,8 +27,11 @@ from llama_launcher.models.scanner import scan_models
 from llama_launcher.models.storage import load_models as load_cached_models, save_models as save_cached_models
 from llama_launcher.remote.manager import ServerManager
 from llama_launcher.remote.types import ServerConfig, ConnectionType, ConnectionState
+from llama_launcher.gui.advanced_tab import AdvancedConfigTab
+from llama_launcher.gui.config_controller import ConfigController
 from llama_launcher.gui.server_management import ServerManagementWidget
 from llama_launcher.gui.resource_usage_panel import ResourceUsagePanel
+from llama_launcher.gui.widgets import BinaryContextSpinBox, info_label
 from llama_launcher.estimator import ResourceEstimator
 from llama_launcher.utils.helpers import get_file_size_mb
 from llama_launcher.utils.paths import config_file
@@ -172,78 +175,20 @@ class _GpuStatsWorker(QThread):
         self.stats_done.emit("")
 
 
-class BinaryContextSpinBox(QSpinBox):
-    """QSpinBox that jumps between valid binary context sizes."""
-    BINARY_CONTEXTS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
-    
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setRange(256, 1048576)
-        self.setSingleStep(1)
-        
-    def stepBy(self, steps: int):
-        current = self.value()
-        if current not in self.BINARY_CONTEXTS:
-            current = self.round_to_binary_context(current)
-        
-        try:
-            idx = self.BINARY_CONTEXTS.index(current)
-        except ValueError:
-            current = self.round_to_binary_context(current)
-            idx = self.BINARY_CONTEXTS.index(current)
-        
-        if steps > 0:
-            if idx < len(self.BINARY_CONTEXTS) - 1:
-                new_val = self.BINARY_CONTEXTS[idx + 1]
-            else:
-                new_val = self.BINARY_CONTEXTS[-1]
-        elif steps < 0:
-            if idx > 0:
-                new_val = self.BINARY_CONTEXTS[idx - 1]
-            else:
-                new_val = self.BINARY_CONTEXTS[0]
-        else:
-            return super().stepBy(steps)
-            
-        self.blockSignals(True)
-        super().setValue(new_val)
-        self.blockSignals(False)
-        self.valueChanged.emit(new_val)
-        
-    def round_to_binary_context(self, size):
-        import math
-        if size <= 256:
-            return 256
-        if size >= 1048576:
-            return 1048576
-        
-        p = int(math.log2(size))
-        lower = 1 << p
-        upper = lower << 1
-        
-        if upper > 1048576:
-            return 524288
-        
-        if size - lower < upper - size:
-            return lower
-        else:
-            return upper
-
-
 class LlamaLauncherGUI(QMainWindow):
     """Main GUI Window for llama-launcher."""
 
     def __init__(self):
         super().__init__()
-        self.config = LlamaConfig(model_path="", context_size=4096, gpu_layers=-1,
-                                  threads=0, port=8080, host="127.0.0.1", backend="auto",
-                                  use_mmap=True, kv_cache_type="f16", batch_size=2048)
+        self.config = LlamaConfig()
+        self.controller = ConfigController(self.config, self)
         self.models = []
         self.server_manager = ServerManager()
         self.gpu_info: GPUInfo = GPUInfo(backend="cpu", device_name="Detecting...")
         self.resource_estimator = ResourceEstimator()
         self._ctx_auto_set = True  # Allow auto-set on first model load
         self._active_workers = []
+        self._closing = False
         self._ensure_local_server()
         self.init_ui()
 
@@ -296,6 +241,9 @@ class LlamaLauncherGUI(QMainWindow):
         # Load saved folders and rescan
         self.load_folders()
 
+        # Push initial config values into all bound widgets
+        self.controller.sync_ui()
+
         # Defer GPU detection and model scan to after UI is shown
         QTimer.singleShot(200, self._deferred_init)
         
@@ -306,17 +254,19 @@ class LlamaLauncherGUI(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up timers, workers, and server connections on exit."""
+        # Prevent deferred timers/signals from starting new work.
+        self._closing = True
         for timer_name in ('_preset_style_timer', '_gpu_stats_timer'):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()
-        self.server_manager.disconnect_all()
+        mgmt = getattr(self, 'server_management_widget', None)
+        if mgmt is not None:
+            mgmt.shutdown()
         for w in list(self._active_workers):
             if w.isRunning():
                 w.wait(1000)
-        scan_worker = getattr(self, '_scan_worker', None)
-        if scan_worker is not None and scan_worker.isRunning():
-            scan_worker.wait(1000)
+        self.server_manager.disconnect_all()
         event.accept()
 
     def _start_worker(self, worker: QThread) -> None:
@@ -337,29 +287,6 @@ class LlamaLauncherGUI(QMainWindow):
         except ValueError:
             logger.debug("Suppressed exception", exc_info=True)
 
-    def _create_info_label(self, text, tooltip):
-        """Create a label with an information icon."""
-        widget = QWidget()
-        layout = QHBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        
-        label = QLabel(text)
-        layout.addWidget(label)
-        
-        info_btn = QToolButton()
-        info_btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation))
-        info_btn.setToolTip(tooltip)
-        info_btn.setFixedSize(16, 16)
-        info_btn.setCursor(Qt.CursorShape.WhatsThisCursor)
-        info_btn.setStyleSheet(
-            "QToolButton { border: none; background: transparent; color: #2196F3; }"
-            "QToolButton:hover { background-color: #ffffe0; color: #000000; border-radius: 4px; }"
-        )
-        layout.addWidget(info_btn)
-        
-        return widget
-        
     def create_model_browser_tab(self):
         """Create model browser tab with multiple source folders."""
         tab = QWidget()
@@ -492,7 +419,7 @@ class LlamaLauncherGUI(QMainWindow):
         self.model_combo.setMinimumWidth(300)
         self.model_browse_btn = QPushButton("Browse...")
         self.model_browse_btn.clicked.connect(self.browse_model)
-        config_form.addRow(self._create_info_label("Main Model:", "Path to the main model file (.gguf, .bin, .safetensors)."), self.model_combo)
+        config_form.addRow(info_label("Main Model:", "Path to the main model file (.gguf, .bin, .safetensors)."), self.model_combo)
         
         self.mmproj_combo = QComboBox()
         self.mmproj_combo.setEditable(True)
@@ -500,7 +427,7 @@ class LlamaLauncherGUI(QMainWindow):
         self.mmproj_combo.setMinimumWidth(300)
         self.mmproj_browse_btn = QPushButton("Browse...")
         self.mmproj_browse_btn.clicked.connect(self.browse_mmproj_model)
-        config_form.addRow(self._create_info_label("mmproj Model:", "Path to mmproj model for vision-language models."), self.mmproj_combo)
+        config_form.addRow(info_label("mmproj Model:", "Path to mmproj model for vision-language models."), self.mmproj_combo)
         
         self.draft_combo = QComboBox()
         self.draft_combo.setEditable(True)
@@ -508,16 +435,16 @@ class LlamaLauncherGUI(QMainWindow):
         self.draft_combo.setMinimumWidth(300)
         self.draft_browse_btn = QPushButton("Browse...")
         self.draft_browse_btn.clicked.connect(self.browse_draft_model)
-        config_form.addRow(self._create_info_label("Draft Model:", "Path to draft model for speculative decoding."), self.draft_combo)
+        config_form.addRow(info_label("Draft Model:", "Path to draft model for speculative decoding."), self.draft_combo)
         
         # Context Size
         self.ctx_spin = BinaryContextSpinBox()
         self.ctx_spin.setValue(4096)
         self.ctx_spin.setToolTip("Size of the prompt context in tokens. Default: 4096.")
         self.ctx_spin.editingFinished.connect(self.on_context_editing_finished)
-        self.ctx_spin.valueChanged.connect(self._sync_ctx_to_adv)
+        self.ctx_spin.valueChanged.connect(lambda *_: setattr(self, '_ctx_auto_set', False))
         self.ctx_spin.setMinimumWidth(120)
-        config_form.addRow(self._create_info_label("Context Size:", "Size of the prompt context in tokens."), self.ctx_spin)
+        config_form.addRow(info_label("Context Size:", "Size of the prompt context in tokens."), self.ctx_spin)
         
         # Threads
         self.threads_spin = QSpinBox()
@@ -529,7 +456,7 @@ class LlamaLauncherGUI(QMainWindow):
         threads_layout.addWidget(self.threads_spin)
         threads_layout.addWidget(QLabel("(0=auto)"))
         threads_layout.addStretch()
-        config_form.addRow(self._create_info_label("Threads:", "Number of CPU threads (0=auto)."), threads_layout)
+        config_form.addRow(info_label("Threads:", "Number of CPU threads (0=auto)."), threads_layout)
         
         # GPU Layers
         self.gpu_spin = QSpinBox()
@@ -541,15 +468,15 @@ class LlamaLauncherGUI(QMainWindow):
         gpu_layers_layout.addWidget(self.gpu_spin)
         gpu_layers_layout.addWidget(QLabel("(-1=all)"))
         gpu_layers_layout.addStretch()
-        config_form.addRow(self._create_info_label("GPU Layers:", "Max layers to VRAM (-1=all)."), gpu_layers_layout)
+        config_form.addRow(info_label("GPU Layers:", "Max layers to VRAM (-1=all)."), gpu_layers_layout)
         
         # Batch Size
         self.batch_spin = QSpinBox()
-        self.batch_spin.setRange(32, 4096)
+        self.batch_spin.setRange(1, 65536)
         self.batch_spin.setValue(2048)
-        self.batch_spin.setToolTip("Physical maximum batch size for internal batching operations. Default: 512.")
+        self.batch_spin.setToolTip("Logical maximum batch size (-b). Default: 2048.")
         self.batch_spin.setMinimumWidth(120)
-        config_form.addRow(self._create_info_label("Batch Size:", "Physical max batch size."), self.batch_spin)
+        config_form.addRow(info_label("Batch Size:", "Physical max batch size."), self.batch_spin)
         
         # Port
         self.port_spin = QSpinBox()
@@ -557,1273 +484,75 @@ class LlamaLauncherGUI(QMainWindow):
         self.port_spin.setValue(8080)
         self.port_spin.setToolTip("Port for the llama-server to listen on. Default: 8080.")
         self.port_spin.setMinimumWidth(120)
-        config_form.addRow(self._create_info_label("Port:", "Server listen port."), self.port_spin)
+        config_form.addRow(info_label("Port:", "Server listen port."), self.port_spin)
         
         # Host
         self.host_input = QLineEdit()
         self.host_input.setText("127.0.0.1")
         self.host_input.setToolTip("Host address for the llama-server to bind to. Default: 127.0.0.1.")
         self.host_input.setMinimumWidth(150)
-        config_form.addRow(self._create_info_label("Host:", "Server bind address."), self.host_input)
+        config_form.addRow(info_label("Host:", "Server bind address."), self.host_input)
         
         # KV Cache Type
         self.cache_combo = QComboBox()
-        self.cache_combo.addItems(["f16", "q8_0", "q4_0", "q4_1", "q5_0", "q5_1"])
-        self.cache_combo.setToolTip("KV cache data type. Default: f16.")
+        self.cache_combo.addItems(list(CACHE_TYPES))
+        self.cache_combo.setCurrentText("f16")
+        self.cache_combo.setToolTip("KV cache data type for K and V. Default: f16.")
         self.cache_combo.setMinimumWidth(120)
-        config_form.addRow(self._create_info_label("KV Cache Type:", "KV cache data type."), self.cache_combo)
+        config_form.addRow(info_label("KV Cache Type:", "KV cache data type."), self.cache_combo)
         
         # mmap checkbox
         self.mmap_check = QCheckBox("--mmap / --no-mmap")
         self.mmap_check.setChecked(True)
         self.mmap_check.setToolTip("Whether to memory-map model. Default: True (enabled). If disabled, slower load but may reduce pageouts if not using mlock.")
-        config_form.addRow(self._create_info_label("--mmap / --no-mmap", "Whether to memory-map model. Default: True (enabled). If disabled, slower load but may reduce pageouts if not using mlock."), self.mmap_check)
+        config_form.addRow(info_label("--mmap / --no-mmap", "Whether to memory-map model. Default: True (enabled). If disabled, slower load but may reduce pageouts if not using mlock."), self.mmap_check)
         
         config_layout.addLayout(config_form)
         config_group.setLayout(config_layout)
-        
+
         layout.addWidget(config_group)
-        
+
+        # Bind all basic-tab widgets to the live config via the controller.
+        self.controller.bind("model_path", self.model_combo.currentText,
+                             self.model_combo.setCurrentText, self.model_combo.currentTextChanged)
+        self.controller.bind("mmproj_model_path", self.mmproj_combo.currentText,
+                             self.mmproj_combo.setCurrentText, self.mmproj_combo.currentTextChanged)
+        self.controller.bind("draft_model_path", self.draft_combo.currentText,
+                             self.draft_combo.setCurrentText, self.draft_combo.currentTextChanged)
+        self.controller.bind("context_size", self.ctx_spin.value,
+                             self.ctx_spin.setValue, self.ctx_spin.valueChanged)
+        self.controller.bind("threads", self.threads_spin.value,
+                             self.threads_spin.setValue, self.threads_spin.valueChanged)
+        self.controller.bind("gpu_layers", self.gpu_spin.value,
+                             self.gpu_spin.setValue, self.gpu_spin.valueChanged)
+        self.controller.bind("batch_size", self.batch_spin.value,
+                             self.batch_spin.setValue, self.batch_spin.valueChanged)
+        self.controller.bind("port", self.port_spin.value,
+                             self.port_spin.setValue, self.port_spin.valueChanged)
+        self.controller.bind("host", self.host_input.text,
+                             self.host_input.setText, self.host_input.textChanged)
+        self.controller.bind("use_mmap", self.mmap_check.isChecked,
+                             self.mmap_check.setChecked, self.mmap_check.stateChanged)
+        # The basic KV cache combo drives both K and V cache types.
+        self.controller.bind("cache_type_k", self.cache_combo.currentText,
+                             self.cache_combo.setCurrentText, self.cache_combo.currentTextChanged)
+        self.cache_combo.currentTextChanged.connect(
+            lambda v: self.controller.set("cache_type_v", v))
+
         self.tab_widget.addTab(tab, "Basic Config")
         
     def create_advanced_config_tab(self):
-        """Create advanced configuration tab with all llama-server options."""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        
-        # Preset selector - compact horizontal layout at the top
-        preset_layout = QHBoxLayout()
-        
-        self.adv_preset_combo = QComboBox()
-        self.adv_preset_combo.addItems(PresetManager.get_all_presets())
-        self.adv_preset_combo.currentTextChanged.connect(self.load_preset)
-        
-        self.adv_save_preset_btn = QPushButton("Save Preset")
-        self.adv_save_preset_btn.clicked.connect(self.save_current_preset)
-        
-        preset_layout.addWidget(QLabel("Preset:"))
-        preset_layout.addWidget(self.adv_preset_combo)
-        preset_layout.addWidget(self.adv_save_preset_btn)
-        preset_layout.addStretch()
-        
-        self.manage_presets_btn_adv = QPushButton("Manage Presets...")
-        self.manage_presets_btn_adv.clicked.connect(self.open_preset_manager)
-        preset_layout.addWidget(self.manage_presets_btn_adv)
-        
-        layout.addLayout(preset_layout)
-        
-        # Use a scroll area for the advanced config
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        
-        scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_widget)
-        
-        # Common params group
-        common_group = QGroupBox("Common Parameters")
-        common_layout = QFormLayout()
-        
-        self.adv_threads_spin = QSpinBox()
-        self.adv_threads_spin.setRange(-1, 256)
-        self.adv_threads_spin.setValue(0)
-        self.adv_threads_spin.setToolTip("Number of CPU threads to use during generation. Default: 0 (auto-detect based on physical cores). Set to -1 for auto-detect based on physical cores. Example: 8 for 8 threads.")
-        common_layout.addRow(self._create_info_label("Threads (-t, --threads):", "Number of CPU threads to use during generation. Default: 0 (auto-detect based on physical cores). Set to -1 for auto-detect based on physical cores. Example: 8 for 8 threads."), self.adv_threads_spin)
-        
-        self.adv_threads_batch_spin = QSpinBox()
-        self.adv_threads_batch_spin.setRange(-1, 256)
-        self.adv_threads_batch_spin.setValue(-1)
-        self.adv_threads_batch_spin.setToolTip("Number of threads to use during batch and prompt processing. Default: -1 (same as --threads). Example: 4 for batch processing.")
-        common_layout.addRow(self._create_info_label("Threads Batch (-tb, --threads-batch):", "Number of threads to use during batch and prompt processing. Default: -1 (same as --threads). Example: 4 for batch processing."), self.adv_threads_batch_spin)
-        
-        self.adv_ctx_spin = QSpinBox()
-        self.adv_ctx_spin.setRange(0, 524288)
-        self.adv_ctx_spin.setValue(0)
-        self.adv_ctx_spin.setToolTip("Size of the prompt context in tokens. Default: 0 (load from model). Example: 4096 for 4K context, 131072 for 128K context.")
-        common_layout.addRow(self._create_info_label("Context Size (-c, --ctx-size):", "Size of the prompt context in tokens. Default: 0 (load from model). Example: 4096 for 4K context, 131072 for 128K context."), self.adv_ctx_spin)
-        
-        self.adv_predict_spin = QSpinBox()
-        self.adv_predict_spin.setRange(-1, 65536)
-        self.adv_predict_spin.setValue(-1)
-        self.adv_predict_spin.setToolTip("Number of tokens to predict. Default: -1 (infinity, generate until stop token or context limit). Example: 256 for 256 tokens.")
-        common_layout.addRow(self._create_info_label("Predict (-n, --predict/--n-predict):", "Number of tokens to predict. Default: -1 (infinity, generate until stop token or context limit). Example: 256 for 256 tokens."), self.adv_predict_spin)
-        
-        self.adv_batch_spin = QSpinBox()
-        self.adv_batch_spin.setRange(1, 65536)
-        self.adv_batch_spin.setValue(2048)
-        self.adv_batch_spin.setToolTip("Logical maximum batch size for processing. Default: 2048. Example: 2048 for standard batching.")
-        common_layout.addRow(self._create_info_label("Batch Size (-b, --batch-size):", "Logical maximum batch size for processing. Default: 2048. Example: 2048 for standard batching."), self.adv_batch_spin)
-        
-        self.adv_ubatch_spin = QSpinBox()
-        self.adv_ubatch_spin.setRange(1, 4096)
-        self.adv_ubatch_spin.setValue(512)
-        self.adv_ubatch_spin.setToolTip("Physical maximum batch size. Used for internal batching operations. Default: 512. Example: 512 for physical batch size.")
-        common_layout.addRow(self._create_info_label("UBatch Size (-ub, --ubatch-size):", "Physical maximum batch size. Used for internal batching operations. Default: 512. Example: 512 for physical batch size."), self.adv_ubatch_spin)
-        
-        self.adv_keep_spin = QSpinBox()
-        self.adv_keep_spin.setRange(-1, 131072)
-        self.adv_keep_spin.setValue(0)
-        self.adv_keep_spin.setToolTip("Number of tokens to keep from the initial prompt. Default: 0 (keep none). Set to -1 to keep all. Example: 100 to keep first 100 tokens.")
-        common_layout.addRow(self._create_info_label("Keep (--keep):", "Number of tokens to keep from the initial prompt. Default: 0 (keep none). Set to -1 to keep all. Example: 100 to keep first 100 tokens."), self.adv_keep_spin)
-        
-        self.adv_rope_scaling_combo = QComboBox()
-        self.adv_rope_scaling_combo.addItems(["none", "linear", "yarn"])
-        self.adv_rope_scaling_combo.setToolTip("RoPE frequency scaling method for extending context: 'none' (default), 'linear', or 'yarn' (YaRN). Example: yarn for models trained on 4K but needing 32K context.")
-        common_layout.addRow(self._create_info_label("RoPE Scaling (--rope-scaling):", "RoPE frequency scaling method for extending context: 'none' (default), 'linear', or 'yarn' (YaRN). Example: yarn for models trained on 4K but needing 32K context."), self.adv_rope_scaling_combo)
-        
-        self.adv_rope_scale_spin = QSpinBox()
-        self.adv_rope_scale_spin.setRange(1, 100)
-        self.adv_rope_scale_spin.setValue(1)
-        self.adv_rope_scale_spin.setToolTip("RoPE context scaling factor, expands context by a factor of N. Default: 1. Example: 8 to expand 4K context to 32K.")
-        common_layout.addRow(self._create_info_label("RoPE Scale (--rope-scale):", "RoPE context scaling factor, expands context by a factor of N. Default: 1. Example: 8 to expand 4K context to 32K."), self.adv_rope_scale_spin)
-        
-        self.adv_rope_freq_base_spin = QSpinBox()
-        self.adv_rope_freq_base_spin.setRange(0, 10000000)
-        self.adv_rope_freq_base_spin.setValue(0)
-        self.adv_rope_freq_base_spin.setToolTip("RoPE base frequency, used by NTK-aware scaling. Default: 0 (load from model). Example: 1000000 for 1M context models.")
-        common_layout.addRow(self._create_info_label("RoPE Freq Base (--rope-freq-base):", "RoPE base frequency, used by NTK-aware scaling. Default: 0 (load from model). Example: 1000000 for 1M context models."), self.adv_rope_freq_base_spin)
-        
-        self.adv_rope_freq_scale_spin = QSpinBox()
-        self.adv_rope_freq_scale_spin.setRange(0, 100)
-        self.adv_rope_freq_scale_spin.setValue(0)
-        self.adv_rope_freq_scale_spin.setToolTip("RoPE frequency scaling factor, expands context by a factor of 1/N. Default: 0 (load from model). Example: 2 to halve the frequency.")
-        common_layout.addRow(self._create_info_label("RoPE Freq Scale (--rope-freq-scale):", "RoPE frequency scaling factor, expands context by a factor of 1/N. Default: 0 (load from model). Example: 2 to halve the frequency."), self.adv_rope_freq_scale_spin)
-        
-        self.adv_cache_type_k_combo = QComboBox()
-        self.adv_cache_type_k_combo.addItems(["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"])
-        self.adv_cache_type_k_combo.setCurrentIndex(1)
-        self.adv_cache_type_k_combo.setToolTip("KV cache data type for K (Key). Default: f16. Options: f32 (highest precision, most VRAM), f16/bf16 (balanced), q8_0/q5_1/q5_0/q4_1/q4_0 (quantized, less VRAM). Example: q8_0 for good balance.")
-        common_layout.addRow(self._create_info_label("Cache Type K (-ctk, --cache-type-k):", "KV cache data type for K (Key). Default: f16. Options: f32 (highest precision, most VRAM), f16/bf16 (balanced), q8_0/q5_1/q5_0/q4_1/q4_0 (quantized, less VRAM). Example: q8_0 for good balance."), self.adv_cache_type_k_combo)
+        """Create the advanced config tab generated from the field registry."""
+        self.advanced_tab = AdvancedConfigTab(
+            self.controller,
+            preset_names=PresetManager.get_all_presets(),
+            on_preset_selected=self.load_preset,
+            on_save_preset=self.save_current_preset,
+            on_manage_presets=self.open_preset_manager,
+        )
+        self.adv_preset_combo = self.advanced_tab.preset_combo
+        self.tab_widget.addTab(self.advanced_tab, "Advanced Config")
 
-        self.adv_cache_type_v_combo = QComboBox()
-        self.adv_cache_type_v_combo.addItems(["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"])
-        self.adv_cache_type_v_combo.setCurrentIndex(1)
-        self.adv_cache_type_v_combo.setToolTip("KV cache data type for V (Value). Default: f16. Same options as Cache Type K. Example: f16 for standard, q4_0 to save VRAM.")
-        common_layout.addRow(self._create_info_label("Cache Type V (-ctv, --cache-type-v):", "KV cache data type for V (Value). Default: f16. Same options as Cache Type K. Example: f16 for standard, q4_0 to save VRAM."), self.adv_cache_type_v_combo)
-        
-        self.adv_mmap_check = QCheckBox("--mmap / --no-mmap")
-        self.adv_mmap_check.setChecked(True)
-        self.adv_mmap_check.setToolTip("Whether to memory-map model. Default: True (enabled). If disabled, slower load but may reduce pageouts if not using mlock.")
-        common_layout.addRow(self._create_info_label("--mmap / --no-mmap", "Whether to memory-map model. Default: True (enabled). If disabled, slower load but may reduce pageouts if not using mlock."), self.adv_mmap_check)
-        
-        self.adv_mlock_check = QCheckBox("--mlock")
-        self.adv_mlock_check.setToolTip("Force system to keep model in RAM rather than swapping or compressing. Prevents paging to disk. Default: disabled.")
-        common_layout.addRow(self._create_info_label("--mlock", "Force system to keep model in RAM rather than swapping or compressing. Prevents paging to disk. Default: disabled."), self.adv_mlock_check)
-        
-        common_group.setLayout(common_layout)
-        scroll_layout.addWidget(common_group)
-        
-        # GPU params group
-        gpu_group = QGroupBox("GPU Parameters")
-        gpu_layout = QFormLayout()
-        
-        self.adv_gpu_layers_spin = QSpinBox()
-        self.adv_gpu_layers_spin.setRange(-1, 999)
-        self.adv_gpu_layers_spin.setValue(-1)
-        self.adv_gpu_layers_spin.setToolTip("Max number of layers to store in VRAM. Default: -1 (all layers to GPU). Set to -1 or 'all' for all layers to GPU. Example: 33 for 33 layers, -1 for all.")
-        gpu_layout.addRow(self._create_info_label("GPU Layers (-ngl, --gpu-layers/--n-gpu-layers):", "Max number of layers to store in VRAM. Default: -1 (all layers to GPU). Set to -1 or 'all' for all layers to GPU. Example: 33 for 33 layers, -1 for all."), self.adv_gpu_layers_spin)
-        
-        self.adv_split_mode_combo = QComboBox()
-        self.adv_split_mode_combo.addItems(["none", "layer", "row", "tensor"])
-        self.adv_split_mode_combo.setCurrentIndex(1)
-        self.adv_split_mode_combo.setToolTip("How to split model across multiple GPUs: 'none' (one GPU), 'layer' (default, split layers and KV), 'row' (split weights by rows), 'tensor' (experimental). Default: layer.")
-        gpu_layout.addRow(self._create_info_label("Split Mode (-sm, --split-mode):", "How to split model across multiple GPUs: 'none' (one GPU), 'layer' (default, split layers and KV), 'row' (split weights by rows), 'tensor' (experimental). Default: layer."), self.adv_split_mode_combo)
-        
-        self.adv_tensor_split_input = QLineEdit()
-        self.adv_tensor_split_input.setPlaceholderText("e.g. 3,1")
-        self.adv_tensor_split_input.setToolTip("Fraction of model to offload to each GPU, comma-separated list of proportions. Default: not set (use split-mode=none or layer). Example: '3,1' for 75% on GPU 0, 25% on GPU 1.")
-        gpu_layout.addRow(self._create_info_label("Tensor Split (-ts, --tensor-split):", "Fraction of model to offload to each GPU, comma-separated list of proportions. Default: not set (use split-mode=none or layer). Example: '3,1' for 75% on GPU 0, 25% on GPU 1."), self.adv_tensor_split_input)
-        
-        self.adv_main_gpu_spin = QSpinBox()
-        self.adv_main_gpu_spin.setRange(0, 256)
-        self.adv_main_gpu_spin.setValue(0)
-        self.adv_main_gpu_spin.setToolTip("The GPU to use for the model (with split-mode=none), or for intermediate results and KV (with split-mode=row). Default: 0.")
-        gpu_layout.addRow(self._create_info_label("Main GPU (-mg, --main-gpu):", "The GPU to use for the model (with split-mode=none), or for intermediate results and KV (with split-mode=row). Default: 0."), self.adv_main_gpu_spin)
-        
-        gpu_group.setLayout(gpu_layout)
-        scroll_layout.addWidget(gpu_group)
-        
-        # Sampling params group
-        sampling_group = QGroupBox("Sampling Parameters")
-        sampling_layout = QFormLayout()
-        
-        self.adv_temp_spin = QDoubleSpinBox()
-        self.adv_temp_spin.setRange(0.0, 2.0)
-        self.adv_temp_spin.setSingleStep(0.05)
-        self.adv_temp_spin.setValue(0.8)
-        self.adv_temp_spin.setToolTip("Controls randomness: lower (0.1) = more deterministic/focused, higher (1.5) = more creative/random. Default: 0.8. Example: 0.7 for balanced.")
-        sampling_layout.addRow(self._create_info_label("Temperature (-temp, --temperature):", "Controls randomness: lower (0.1) = more deterministic/focused, higher (1.5) = more creative/random. Default: 0.8. Example: 0.7 for balanced."), self.adv_temp_spin)
-        
-        self.adv_top_k_spin = QSpinBox()
-        self.adv_top_k_spin.setRange(0, 128)
-        self.adv_top_k_spin.setValue(40)
-        self.adv_top_k_spin.setToolTip("Top-K sampling: restricts to top K most probable tokens. Set to 0 to disable. Default: 40. Example: 20 for more focused output.")
-        sampling_layout.addRow(self._create_info_label("Top K (-top-k):", "Top-K sampling: restricts to top K most probable tokens. Set to 0 to disable. Default: 40. Example: 20 for more focused output."), self.adv_top_k_spin)
-        
-        self.adv_top_p_spin = QDoubleSpinBox()
-        self.adv_top_p_spin.setRange(0.0, 1.0)
-        self.adv_top_p_spin.setSingleStep(0.01)
-        self.adv_top_p_spin.setValue(0.95)
-        self.adv_top_p_spin.setToolTip("Top-P (nucleus) sampling: restricts to tokens with cumulative probability P. Set to 1.0 to disable. Default: 0.95. Example: 0.9 for balanced diversity.")
-        sampling_layout.addRow(self._create_info_label("Top P (--top-p):", "Top-P (nucleus) sampling: restricts to tokens with cumulative probability P. Set to 1.0 to disable. Default: 0.95. Example: 0.9 for balanced diversity."), self.adv_top_p_spin)
-        
-        self.adv_min_p_spin = QDoubleSpinBox()
-        self.adv_min_p_spin.setRange(0.0, 1.0)
-        self.adv_min_p_spin.setSingleStep(0.01)
-        self.adv_min_p_spin.setValue(0.05)
-        self.adv_min_p_spin.setToolTip("Min-P sampling: filters tokens with probability below min-p * highest token probability. Set to 0.0 to disable. Default: 0.05.")
-        sampling_layout.addRow(self._create_info_label("Min P (--min-p):", "Min-P sampling: filters tokens with probability below min-p * highest token probability. Set to 0.0 to disable. Default: 0.05."), self.adv_min_p_spin)
-        
-        self.adv_repeat_last_n_spin = QSpinBox()
-        self.adv_repeat_last_n_spin.setRange(-1, 131072)
-        self.adv_repeat_last_n_spin.setValue(64)
-        self.adv_repeat_last_n_spin.setToolTip("Last N tokens to consider for penalty. Set to 0 to disable, -1 for context size. Default: 64. Example: 128 for longer context penalty.")
-        sampling_layout.addRow(self._create_info_label("Repeat Last N (--repeat-last-n):", "Last N tokens to consider for penalty. Set to 0 to disable, -1 for context size. Default: 64. Example: 128 for longer context penalty."), self.adv_repeat_last_n_spin)
-        
-        self.adv_repeat_penalty_spin = QDoubleSpinBox()
-        self.adv_repeat_penalty_spin.setRange(0.0, 2.0)
-        self.adv_repeat_penalty_spin.setSingleStep(0.05)
-        self.adv_repeat_penalty_spin.setValue(1.0)
-        self.adv_repeat_penalty_spin.setToolTip("Penalize repeat sequence of tokens. Set to 1.0 to disable. >1.0 penalizes repeats. Example: 1.2 to reduce repetition.")
-        sampling_layout.addRow(self._create_info_label("Repeat Penalty (--repeat-penalty):", "Penalize repeat sequence of tokens. Set to 1.0 to disable. >1.0 penalizes repeats. Example: 1.2 to reduce repetition."), self.adv_repeat_penalty_spin)
-        
-        self.adv_presence_penalty_spin = QDoubleSpinBox()
-        self.adv_presence_penalty_spin.setRange(-2.0, 2.0)
-        self.adv_presence_penalty_spin.setSingleStep(0.05)
-        self.adv_presence_penalty_spin.setValue(0.0)
-        self.adv_presence_penalty_spin.setToolTip("Repeat alpha presence penalty: >0 penalizes new tokens based on whether they appear in text. Default: 0.0. Example: 0.5 for more topics.")
-        sampling_layout.addRow(self._create_info_label("Presence Penalty (--presence-penalty):", "Repeat alpha presence penalty: >0 penalizes new tokens based on whether they appear in text. Default: 0.0. Example: 0.5 for more topics."), self.adv_presence_penalty_spin)
-        
-        self.adv_frequency_penalty_spin = QDoubleSpinBox()
-        self.adv_frequency_penalty_spin.setRange(-2.0, 2.0)
-        self.adv_frequency_penalty_spin.setSingleStep(0.05)
-        self.adv_frequency_penalty_spin.setValue(0.0)
-        self.adv_frequency_penalty_spin.setToolTip("Repeat alpha frequency penalty: >0 penalizes new tokens based on their frequency in text. Default: 0.0. Example: 0.5 for less repetition.")
-        sampling_layout.addRow(self._create_info_label("Frequency Penalty (--frequency-penalty):", "Repeat alpha frequency penalty: >0 penalizes new tokens based on their frequency in text. Default: 0.0. Example: 0.5 for less repetition."), self.adv_frequency_penalty_spin)
-
-        self.adv_ignore_eos_check = QCheckBox("--ignore-eos/--no-ignore-eos")
-        self.adv_ignore_eos_check.setToolTip("Ignore end-of-sequence token. Allows generation beyond EOS. Default: disabled.")
-        sampling_layout.addRow(self._create_info_label("--ignore-eos/--no-ignore-eos", "Ignore end-of-sequence token. Default: disabled."), self.adv_ignore_eos_check)
-
-        self.adv_backend_sampling_check = QCheckBox("--backend-sampling/--no-backend-sampling")
-        self.adv_backend_sampling_check.setToolTip("Use backend (GPU) sampling for faster generation. Default: disabled.")
-        sampling_layout.addRow(self._create_info_label("--backend-sampling/--no-backend-sampling", "Use backend (GPU) sampling. Default: disabled."), self.adv_backend_sampling_check)
-
-        sampling_group.setLayout(sampling_layout)
-        scroll_layout.addWidget(sampling_group)
-
-        # Extra Sampling group
-        extra_sampling_group = QGroupBox("Extra Sampling Parameters")
-        extra_sampling_layout = QFormLayout()
-
-        self.adv_samplers_input = QLineEdit()
-        self.adv_samplers_input.setPlaceholderText("e.g. penalties;dry;top_k;top_p;temperature")
-        self.adv_samplers_input.setToolTip("Semi-colon separated sampler chain. Default: penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature.")
-        extra_sampling_layout.addRow(self._create_info_label("Samplers (--samplers):", "Semi-colon separated sampler chain."), self.adv_samplers_input)
-
-        self.adv_sampler_seq_input = QLineEdit()
-        self.adv_sampler_seq_input.setPlaceholderText("e.g. edskypmxt")
-        self.adv_sampler_seq_input.setToolTip("Sampler sequence shorthand. Default: edskypmxt.")
-        extra_sampling_layout.addRow(self._create_info_label("Sampler Seq (--sampler-seq):", "Sampler sequence shorthand."), self.adv_sampler_seq_input)
-
-        self.adv_seed_spin = QSpinBox()
-        self.adv_seed_spin.setRange(-1, 2147483647)
-        self.adv_seed_spin.setValue(-1)
-        self.adv_seed_spin.setToolTip("Random seed for reproducibility. -1=random. Default: -1.")
-        extra_sampling_layout.addRow(self._create_info_label("Seed (--seed):", "Random seed. -1=random. Default: -1."), self.adv_seed_spin)
-
-        self.adv_top_n_sigma_spin = QDoubleSpinBox()
-        self.adv_top_n_sigma_spin.setRange(-1.0, 10.0)
-        self.adv_top_n_sigma_spin.setSingleStep(0.1)
-        self.adv_top_n_sigma_spin.setValue(-1.0)
-        self.adv_top_n_sigma_spin.setToolTip("Top-N-Sigma sampling. -1=disabled. Default: -1.")
-        extra_sampling_layout.addRow(self._create_info_label("Top N Sigma (--top-n-sigma):", "Top-N-Sigma sampling. -1=disabled. Default: -1."), self.adv_top_n_sigma_spin)
-
-        self.adv_typical_p_spin = QDoubleSpinBox()
-        self.adv_typical_p_spin.setRange(0.0, 1.0)
-        self.adv_typical_p_spin.setSingleStep(0.01)
-        self.adv_typical_p_spin.setValue(1.0)
-        self.adv_typical_p_spin.setToolTip("Locally typical sampling. 1.0=disabled. Default: 1.0.")
-        extra_sampling_layout.addRow(self._create_info_label("Typical P (--typical-p):", "Locally typical sampling. 1.0=disabled. Default: 1.0."), self.adv_typical_p_spin)
-
-        self.adv_xtc_probability_spin = QDoubleSpinBox()
-        self.adv_xtc_probability_spin.setRange(0.0, 1.0)
-        self.adv_xtc_probability_spin.setSingleStep(0.01)
-        self.adv_xtc_probability_spin.setValue(0.0)
-        self.adv_xtc_probability_spin.setToolTip("XTC turn probability. 0=disabled. Default: 0.")
-        extra_sampling_layout.addRow(self._create_info_label("XTC Probability (--xtc-probability):", "XTC turn probability. 0=disabled. Default: 0."), self.adv_xtc_probability_spin)
-
-        self.adv_xtc_threshold_spin = QDoubleSpinBox()
-        self.adv_xtc_threshold_spin.setRange(0.0, 1.0)
-        self.adv_xtc_threshold_spin.setSingleStep(0.01)
-        self.adv_xtc_threshold_spin.setValue(0.1)
-        self.adv_xtc_threshold_spin.setToolTip("XTC token probability threshold. Default: 0.1.")
-        extra_sampling_layout.addRow(self._create_info_label("XTC Threshold (--xtc-threshold):", "XTC token probability threshold. Default: 0.1."), self.adv_xtc_threshold_spin)
-
-        self.adv_logit_bias_input = QLineEdit()
-        self.adv_logit_bias_input.setPlaceholderText("e.g. 15032:1.0,15033:-1.0")
-        self.adv_logit_bias_input.setToolTip("Logit bias for token control. Default: not set.")
-        extra_sampling_layout.addRow(self._create_info_label("Logit Bias (--logit-bias):", "Logit bias for token control. Default: not set."), self.adv_logit_bias_input)
-
-        extra_sampling_group.setLayout(extra_sampling_layout)
-        scroll_layout.addWidget(extra_sampling_group)
-
-        # Adaptive & DynaTemp group
-        adaptive_group = QGroupBox("Adaptive & DynaTemp")
-        adaptive_layout = QFormLayout()
-
-        self.adv_adaptive_target_spin = QDoubleSpinBox()
-        self.adv_adaptive_target_spin.setRange(-1.0, 10.0)
-        self.adv_adaptive_target_spin.setSingleStep(0.1)
-        self.adv_adaptive_target_spin.setValue(-1.0)
-        self.adv_adaptive_target_spin.setToolTip("Adaptive temperature target. -1=disabled. Default: -1.")
-        adaptive_layout.addRow(self._create_info_label("Adaptive Target (--adaptive-target):", "Adaptive temperature target. -1=disabled. Default: -1."), self.adv_adaptive_target_spin)
-
-        self.adv_adaptive_decay_spin = QDoubleSpinBox()
-        self.adv_adaptive_decay_spin.setRange(0.0, 1.0)
-        self.adv_adaptive_decay_spin.setSingleStep(0.05)
-        self.adv_adaptive_decay_spin.setValue(0.9)
-        self.adv_adaptive_decay_spin.setToolTip("Adaptive temperature decay rate. Default: 0.9.")
-        adaptive_layout.addRow(self._create_info_label("Adaptive Decay (--adaptive-decay):", "Adaptive temperature decay rate. Default: 0.9."), self.adv_adaptive_decay_spin)
-
-        self.adv_dynatemp_range_spin = QDoubleSpinBox()
-        self.adv_dynatemp_range_spin.setRange(0.0, 5.0)
-        self.adv_dynatemp_range_spin.setSingleStep(0.1)
-        self.adv_dynatemp_range_spin.setValue(0.0)
-        self.adv_dynatemp_range_spin.setToolTip("DynaTemp range. 0=disabled. Default: 0.")
-        adaptive_layout.addRow(self._create_info_label("DynaTemp Range (--dynatemp-range):", "DynaTemp range. 0=disabled. Default: 0."), self.adv_dynatemp_range_spin)
-
-        self.adv_dynatemp_exp_spin = QDoubleSpinBox()
-        self.adv_dynatemp_exp_spin.setRange(0.0, 10.0)
-        self.adv_dynatemp_exp_spin.setSingleStep(0.1)
-        self.adv_dynatemp_exp_spin.setValue(1.0)
-        self.adv_dynatemp_exp_spin.setToolTip("DynaTemp exponent. Default: 1.0.")
-        adaptive_layout.addRow(self._create_info_label("DynaTemp Exp (--dynatemp-exp):", "DynaTemp exponent. Default: 1.0."), self.adv_dynatemp_exp_spin)
-
-        adaptive_group.setLayout(adaptive_layout)
-        scroll_layout.addWidget(adaptive_group)
-
-        # Mirostat group
-        mirostat_group = QGroupBox("Mirostat Sampling")
-        mirostat_layout = QFormLayout()
-
-        self.adv_mirostat_spin = QSpinBox()
-        self.adv_mirostat_spin.setRange(0, 2)
-        self.adv_mirostat_spin.setValue(0)
-        self.adv_mirostat_spin.setToolTip("Mirostat mode: 0=disabled, 1=Mirostat, 2=Mirostat 2.0. Default: 0.")
-        mirostat_layout.addRow(self._create_info_label("Mirostat (--mirostat):", "Mirostat mode: 0=disabled, 1=Mirostat, 2=Mirostat 2.0. Default: 0."), self.adv_mirostat_spin)
-
-        self.adv_mirostat_lr_spin = QDoubleSpinBox()
-        self.adv_mirostat_lr_spin.setRange(0.0, 1.0)
-        self.adv_mirostat_lr_spin.setSingleStep(0.01)
-        self.adv_mirostat_lr_spin.setValue(0.1)
-        self.adv_mirostat_lr_spin.setToolTip("Mirostat learning rate. Default: 0.1.")
-        mirostat_layout.addRow(self._create_info_label("Mirostat LR (--mirostat-lr):", "Mirostat learning rate. Default: 0.1."), self.adv_mirostat_lr_spin)
-
-        self.adv_mirostat_ent_spin = QDoubleSpinBox()
-        self.adv_mirostat_ent_spin.setRange(0.0, 20.0)
-        self.adv_mirostat_ent_spin.setSingleStep(0.1)
-        self.adv_mirostat_ent_spin.setValue(5.0)
-        self.adv_mirostat_ent_spin.setToolTip("Target Mirostat entropy. Default: 5.0.")
-        mirostat_layout.addRow(self._create_info_label("Mirostat Entropy (--mirostat-ent):", "Target Mirostat entropy. Default: 5.0."), self.adv_mirostat_ent_spin)
-
-        mirostat_group.setLayout(mirostat_layout)
-        scroll_layout.addWidget(mirostat_group)
-
-        # DRY (Don't Repeat Yourself) controls group
-        dry_group = QGroupBox("DRY (Anti-Repetition) Controls")
-        dry_layout = QFormLayout()
-
-        self.adv_dry_multiplier_spin = QDoubleSpinBox()
-        self.adv_dry_multiplier_spin.setRange(0.0, 10.0)
-        self.adv_dry_multiplier_spin.setSingleStep(0.05)
-        self.adv_dry_multiplier_spin.setValue(0.0)
-        self.adv_dry_multiplier_spin.setToolTip("DRY penalty multiplier. 0=disabled. Default: 0.0.")
-        dry_layout.addRow(self._create_info_label("DRY Multiplier (--dry-mul):", "DRY penalty multiplier. 0=disabled. Default: 0.0."), self.adv_dry_multiplier_spin)
-
-        self.adv_dry_base_spin = QDoubleSpinBox()
-        self.adv_dry_base_spin.setRange(0.0, 10.0)
-        self.adv_dry_base_spin.setSingleStep(0.05)
-        self.adv_dry_base_spin.setValue(1.75)
-        self.adv_dry_base_spin.setToolTip("DRY penalty base value. Default: 1.75.")
-        dry_layout.addRow(self._create_info_label("DRY Base (--dry-base):", "DRY penalty base value. Default: 1.75."), self.adv_dry_base_spin)
-
-        self.adv_dry_allowed_length_spin = QSpinBox()
-        self.adv_dry_allowed_length_spin.setRange(0, 32)
-        self.adv_dry_allowed_length_spin.setValue(2)
-        self.adv_dry_allowed_length_spin.setToolTip("DRY allowed repetition length. Default: 2.")
-        dry_layout.addRow(self._create_info_label("DRY Allowed Length (--dry-allowed-length):", "DRY allowed repetition length. Default: 2."), self.adv_dry_allowed_length_spin)
-
-        self.adv_dry_penalty_last_n_spin = QSpinBox()
-        self.adv_dry_penalty_last_n_spin.setRange(-1, 131072)
-        self.adv_dry_penalty_last_n_spin.setValue(-1)
-        self.adv_dry_penalty_last_n_spin.setToolTip("Tokens to look back for DRY penalty. -1=context size. Default: -1.")
-        dry_layout.addRow(self._create_info_label("DRY Penalty Last N (--dry-penalty-last-n):", "Tokens to look back for DRY penalty. -1=context size. Default: -1."), self.adv_dry_penalty_last_n_spin)
-
-        self.adv_dry_sequence_breaker_input = QLineEdit()
-        self.adv_dry_sequence_breaker_input.setPlaceholderText("e.g. \\n")
-        self.adv_dry_sequence_breaker_input.setToolTip("Sequence breaker token for DRY penalty. Default: not set.")
-        dry_layout.addRow(self._create_info_label("DRY Sequence Breaker (--dry-sequence-breaker):", "Sequence breaker token for DRY penalty. Default: not set."), self.adv_dry_sequence_breaker_input)
-
-        dry_group.setLayout(dry_layout)
-        scroll_layout.addWidget(dry_group)
-
-        # Speculative params group
-        spec_group = QGroupBox("Speculative Decoding Parameters")
-        spec_layout = QFormLayout()
-        
-        self.adv_draft_n_max_spin = QSpinBox()
-        self.adv_draft_n_max_spin.setRange(1, 32)
-        self.adv_draft_n_max_spin.setValue(3)
-        self.adv_draft_n_max_spin.setToolTip("Number of tokens to draft for speculative decoding. Higher = more aggressive speculation but more validation cost. Default: 3. Example: 5 for faster generation.")
-        spec_layout.addRow(self._create_info_label("Draft N Max (--spec-draft-n-max):", "Number of tokens to draft for speculative decoding. Higher = more aggressive speculation but more validation cost. Default: 3. Example: 5 for faster generation."), self.adv_draft_n_max_spin)
-        
-        self.adv_draft_n_min_spin = QSpinBox()
-        self.adv_draft_n_min_spin.setRange(0, 32)
-        self.adv_draft_n_min_spin.setValue(0)
-        self.adv_draft_n_min_spin.setToolTip("Minimum number of draft tokens to use for speculative decoding. Set to 0 to disable minimum. Default: 0.")
-        spec_layout.addRow(self._create_info_label("Draft N Min (--spec-draft-n-min):", "Minimum number of draft tokens to use for speculative decoding. Set to 0 to disable minimum. Default: 0."), self.adv_draft_n_min_spin)
-        
-        self.adv_spec_type_combo = QComboBox()
-        self.adv_spec_type_combo.addItems(["none", "ngram", "mod", "simple", "map_k", "map_k4v"])
-        self.adv_spec_type_combo.setToolTip("Speculative decoding type: 'none' (disabled), 'ngram', 'mod', 'simple', 'map_k', or 'map_k4v'. Default: none.")
-        spec_layout.addRow(self._create_info_label("Spec Type (--spec-type):", "Speculative decoding type: 'none' (disabled), 'ngram', 'mod', 'simple', 'map_k', or 'map_k4v'. Default: none."), self.adv_spec_type_combo)
-
-        self.adv_spec_draft_model_input = QLineEdit()
-        self.adv_spec_draft_model_input.setPlaceholderText("e.g. /path/to/draft-model.gguf")
-        self.adv_spec_draft_model_input.setToolTip("Path to speculative draft model. Default: not set.")
-        spec_layout.addRow(self._create_info_label("Spec Draft Model (--spec-draft-model):", "Path to speculative draft model. Default: not set."), self.adv_spec_draft_model_input)
-
-        self.adv_spec_draft_threads_spin = QSpinBox()
-        self.adv_spec_draft_threads_spin.setRange(0, 256)
-        self.adv_spec_draft_threads_spin.setValue(0)
-        self.adv_spec_draft_threads_spin.setToolTip("Number of threads for speculative draft model. 0=auto. Default: 0.")
-        spec_layout.addRow(self._create_info_label("Spec Draft Threads (--spec-draft-threads):", "Threads for speculative draft model. 0=auto. Default: 0."), self.adv_spec_draft_threads_spin)
-
-        self.adv_spec_draft_threads_batch_spin = QSpinBox()
-        self.adv_spec_draft_threads_batch_spin.setRange(-1, 256)
-        self.adv_spec_draft_threads_batch_spin.setValue(-1)
-        self.adv_spec_draft_threads_batch_spin.setToolTip("Threads for speculative draft batch processing. -1=same as draft threads. Default: -1.")
-        spec_layout.addRow(self._create_info_label("Spec Draft Threads Batch (--spec-draft-threads-batch):", "Threads for speculative draft batch. -1=same as draft threads. Default: -1."), self.adv_spec_draft_threads_batch_spin)
-
-        self.adv_spec_draft_hf_input = QLineEdit()
-        self.adv_spec_draft_hf_input.setPlaceholderText("e.g. org/model-name")
-        self.adv_spec_draft_hf_input.setToolTip("Hugging Face repo for speculative draft model. Default: not set.")
-        spec_layout.addRow(self._create_info_label("Spec Draft HF Repo (--spec-draft-hf):", "Hugging Face repo for speculative draft model. Default: not set."), self.adv_spec_draft_hf_input)
-
-        self.adv_spec_draft_override_tensor_input = QLineEdit()
-        self.adv_spec_draft_override_tensor_input.setPlaceholderText("e.g. KQV=1,O=1")
-        self.adv_spec_draft_override_tensor_input.setToolTip("Override tensor split for speculative draft model. Default: not set.")
-        spec_layout.addRow(self._create_info_label("Spec Draft Override Tensor (--spec-draft-override-tensor):", "Override tensor split for speculative draft model. Default: not set."), self.adv_spec_draft_override_tensor_input)
-
-        self.adv_spec_draft_device_input = QLineEdit()
-        self.adv_spec_draft_device_input.setPlaceholderText("e.g. cuda:0,cpu")
-        self.adv_spec_draft_device_input.setToolTip("Device for speculative draft model. Default: not set.")
-        spec_layout.addRow(self._create_info_label("Spec Draft Device (--spec-draft-device):", "Device for speculative draft model. Default: not set."), self.adv_spec_draft_device_input)
-
-        self.adv_spec_draft_n_max_spin = QSpinBox()
-        self.adv_spec_draft_n_max_spin.setRange(1, 32)
-        self.adv_spec_draft_n_max_spin.setValue(3)
-        self.adv_spec_draft_n_max_spin.setToolTip("Max draft tokens for spec decoding. Default: 3.")
-        spec_layout.addRow(self._create_info_label("Spec Draft N Max (--spec-draft-n-max):", "Max draft tokens for spec decoding. Default: 3."), self.adv_spec_draft_n_max_spin)
-
-        self.adv_spec_draft_n_min_spin = QSpinBox()
-        self.adv_spec_draft_n_min_spin.setRange(0, 32)
-        self.adv_spec_draft_n_min_spin.setValue(0)
-        self.adv_spec_draft_n_min_spin.setToolTip("Min draft tokens for spec decoding. Default: 0.")
-        spec_layout.addRow(self._create_info_label("Spec Draft N Min (--spec-draft-n-min):", "Min draft tokens for spec decoding. Default: 0."), self.adv_spec_draft_n_min_spin)
-
-        self.adv_spec_draft_p_split_spin = QDoubleSpinBox()
-        self.adv_spec_draft_p_split_spin.setRange(0.0, 1.0)
-        self.adv_spec_draft_p_split_spin.setSingleStep(0.05)
-        self.adv_spec_draft_p_split_spin.setValue(0.1)
-        self.adv_spec_draft_p_split_spin.setToolTip("Spec draft p-split threshold. Default: 0.1.")
-        spec_layout.addRow(self._create_info_label("Spec Draft P Split (--spec-draft-p-split):", "Spec draft p-split threshold. Default: 0.1."), self.adv_spec_draft_p_split_spin)
-
-        self.adv_spec_draft_p_min_spin = QDoubleSpinBox()
-        self.adv_spec_draft_p_min_spin.setRange(0.0, 1.0)
-        self.adv_spec_draft_p_min_spin.setSingleStep(0.05)
-        self.adv_spec_draft_p_min_spin.setValue(0.0)
-        self.adv_spec_draft_p_min_spin.setToolTip("Spec draft p-min threshold. Default: 0.0.")
-        spec_layout.addRow(self._create_info_label("Spec Draft P Min (--spec-draft-p-min):", "Spec draft p-min threshold. Default: 0.0."), self.adv_spec_draft_p_min_spin)
-
-        self.adv_spec_draft_backend_sampling_check = QCheckBox("--spec-draft-backend-sampling/--no-spec-draft-backend-sampling")
-        self.adv_spec_draft_backend_sampling_check.setChecked(True)
-        self.adv_spec_draft_backend_sampling_check.setToolTip("Use backend sampling for spec draft. Default: enabled.")
-        spec_layout.addRow(self._create_info_label("--spec-draft-backend-sampling", "Use backend sampling for spec draft. Default: enabled."), self.adv_spec_draft_backend_sampling_check)
-
-        self.adv_spec_draft_ngl_spin = QSpinBox()
-        self.adv_spec_draft_ngl_spin.setRange(-1, 999)
-        self.adv_spec_draft_ngl_spin.setValue(-1)
-        self.adv_spec_draft_ngl_spin.setToolTip("GPU layers for spec draft model. -1=all. Default: -1.")
-        spec_layout.addRow(self._create_info_label("Spec Draft NGL (--spec-draft-ngl):", "GPU layers for spec draft model. Default: -1."), self.adv_spec_draft_ngl_spin)
-
-        spec_group.setLayout(spec_layout)
-        scroll_layout.addWidget(spec_group)
-        
-        # Spec draft cache types group
-        spec_draft_cache_group = QGroupBox("Spec Draft Cache Types")
-        spec_draft_cache_layout = QFormLayout()
-        
-        self.adv_spec_draft_type_k_combo = QComboBox()
-        self.adv_spec_draft_type_k_combo.addItems(["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"])
-        self.adv_spec_draft_type_k_combo.setCurrentIndex(1)
-        self.adv_spec_draft_type_k_combo.setToolTip("KV cache data type for K (Key) in spec draft. Default: f16.")
-        spec_draft_cache_layout.addRow(self._create_info_label("Spec Draft Type K (--spec-draft-type-k):", "KV cache data type for K (Key) in spec draft. Default: f16."), self.adv_spec_draft_type_k_combo)
-        
-        self.adv_spec_draft_type_v_combo = QComboBox()
-        self.adv_spec_draft_type_v_combo.addItems(["f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1"])
-        self.adv_spec_draft_type_v_combo.setCurrentIndex(1)
-        self.adv_spec_draft_type_v_combo.setToolTip("KV cache data type for V (Value) in spec draft. Default: f16.")
-        spec_draft_cache_layout.addRow(self._create_info_label("Spec Draft Type V (--spec-draft-type-v):", "KV cache data type for V (Value) in spec draft. Default: f16."), self.adv_spec_draft_type_v_combo)
-        
-        spec_draft_cache_group.setLayout(spec_draft_cache_layout)
-        scroll_layout.addWidget(spec_draft_cache_group)
-
-        # Grammar & Schema group
-        grammar_schema_group = QGroupBox("Grammar & Schema Constraints")
-        grammar_schema_layout = QFormLayout()
-
-        self.adv_grammar_input = QLineEdit()
-        self.adv_grammar_input.setPlaceholderText("e.g. [a-z]+")
-        self.adv_grammar_input.setToolTip("GBNF grammar string for constrained generation. Default: not set.")
-        grammar_schema_layout.addRow(self._create_info_label("Grammar (--grammar):", "GBNF grammar string for constrained generation. Default: not set."), self.adv_grammar_input)
-
-        self.adv_grammar_file_input = QLineEdit()
-        self.adv_grammar_file_input.setPlaceholderText("e.g. /path/to/grammar.gbnf")
-        self.adv_grammar_file_input.setToolTip("Path to GBNF grammar file. Default: not set.")
-        grammar_schema_layout.addRow(self._create_info_label("Grammar File (--grammar-file):", "Path to GBNF grammar file. Default: not set."), self.adv_grammar_file_input)
-
-        self.adv_json_schema_input = QLineEdit()
-        self.adv_json_schema_input.setPlaceholderText("e.g. {...}")
-        self.adv_json_schema_input.setToolTip("JSON schema string for constrained generation. Default: not set.")
-        grammar_schema_layout.addRow(self._create_info_label("JSON Schema (--json-schema):", "JSON schema string for constrained generation. Default: not set."), self.adv_json_schema_input)
-
-        self.adv_json_schema_file_input = QLineEdit()
-        self.adv_json_schema_file_input.setPlaceholderText("e.g. /path/to/schema.json")
-        self.adv_json_schema_file_input.setToolTip("Path to JSON schema file. Default: not set.")
-        grammar_schema_layout.addRow(self._create_info_label("JSON Schema File (--json-schema-file):", "Path to JSON schema file. Default: not set."), self.adv_json_schema_file_input)
-
-        grammar_schema_group.setLayout(grammar_schema_layout)
-        scroll_layout.addWidget(grammar_schema_group)
-
-        # Spec N-gram & Mod Parameters group
-        spec_ngram_group = QGroupBox("Speculative N-Gram / Mod Parameters")
-        spec_ngram_layout = QFormLayout()
-
-        self.adv_spec_ngram_mod_n_min_spin = QSpinBox()
-        self.adv_spec_ngram_mod_n_min_spin.setRange(1, 128)
-        self.adv_spec_ngram_mod_n_min_spin.setValue(48)
-        self.adv_spec_ngram_mod_n_min_spin.setToolTip("Min n-gram mod sequence length. Default: 48.")
-        spec_ngram_layout.addRow(self._create_info_label("N-Gram Mod N Min (--spec-ngram-mod-n-min):", "Min n-gram mod sequence length. Default: 48."), self.adv_spec_ngram_mod_n_min_spin)
-
-        self.adv_spec_ngram_mod_n_max_spin = QSpinBox()
-        self.adv_spec_ngram_mod_n_max_spin.setRange(1, 128)
-        self.adv_spec_ngram_mod_n_max_spin.setValue(64)
-        self.adv_spec_ngram_mod_n_max_spin.setToolTip("Max n-gram mod sequence length. Default: 64.")
-        spec_ngram_layout.addRow(self._create_info_label("N-Gram Mod N Max (--spec-ngram-mod-n-max):", "Max n-gram mod sequence length. Default: 64."), self.adv_spec_ngram_mod_n_max_spin)
-
-        self.adv_spec_ngram_mod_n_match_spin = QSpinBox()
-        self.adv_spec_ngram_mod_n_match_spin.setRange(1, 128)
-        self.adv_spec_ngram_mod_n_match_spin.setValue(24)
-        self.adv_spec_ngram_mod_n_match_spin.setToolTip("N-gram mod match length. Default: 24.")
-        spec_ngram_layout.addRow(self._create_info_label("N-Gram Mod N Match (--spec-ngram-mod-n-match):", "N-gram mod match length. Default: 24."), self.adv_spec_ngram_mod_n_match_spin)
-
-        self.adv_spec_ngram_simple_size_n_spin = QSpinBox()
-        self.adv_spec_ngram_simple_size_n_spin.setRange(1, 128)
-        self.adv_spec_ngram_simple_size_n_spin.setValue(12)
-        self.adv_spec_ngram_simple_size_n_spin.setToolTip("Simple n-gram size N. Default: 12.")
-        spec_ngram_layout.addRow(self._create_info_label("Simple Size N (--spec-ngram-simple-size-n):", "Simple n-gram size N. Default: 12."), self.adv_spec_ngram_simple_size_n_spin)
-
-        self.adv_spec_ngram_simple_size_m_spin = QSpinBox()
-        self.adv_spec_ngram_simple_size_m_spin.setRange(1, 128)
-        self.adv_spec_ngram_simple_size_m_spin.setValue(48)
-        self.adv_spec_ngram_simple_size_m_spin.setToolTip("Simple n-gram size M. Default: 48.")
-        spec_ngram_layout.addRow(self._create_info_label("Simple Size M (--spec-ngram-simple-size-m):", "Simple n-gram size M. Default: 48."), self.adv_spec_ngram_simple_size_m_spin)
-
-        self.adv_spec_ngram_simple_min_hits_spin = QSpinBox()
-        self.adv_spec_ngram_simple_min_hits_spin.setRange(0, 32)
-        self.adv_spec_ngram_simple_min_hits_spin.setValue(1)
-        self.adv_spec_ngram_simple_min_hits_spin.setToolTip("Simple n-gram min hits. Default: 1.")
-        spec_ngram_layout.addRow(self._create_info_label("Simple Min Hits (--spec-ngram-simple-min-hits):", "Simple n-gram min hits. Default: 1."), self.adv_spec_ngram_simple_min_hits_spin)
-
-        self.adv_spec_ngram_map_k_size_n_spin = QSpinBox()
-        self.adv_spec_ngram_map_k_size_n_spin.setRange(1, 128)
-        self.adv_spec_ngram_map_k_size_n_spin.setValue(12)
-        self.adv_spec_ngram_map_k_size_n_spin.setToolTip("Map K size N. Default: 12.")
-        spec_ngram_layout.addRow(self._create_info_label("Map K Size N (--spec-ngram-map-k-size-n):", "Map K size N. Default: 12."), self.adv_spec_ngram_map_k_size_n_spin)
-
-        self.adv_spec_ngram_map_k_size_m_spin = QSpinBox()
-        self.adv_spec_ngram_map_k_size_m_spin.setRange(1, 128)
-        self.adv_spec_ngram_map_k_size_m_spin.setValue(48)
-        self.adv_spec_ngram_map_k_size_m_spin.setToolTip("Map K size M. Default: 48.")
-        spec_ngram_layout.addRow(self._create_info_label("Map K Size M (--spec-ngram-map-k-size-m):", "Map K size M. Default: 48."), self.adv_spec_ngram_map_k_size_m_spin)
-
-        self.adv_spec_ngram_map_k_min_hits_spin = QSpinBox()
-        self.adv_spec_ngram_map_k_min_hits_spin.setRange(0, 32)
-        self.adv_spec_ngram_map_k_min_hits_spin.setValue(1)
-        self.adv_spec_ngram_map_k_min_hits_spin.setToolTip("Map K min hits. Default: 1.")
-        spec_ngram_layout.addRow(self._create_info_label("Map K Min Hits (--spec-ngram-map-k-min-hits):", "Map K min hits. Default: 1."), self.adv_spec_ngram_map_k_min_hits_spin)
-
-        self.adv_spec_ngram_map_k4v_size_n_spin = QSpinBox()
-        self.adv_spec_ngram_map_k4v_size_n_spin.setRange(1, 128)
-        self.adv_spec_ngram_map_k4v_size_n_spin.setValue(12)
-        self.adv_spec_ngram_map_k4v_size_n_spin.setToolTip("Map K4V size N. Default: 12.")
-        spec_ngram_layout.addRow(self._create_info_label("Map K4V Size N (--spec-ngram-map-k4v-size-n):", "Map K4V size N. Default: 12."), self.adv_spec_ngram_map_k4v_size_n_spin)
-
-        self.adv_spec_ngram_map_k4v_size_m_spin = QSpinBox()
-        self.adv_spec_ngram_map_k4v_size_m_spin.setRange(1, 128)
-        self.adv_spec_ngram_map_k4v_size_m_spin.setValue(48)
-        self.adv_spec_ngram_map_k4v_size_m_spin.setToolTip("Map K4V size M. Default: 48.")
-        spec_ngram_layout.addRow(self._create_info_label("Map K4V Size M (--spec-ngram-map-k4v-size-m):", "Map K4V size M. Default: 48."), self.adv_spec_ngram_map_k4v_size_m_spin)
-
-        self.adv_spec_ngram_map_k4v_min_hits_spin = QSpinBox()
-        self.adv_spec_ngram_map_k4v_min_hits_spin.setRange(0, 32)
-        self.adv_spec_ngram_map_k4v_min_hits_spin.setValue(1)
-        self.adv_spec_ngram_map_k4v_min_hits_spin.setToolTip("Map K4V min hits. Default: 1.")
-        spec_ngram_layout.addRow(self._create_info_label("Map K4V Min Hits (--spec-ngram-map-k4v-min-hits):", "Map K4V min hits. Default: 1."), self.adv_spec_ngram_map_k4v_min_hits_spin)
-
-        spec_ngram_group.setLayout(spec_ngram_layout)
-        scroll_layout.addWidget(spec_ngram_group)
-
-        # Threads & Batching params group
-        threads_batch_group = QGroupBox("Threads & Batching Parameters")
-        threads_batch_layout = QFormLayout()
-        
-        self.adv_cpu_mask_input = QLineEdit()
-        self.adv_cpu_mask_input.setPlaceholderText("e.g. 0x1,0x2")
-        self.adv_cpu_mask_input.setToolTip("CPU affinity mask for main thread. Default: not set.")
-        threads_batch_layout.addRow(self._create_info_label("CPU Mask (--cpu-mask):", "CPU affinity mask for main thread. Default: not set."), self.adv_cpu_mask_input)
-        
-        self.adv_cpu_range_input = QLineEdit()
-        self.adv_cpu_range_input.setPlaceholderText("e.g. 0-3,4-7")
-        self.adv_cpu_range_input.setToolTip("CPU range for main thread. Default: not set.")
-        threads_batch_layout.addRow(self._create_info_label("CPU Range (--cpu-range):", "CPU range for main thread. Default: not set."), self.adv_cpu_range_input)
-        
-        self.adv_cpu_strict_spin = QSpinBox()
-        self.adv_cpu_strict_spin.setRange(0, 1)
-        self.adv_cpu_strict_spin.setValue(0)
-        self.adv_cpu_strict_spin.setToolTip("Strict CPU affinity for main thread. Default: 0 (disabled).")
-        threads_batch_layout.addRow(self._create_info_label("CPU Strict (--cpu-strict):", "Strict CPU affinity for main thread. Default: 0 (disabled)."), self.adv_cpu_strict_spin)
-        
-        self.adv_prio_spin = QSpinBox()
-        self.adv_prio_spin.setRange(-2, 2)
-        self.adv_prio_spin.setValue(0)
-        self.adv_prio_spin.setToolTip("Thread priority for main thread: -2=lowest, -1=low, 0=default, 1=high, 2=highest. Default: 0.")
-        threads_batch_layout.addRow(self._create_info_label("Prio (--prio):", "Thread priority for main thread: -2=lowest, -1=low, 0=default, 1=high, 2=highest. Default: 0."), self.adv_prio_spin)
-        
-        self.adv_poll_spin = QSpinBox()
-        self.adv_poll_spin.setRange(0, 1000)
-        self.adv_poll_spin.setValue(50)
-        self.adv_poll_spin.setToolTip("Polling interval for main thread in ms. Default: 50.")
-        threads_batch_layout.addRow(self._create_info_label("Poll (--poll):", "Polling interval for main thread in ms. Default: 50."), self.adv_poll_spin)
-        
-        self.adv_cpu_mask_batch_input = QLineEdit()
-        self.adv_cpu_mask_batch_input.setPlaceholderText("e.g. 0x1,0x2")
-        self.adv_cpu_mask_batch_input.setToolTip("CPU affinity mask for batch thread. Default: not set.")
-        threads_batch_layout.addRow(self._create_info_label("CPU Mask Batch (--cpu-mask-batch):", "CPU affinity mask for batch thread. Default: not set."), self.adv_cpu_mask_batch_input)
-        
-        self.adv_cpu_range_batch_input = QLineEdit()
-        self.adv_cpu_range_batch_input.setPlaceholderText("e.g. 0-3,4-7")
-        self.adv_cpu_range_batch_input.setToolTip("CPU range for batch thread. Default: not set.")
-        threads_batch_layout.addRow(self._create_info_label("CPU Range Batch (--cpu-range-batch):", "CPU range for batch thread. Default: not set."), self.adv_cpu_range_batch_input)
-        
-        self.adv_cpu_strict_batch_spin = QSpinBox()
-        self.adv_cpu_strict_batch_spin.setRange(0, 1)
-        self.adv_cpu_strict_batch_spin.setValue(0)
-        self.adv_cpu_strict_batch_spin.setToolTip("Strict CPU affinity for batch thread. Default: 0 (disabled).")
-        threads_batch_layout.addRow(self._create_info_label("CPU Strict Batch (--cpu-strict-batch):", "Strict CPU affinity for batch thread. Default: 0 (disabled)."), self.adv_cpu_strict_batch_spin)
-        
-        self.adv_prio_batch_spin = QSpinBox()
-        self.adv_prio_batch_spin.setRange(-2, 2)
-        self.adv_prio_batch_spin.setValue(0)
-        self.adv_prio_batch_spin.setToolTip("Thread priority for batch thread: -2=lowest, -1=low, 0=default, 1=high, 2=highest. Default: 0.")
-        threads_batch_layout.addRow(self._create_info_label("Prio Batch (--prio-batch):", "Thread priority for batch thread: -2=lowest, -1=low, 0=default, 1=high, 2=highest. Default: 0."), self.adv_prio_batch_spin)
-        
-        self.adv_poll_batch_spin = QSpinBox()
-        self.adv_poll_batch_spin.setRange(0, 1000)
-        self.adv_poll_batch_spin.setValue(0)
-        self.adv_poll_batch_spin.setToolTip("Polling interval for batch thread in ms. Default: 0 (inherit from main).")
-        threads_batch_layout.addRow(self._create_info_label("Poll Batch (--poll-batch):", "Polling interval for batch thread in ms. Default: 0 (inherit from main)."), self.adv_poll_batch_spin)
-        
-        threads_batch_group.setLayout(threads_batch_layout)
-        scroll_layout.addWidget(threads_batch_group)
-
-        # Spec Draft CPU Affinity group
-        spec_cpu_group = QGroupBox("Spec Draft CPU Affinity")
-        spec_cpu_layout = QFormLayout()
-
-        self.adv_spec_draft_cpu_mask_input = QLineEdit()
-        self.adv_spec_draft_cpu_mask_input.setPlaceholderText("e.g. 0x1,0x2")
-        self.adv_spec_draft_cpu_mask_input.setToolTip("CPU affinity mask for spec draft. Default: not set.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft CPU Mask (--spec-draft-cpu-mask):", "CPU affinity mask for spec draft. Default: not set."), self.adv_spec_draft_cpu_mask_input)
-
-        self.adv_spec_draft_cpu_range_input = QLineEdit()
-        self.adv_spec_draft_cpu_range_input.setPlaceholderText("e.g. 0-3,4-7")
-        self.adv_spec_draft_cpu_range_input.setToolTip("CPU range for spec draft. Default: not set.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft CPU Range (--spec-draft-cpu-range):", "CPU range for spec draft. Default: not set."), self.adv_spec_draft_cpu_range_input)
-
-        self.adv_spec_draft_cpu_strict_spin = QSpinBox()
-        self.adv_spec_draft_cpu_strict_spin.setRange(0, 1)
-        self.adv_spec_draft_cpu_strict_spin.setValue(0)
-        self.adv_spec_draft_cpu_strict_spin.setToolTip("Strict CPU affinity for spec draft. Default: 0.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft CPU Strict (--spec-draft-cpu-strict):", "Strict CPU affinity for spec draft. Default: 0."), self.adv_spec_draft_cpu_strict_spin)
-
-        self.adv_spec_draft_prio_spin = QSpinBox()
-        self.adv_spec_draft_prio_spin.setRange(-2, 2)
-        self.adv_spec_draft_prio_spin.setValue(0)
-        self.adv_spec_draft_prio_spin.setToolTip("Thread priority for spec draft. 0=default. Default: 0.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft Prio (--spec-draft-prio):", "Thread priority for spec draft. Default: 0."), self.adv_spec_draft_prio_spin)
-
-        self.adv_spec_draft_poll_spin = QSpinBox()
-        self.adv_spec_draft_poll_spin.setRange(0, 1000)
-        self.adv_spec_draft_poll_spin.setValue(0)
-        self.adv_spec_draft_poll_spin.setToolTip("Polling interval for spec draft in ms. Default: 0.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft Poll (--spec-draft-poll):", "Polling interval for spec draft in ms. Default: 0."), self.adv_spec_draft_poll_spin)
-
-        self.adv_spec_draft_cpu_mask_batch_input = QLineEdit()
-        self.adv_spec_draft_cpu_mask_batch_input.setPlaceholderText("e.g. 0x1,0x2")
-        self.adv_spec_draft_cpu_mask_batch_input.setToolTip("CPU mask for spec draft batch. Default: not set.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft CPU Mask Batch (--spec-draft-cpu-mask-batch):", "CPU mask for spec draft batch. Default: not set."), self.adv_spec_draft_cpu_mask_batch_input)
-
-        self.adv_spec_draft_cpu_strict_batch_spin = QSpinBox()
-        self.adv_spec_draft_cpu_strict_batch_spin.setRange(0, 1)
-        self.adv_spec_draft_cpu_strict_batch_spin.setValue(0)
-        self.adv_spec_draft_cpu_strict_batch_spin.setToolTip("Strict CPU affinity for spec draft batch. Default: 0.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft CPU Strict Batch (--spec-draft-cpu-strict-batch):", "Strict CPU affinity for spec draft batch. Default: 0."), self.adv_spec_draft_cpu_strict_batch_spin)
-
-        self.adv_spec_draft_prio_batch_spin = QSpinBox()
-        self.adv_spec_draft_prio_batch_spin.setRange(-2, 2)
-        self.adv_spec_draft_prio_batch_spin.setValue(0)
-        self.adv_spec_draft_prio_batch_spin.setToolTip("Priority for spec draft batch. Default: 0.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft Prio Batch (--spec-draft-prio-batch):", "Priority for spec draft batch. Default: 0."), self.adv_spec_draft_prio_batch_spin)
-
-        self.adv_spec_draft_poll_batch_spin = QSpinBox()
-        self.adv_spec_draft_poll_batch_spin.setRange(0, 1000)
-        self.adv_spec_draft_poll_batch_spin.setValue(0)
-        self.adv_spec_draft_poll_batch_spin.setToolTip("Polling interval for spec draft batch. Default: 0.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft Poll Batch (--spec-draft-poll-batch):", "Polling interval for spec draft batch. Default: 0."), self.adv_spec_draft_poll_batch_spin)
-
-        self.adv_spec_draft_cpu_moe_check = QCheckBox("--spec-draft-cpu-moe/--no-spec-draft-cpu-moe")
-        self.adv_spec_draft_cpu_moe_check.setToolTip("Offload spec draft MoE layers to CPU. Default: disabled.")
-        spec_cpu_layout.addRow(self._create_info_label("--spec-draft-cpu-moe", "Offload spec draft MoE layers to CPU. Default: disabled."), self.adv_spec_draft_cpu_moe_check)
-
-        self.adv_spec_draft_n_cpu_moe_spin = QSpinBox()
-        self.adv_spec_draft_n_cpu_moe_spin.setRange(0, 256)
-        self.adv_spec_draft_n_cpu_moe_spin.setValue(0)
-        self.adv_spec_draft_n_cpu_moe_spin.setToolTip("CPU threads for spec draft MoE. 0=auto. Default: 0.")
-        spec_cpu_layout.addRow(self._create_info_label("Spec Draft N CPU MoE (--spec-draft-n-cpu-moe):", "CPU threads for spec draft MoE. Default: 0."), self.adv_spec_draft_n_cpu_moe_spin)
-
-        spec_cpu_group.setLayout(spec_cpu_layout)
-        scroll_layout.addWidget(spec_cpu_group)
-
-        # Context & Predict params group
-        context_predict_group = QGroupBox("Context & Predict Parameters")
-        context_predict_layout = QFormLayout()
-        
-        self.adv_swa_full_check = QCheckBox("--swa-full/--no-swa-full")
-        self.adv_swa_full_check.setToolTip("Enable full SWA (Sliding Window Attention). Default: disabled.")
-        context_predict_layout.addRow(self._create_info_label("--swa-full/--no-swa-full", "Enable full SWA (Sliding Window Attention). Default: disabled."), self.adv_swa_full_check)
-        
-        self.adv_flash_attn_combo = QComboBox()
-        self.adv_flash_attn_combo.addItems(["auto", "enable", "disable"])
-        self.adv_flash_attn_combo.setToolTip("Flash attention mode: 'auto', 'enable', or 'disable'. Default: auto.")
-        context_predict_layout.addRow(self._create_info_label("Flash Attention (--flash-attn):", "Flash attention mode: 'auto', 'enable', or 'disable'. Default: auto."), self.adv_flash_attn_combo)
-        
-        self.adv_perf_check = QCheckBox("--perf/--no-perf")
-        self.adv_perf_check.setToolTip("Print performance information. Default: disabled.")
-        context_predict_layout.addRow(self._create_info_label("--perf/--no-perf", "Print performance information. Default: disabled."), self.adv_perf_check)
-        
-        self.adv_escape_check = QCheckBox("--escape/--no-escape")
-        self.adv_escape_check.setChecked(True)
-        self.adv_escape_check.setToolTip("Process escape sequences in input. Default: enabled.")
-        context_predict_layout.addRow(self._create_info_label("--escape/--no-escape", "Process escape sequences in input. Default: enabled."), self.adv_escape_check)
-        
-        context_predict_group.setLayout(context_predict_layout)
-        scroll_layout.addWidget(context_predict_group)
-        
-        # YaRN params group
-        yarn_group = QGroupBox("YaRN RoPE Extension Parameters")
-        yarn_layout = QFormLayout()
-        
-        self.adv_yarn_orig_ctx_spin = QSpinBox()
-        self.adv_yarn_orig_ctx_spin.setRange(0, 131072)
-        self.adv_yarn_orig_ctx_spin.setValue(0)
-        self.adv_yarn_orig_ctx_spin.setToolTip("Original context size for YaRN scaling. Default: 0 (load from model). Example: 4096 for 4K original context.")
-        yarn_layout.addRow(self._create_info_label("YaRN Orig Context (--yarn-orig-ctx):", "Original context size for YaRN scaling. Default: 0 (load from model). Example: 4096 for 4K original context."), self.adv_yarn_orig_ctx_spin)
-        
-        self.adv_yarn_ext_factor_spin = QDoubleSpinBox()
-        self.adv_yarn_ext_factor_spin.setRange(-1.0, 100.0)
-        self.adv_yarn_ext_factor_spin.setSingleStep(0.1)
-        self.adv_yarn_ext_factor_spin.setValue(-1.0)
-        self.adv_yarn_ext_factor_spin.setToolTip("YaRN extrapolation mix factor. Default: -1.0 (auto). Example: 1.0 for full extrapolation.")
-        yarn_layout.addRow(self._create_info_label("YaRN Ext Factor (--yarn-ext-factor):", "YaRN extrapolation mix factor. Default: -1.0 (auto). Example: 1.0 for full extrapolation."), self.adv_yarn_ext_factor_spin)
-        
-        self.adv_yarn_attn_factor_spin = QDoubleSpinBox()
-        self.adv_yarn_attn_factor_spin.setRange(-1.0, 100.0)
-        self.adv_yarn_attn_factor_spin.setSingleStep(0.1)
-        self.adv_yarn_attn_factor_spin.setValue(-1.0)
-        self.adv_yarn_attn_factor_spin.setToolTip("YaRN attention scaling factor. Default: -1.0 (auto). Example: 1.0 for full scaling.")
-        yarn_layout.addRow(self._create_info_label("YaRN Attn Factor (--yarn-attn-factor):", "YaRN attention scaling factor. Default: -1.0 (auto). Example: 1.0 for full scaling."), self.adv_yarn_attn_factor_spin)
-        
-        self.adv_yarn_beta_slow_spin = QDoubleSpinBox()
-        self.adv_yarn_beta_slow_spin.setRange(-1.0, 100.0)
-        self.adv_yarn_beta_slow_spin.setSingleStep(0.1)
-        self.adv_yarn_beta_slow_spin.setValue(-1.0)
-        self.adv_yarn_beta_slow_spin.setToolTip("YaRN beta slow factor for scaling. Default: -1.0 (auto).")
-        yarn_layout.addRow(self._create_info_label("YaRN Beta Slow (--yarn-beta-slow):", "YaRN beta slow factor for scaling. Default: -1.0 (auto)."), self.adv_yarn_beta_slow_spin)
-        
-        self.adv_yarn_beta_fast_spin = QDoubleSpinBox()
-        self.adv_yarn_beta_fast_spin.setRange(-1.0, 100.0)
-        self.adv_yarn_beta_fast_spin.setSingleStep(0.1)
-        self.adv_yarn_beta_fast_spin.setValue(-1.0)
-        self.adv_yarn_beta_fast_spin.setToolTip("YaRN beta fast factor for scaling. Default: -1.0 (auto).")
-        yarn_layout.addRow(self._create_info_label("YaRN Beta Fast (--yarn-beta-fast):", "YaRN beta fast factor for scaling. Default: -1.0 (auto)."), self.adv_yarn_beta_fast_spin)
-        
-        yarn_group.setLayout(yarn_layout)
-        scroll_layout.addWidget(yarn_group)
-        
-        # Cache & Memory params group
-        cache_mem_group = QGroupBox("Cache & Memory Parameters")
-        cache_mem_layout = QFormLayout()
-        
-        self.adv_kv_offload_check = QCheckBox("--kv-offload/--no-kv-offload")
-        self.adv_kv_offload_check.setChecked(True)
-        self.adv_kv_offload_check.setToolTip("Offload KV cache to system RAM if VRAM is full. Default: enabled.")
-        cache_mem_layout.addRow(self._create_info_label("--kv-offload/--no-kv-offload", "Offload KV cache to system RAM if VRAM is full. Default: enabled."), self.adv_kv_offload_check)
-        
-        self.adv_repack_check = QCheckBox("--repack/--no-repack")
-        self.adv_repack_check.setChecked(True)
-        self.adv_repack_check.setToolTip("Repack KV cache for better memory efficiency. Default: enabled.")
-        cache_mem_layout.addRow(self._create_info_label("--repack/--no-repack", "Repack KV cache for better memory efficiency. Default: enabled."), self.adv_repack_check)
-        
-        self.adv_no_host_check = QCheckBox("--no-host/--host")
-        self.adv_no_host_check.setToolTip("Do not keep model in host RAM. Default: disabled (keep in host RAM).")
-        cache_mem_layout.addRow(self._create_info_label("--no-host/--host", "Do not keep model in host RAM. Default: disabled (keep in host RAM)."), self.adv_no_host_check)
-        
-        self.adv_defrag_thold_spin = QSpinBox()
-        self.adv_defrag_thold_spin.setRange(0, 100)
-        self.adv_defrag_thold_spin.setValue(0)
-        self.adv_defrag_thold_spin.setToolTip("KV cache defragmentation threshold (0=disabled). Default: 0.")
-        cache_mem_layout.addRow(self._create_info_label("Defrag Thold (--defrag-thold):", "KV cache defragmentation threshold (0=disabled). Default: 0."), self.adv_defrag_thold_spin)
-        
-        self.adv_direct_io_check = QCheckBox("--direct-io/--no-direct-io")
-        self.adv_direct_io_check.setToolTip("Use direct I/O for model loading. Default: disabled.")
-        cache_mem_layout.addRow(self._create_info_label("--direct-io/--no-direct-io", "Use direct I/O for model loading. Default: disabled."), self.adv_direct_io_check)
-        
-        cache_mem_group.setLayout(cache_mem_layout)
-        scroll_layout.addWidget(cache_mem_group)
-
-        # Extra Cache & Context group
-        extra_cache_group = QGroupBox("Extra Cache & Context")
-        extra_cache_layout = QFormLayout()
-
-        self.adv_ctx_checkpoints_spin = QSpinBox()
-        self.adv_ctx_checkpoints_spin.setRange(0, 1024)
-        self.adv_ctx_checkpoints_spin.setValue(32)
-        self.adv_ctx_checkpoints_spin.setToolTip("Number of context checkpoints. Default: 32.")
-        extra_cache_layout.addRow(self._create_info_label("Context Checkpoints (--ctx-checkpoints):", "Number of context checkpoints. Default: 32."), self.adv_ctx_checkpoints_spin)
-
-        self.adv_checkpoint_min_step_spin = QSpinBox()
-        self.adv_checkpoint_min_step_spin.setRange(0, 4096)
-        self.adv_checkpoint_min_step_spin.setValue(256)
-        self.adv_checkpoint_min_step_spin.setToolTip("Minimum checkpoint step size. Default: 256.")
-        extra_cache_layout.addRow(self._create_info_label("Checkpoint Min Step (--checkpoint-min-step):", "Minimum checkpoint step size. Default: 256."), self.adv_checkpoint_min_step_spin)
-
-        self.adv_cache_ram_spin = QSpinBox()
-        self.adv_cache_ram_spin.setRange(0, 65536)
-        self.adv_cache_ram_spin.setValue(8192)
-        self.adv_cache_ram_spin.setToolTip("Cache RAM size in MB. Default: 8192.")
-        extra_cache_layout.addRow(self._create_info_label("Cache RAM (--cache-ram):", "Cache RAM size in MB. Default: 8192."), self.adv_cache_ram_spin)
-
-        self.adv_cache_idle_slots_check = QCheckBox("--cache-idle-slots/--no-cache-idle-slots")
-        self.adv_cache_idle_slots_check.setChecked(True)
-        self.adv_cache_idle_slots_check.setToolTip("Enable idle slot caching. Default: enabled.")
-        extra_cache_layout.addRow(self._create_info_label("--cache-idle-slots/--no-cache-idle-slots", "Enable idle slot caching. Default: enabled."), self.adv_cache_idle_slots_check)
-
-        self.adv_context_shift_check = QCheckBox("--context-shift/--no-context-shift")
-        self.adv_context_shift_check.setToolTip("Enable context shifting. Default: disabled.")
-        extra_cache_layout.addRow(self._create_info_label("--context-shift/--no-context-shift", "Enable context shifting. Default: disabled."), self.adv_context_shift_check)
-
-        extra_cache_group.setLayout(extra_cache_layout)
-        scroll_layout.addWidget(extra_cache_group)
-
-        # GPU & NUMA params group
-        gpu_numa_group = QGroupBox("GPU & NUMA Parameters")
-        gpu_numa_layout = QFormLayout()
-        
-        self.adv_numa_input = QLineEdit()
-        self.adv_numa_input.setPlaceholderText("e.g. 0,1 or 'prefer-numa-node'")
-        self.adv_numa_input.setToolTip("NUMA policy: '0,1' for specific nodes, 'prefer-numa-node' for NUMA-aware allocation. Default: not set.")
-        gpu_numa_layout.addRow(self._create_info_label("NUMA (--numa):", "NUMA policy: '0,1' for specific nodes, 'prefer-numa-node' for NUMA-aware allocation. Default: not set."), self.adv_numa_input)
-        
-        self.adv_device_input = QLineEdit()
-        self.adv_device_input.setPlaceholderText("e.g. cuda:0,cpu")
-        self.adv_device_input.setToolTip("Device to use: 'cuda:0', 'metal', 'vulkan', 'cpu', etc. Default: not set (auto-detect).")
-        gpu_numa_layout.addRow(self._create_info_label("Device (--device):", "Device to use: 'cuda:0', 'metal', 'vulkan', 'cpu', etc. Default: not set (auto-detect)."), self.adv_device_input)
-        
-        self.adv_override_tensor_input = QLineEdit()
-        self.adv_override_tensor_input.setPlaceholderText("e.g. KQV=1,O=1")
-        self.adv_override_tensor_input.setToolTip("Override tensor split: 'KQV=1,O=1' to force specific tensors to GPU. Default: not set.")
-        gpu_numa_layout.addRow(self._create_info_label("Override Tensor (--override-tensor):", "Override tensor split: 'KQV=1,O=1' to force specific tensors to GPU. Default: not set."), self.adv_override_tensor_input)
-        
-        self.adv_cpu_moe_check = QCheckBox("--cpu-moe/--no-cpu-moe")
-        self.adv_cpu_moe_check.setToolTip("Offload MoE layers to CPU. Default: disabled.")
-        gpu_numa_layout.addRow(self._create_info_label("--cpu-moe/--no-cpu-moe", "Offload MoE layers to CPU. Default: disabled."), self.adv_cpu_moe_check)
-        
-        self.adv_n_cpu_moe_spin = QSpinBox()
-        self.adv_n_cpu_moe_spin.setRange(0, 256)
-        self.adv_n_cpu_moe_spin.setValue(0)
-        self.adv_n_cpu_moe_spin.setToolTip("Number of CPU threads for MoE layers. Default: 0 (auto).")
-        gpu_numa_layout.addRow(self._create_info_label("N CPU MoE (--n-cpu-moe):", "Number of CPU threads for MoE layers. Default: 0 (auto)."), self.adv_n_cpu_moe_spin)
-        
-        self.adv_fit_combo = QComboBox()
-        self.adv_fit_combo.addItems(["on", "off"])
-        self.adv_fit_combo.setToolTip("Fit model to VRAM: 'on' or 'off'. Default: on.")
-        gpu_numa_layout.addRow(self._create_info_label("Fit (--fit):", "Fit model to VRAM: 'on' or 'off'. Default: on."), self.adv_fit_combo)
-        
-        self.adv_fit_target_input = QLineEdit()
-        self.adv_fit_target_input.setPlaceholderText("e.g. 80%")
-        self.adv_fit_target_input.setToolTip("Target VRAM usage percentage for fit mode. Default: not set.")
-        gpu_numa_layout.addRow(self._create_info_label("Fit Target (--fit-target):", "Target VRAM usage percentage for fit mode. Default: not set."), self.adv_fit_target_input)
-        
-        self.adv_fit_ctx_spin = QSpinBox()
-        self.adv_fit_ctx_spin.setRange(512, 131072)
-        self.adv_fit_ctx_spin.setValue(4096)
-        self.adv_fit_ctx_spin.setToolTip("Context size for fit mode calculation. Default: 4096.")
-        gpu_numa_layout.addRow(self._create_info_label("Fit Context (--fit-ctx):", "Context size for fit mode calculation. Default: 4096."), self.adv_fit_ctx_spin)
-        
-        self.adv_check_tensors_check = QCheckBox("--check-tensors/--no-check-tensors")
-        self.adv_check_tensors_check.setToolTip("Check tensor sizes and types. Default: disabled.")
-        gpu_numa_layout.addRow(self._create_info_label("--check-tensors/--no-check-tensors", "Check tensor sizes and types. Default: disabled."), self.adv_check_tensors_check)
-        
-        self.adv_override_kv_input = QLineEdit()
-        self.adv_override_kv_input.setPlaceholderText("e.g. k_scale=0.5,v_scale=0.5")
-        self.adv_override_kv_input.setToolTip("Override KV scale factors: 'k_scale=0.5,v_scale=0.5'. Default: not set.")
-        gpu_numa_layout.addRow(self._create_info_label("Override KV (--override-kv):", "Override KV scale factors: 'k_scale=0.5,v_scale=0.5'. Default: not set."), self.adv_override_kv_input)
-        
-        self.adv_op_offload_check = QCheckBox("--op-offload/--no-op-offload")
-        self.adv_op_offload_check.setChecked(True)
-        self.adv_op_offload_check.setToolTip("Offload operations to GPU. Default: enabled.")
-        gpu_numa_layout.addRow(self._create_info_label("--op-offload/--no-op-offload", "Offload operations to GPU. Default: enabled."), self.adv_op_offload_check)
-        
-        gpu_numa_group.setLayout(gpu_numa_layout)
-        scroll_layout.addWidget(gpu_numa_group)
-        
-        # LoRA & Control Vectors params group
-        lora_ctrl_group = QGroupBox("LoRA & Control Vectors Parameters")
-        lora_ctrl_layout = QFormLayout()
-        
-        self.adv_lora_input = QLineEdit()
-        self.adv_lora_input.setPlaceholderText("e.g. /path/to/lora.gguf")
-        self.adv_lora_input.setToolTip("LoRA adapter path. Default: not set.")
-        lora_ctrl_layout.addRow(self._create_info_label("LoRA (--lora):", "LoRA adapter path. Default: not set."), self.adv_lora_input)
-        
-        self.adv_lora_scaled_input = QLineEdit()
-        self.adv_lora_scaled_input.setPlaceholderText("e.g. /path/to/lora.gguf=1.5")
-        self.adv_lora_scaled_input.setToolTip("LoRA adapter with scale: '/path/to/lora.gguf=1.5'. Default: not set.")
-        lora_ctrl_layout.addRow(self._create_info_label("LoRA Scaled (--lora-scaled):", "LoRA adapter with scale: '/path/to/lora.gguf=1.5'. Default: not set."), self.adv_lora_scaled_input)
-        
-        self.adv_control_vector_input = QLineEdit()
-        self.adv_control_vector_input.setPlaceholderText("e.g. /path/to/cv.gguf")
-        self.adv_control_vector_input.setToolTip("Control vector path. Default: not set.")
-        lora_ctrl_layout.addRow(self._create_info_label("Control Vector (--control-vector):", "Control vector path. Default: not set."), self.adv_control_vector_input)
-        
-        self.adv_control_vector_scaled_input = QLineEdit()
-        self.adv_control_vector_scaled_input.setPlaceholderText("e.g. /path/to/cv.gguf=1.5")
-        self.adv_control_vector_scaled_input.setToolTip("Control vector with scale: '/path/to/cv.gguf=1.5'. Default: not set.")
-        lora_ctrl_layout.addRow(self._create_info_label("Control Vector Scaled (--control-vector-scaled):", "Control vector with scale: '/path/to/cv.gguf=1.5'. Default: not set."), self.adv_control_vector_scaled_input)
-        
-        self.adv_control_vector_layer_range_input = QLineEdit()
-        self.adv_control_vector_layer_range_input.setPlaceholderText("e.g. 0-20")
-        self.adv_control_vector_layer_range_input.setToolTip("Control vector layer range: '0-20'. Default: not set.")
-        lora_ctrl_layout.addRow(self._create_info_label("Control Vector Layer Range (--control-vector-layer-range):", "Control vector layer range: '0-20'. Default: not set."), self.adv_control_vector_layer_range_input)
-        
-        lora_ctrl_group.setLayout(lora_ctrl_layout)
-        scroll_layout.addWidget(lora_ctrl_group)
-        
-        # Model Sources params group
-        model_sources_group = QGroupBox("Model Sources Parameters")
-        model_sources_layout = QFormLayout()
-        
-        self.adv_model_url_input = QLineEdit()
-        self.adv_model_url_input.setPlaceholderText("e.g. https://example.com/model.gguf")
-        self.adv_model_url_input.setToolTip("Model download URL. Default: not set.")
-        model_sources_layout.addRow(self._create_info_label("Model URL (--model-url):", "Model download URL. Default: not set."), self.adv_model_url_input)
-        
-        self.adv_docker_repo_input = QLineEdit()
-        self.adv_docker_repo_input.setPlaceholderText("e.g. ghcr.io/ggml-org/llama.cpp")
-        self.adv_docker_repo_input.setToolTip("Docker repository for model. Default: not set.")
-        model_sources_layout.addRow(self._create_info_label("Docker Repo (--docker-repo):", "Docker repository for model. Default: not set."), self.adv_docker_repo_input)
-        
-        self.adv_hf_repo_input = QLineEdit()
-        self.adv_hf_repo_input.setPlaceholderText("e.g. org/model-name")
-        self.adv_hf_repo_input.setToolTip("Hugging Face repository: 'org/model-name'. Default: not set.")
-        model_sources_layout.addRow(self._create_info_label("HF Repo (--hf-repo):", "Hugging Face repository: 'org/model-name'. Default: not set."), self.adv_hf_repo_input)
-        
-        self.adv_hf_file_input = QLineEdit()
-        self.adv_hf_file_input.setPlaceholderText("e.g. model.gguf")
-        self.adv_hf_file_input.setToolTip("Hugging Face file name. Default: not set.")
-        model_sources_layout.addRow(self._create_info_label("HF File (--hf-file):", "Hugging Face file name. Default: not set."), self.adv_hf_file_input)
-        
-        self.adv_hf_repo_v_input = QLineEdit()
-        self.adv_hf_repo_v_input.setPlaceholderText("e.g. org/validator-model")
-        self.adv_hf_repo_v_input.setToolTip("Hugging Face validator repository: 'org/validator-model'. Default: not set.")
-        model_sources_layout.addRow(self._create_info_label("HF Repo V (--hf-repo-v):", "Hugging Face validator repository: 'org/validator-model'. Default: not set."), self.adv_hf_repo_v_input)
-        
-        self.adv_hf_file_v_input = QLineEdit()
-        self.adv_hf_file_v_input.setPlaceholderText("e.g. validator.gguf")
-        self.adv_hf_file_v_input.setToolTip("Hugging Face validator file name. Default: not set.")
-        model_sources_layout.addRow(self._create_info_label("HF File V (--hf-file-v):", "Hugging Face validator file name. Default: not set."), self.adv_hf_file_v_input)
-        
-        self.adv_hf_token_input = QLineEdit()
-        self.adv_hf_token_input.setPlaceholderText("e.g. hf_...")
-        self.adv_hf_token_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.adv_hf_token_input.setToolTip("Hugging Face access token. Default: not set.")
-        model_sources_layout.addRow(self._create_info_label("HF Token (--hf-token):", "Hugging Face access token. Default: not set."), self.adv_hf_token_input)
-        
-        model_sources_group.setLayout(model_sources_layout)
-        scroll_layout.addWidget(model_sources_group)
-        
-        # Logging params group
-        logging_group = QGroupBox("Logging Parameters")
-        logging_layout = QFormLayout()
-        
-        self.adv_log_disable_check = QCheckBox("--log-disable/--no-log-disable")
-        self.adv_log_disable_check.setToolTip("Disable logging. Default: disabled (logging enabled).")
-        logging_layout.addRow(self._create_info_label("--log-disable/--no-log-disable", "Disable logging. Default: disabled (logging enabled)."), self.adv_log_disable_check)
-        
-        self.adv_log_file_input = QLineEdit()
-        self.adv_log_file_input.setPlaceholderText("e.g. /path/to/log.txt")
-        self.adv_log_file_input.setToolTip("Log file path. Default: not set (stdout).")
-        logging_layout.addRow(self._create_info_label("Log File (--log-file):", "Log file path. Default: not set (stdout)."), self.adv_log_file_input)
-        
-        self.adv_log_colors_combo = QComboBox()
-        self.adv_log_colors_combo.addItems(["auto", "enable", "disable"])
-        self.adv_log_colors_combo.setToolTip("Log colors: 'auto', 'enable', or 'disable'. Default: auto.")
-        logging_layout.addRow(self._create_info_label("Log Colors (--log-colors):", "Log colors: 'auto', 'enable', or 'disable'. Default: auto."), self.adv_log_colors_combo)
-        
-        self.adv_verbose_check = QCheckBox("--verbose/--no-verbose")
-        self.adv_verbose_check.setToolTip("Enable verbose logging. Default: disabled.")
-        logging_layout.addRow(self._create_info_label("--verbose/--no-verbose", "Enable verbose logging. Default: disabled."), self.adv_verbose_check)
-        
-        self.adv_offline_check = QCheckBox("--offline/--no-offline")
-        self.adv_offline_check.setToolTip("Disable network access (offline mode). Default: disabled (online).")
-        logging_layout.addRow(self._create_info_label("--offline/--no-offline", "Disable network access (offline mode). Default: disabled (online)."), self.adv_offline_check)
-        
-        self.adv_verbosity_spin = QSpinBox()
-        self.adv_verbosity_spin.setRange(0, 5)
-        self.adv_verbosity_spin.setValue(3)
-        self.adv_verbosity_spin.setToolTip("Log verbosity level: 0=off, 1=error, 2=warn, 3=info, 4=debug, 5=trace. Default: 3.")
-        logging_layout.addRow(self._create_info_label("Verbosity (--verbosity):", "Log verbosity level: 0=off, 1=error, 2=warn, 3=info, 4=debug, 5=trace. Default: 3."), self.adv_verbosity_spin)
-        
-        self.adv_log_prefix_check = QCheckBox("--log-prefix/--no-log-prefix")
-        self.adv_log_prefix_check.setChecked(True)
-        self.adv_log_prefix_check.setToolTip("Include log prefix (timestamp, level). Default: enabled.")
-        logging_layout.addRow(self._create_info_label("--log-prefix/--no-log-prefix", "Include log prefix (timestamp, level). Default: enabled."), self.adv_log_prefix_check)
-        
-        self.adv_log_timestamps_check = QCheckBox("--log-timestamps/--no-log-timestamps")
-        self.adv_log_timestamps_check.setChecked(True)
-        self.adv_log_timestamps_check.setToolTip("Include timestamps in logs. Default: enabled.")
-        logging_layout.addRow(self._create_info_label("--log-timestamps/--no-log-timestamps", "Include timestamps in logs. Default: enabled."), self.adv_log_timestamps_check)
-        
-        logging_group.setLayout(logging_layout)
-        scroll_layout.addWidget(logging_group)
-
-        # Server Options group
-        server_group = QGroupBox("Server Options")
-        server_layout = QFormLayout()
-
-        self.adv_parallel_spin = QSpinBox()
-        self.adv_parallel_spin.setRange(-1, 128)
-        self.adv_parallel_spin.setValue(-1)
-        self.adv_parallel_spin.setToolTip("Number of parallel request streams. Default: -1 (auto).")
-        server_layout.addRow(self._create_info_label("Parallel (--parallel):", "Number of parallel request streams. Default: -1 (auto)."), self.adv_parallel_spin)
-
-        self.adv_backend_combo = QComboBox()
-        self.adv_backend_combo.addItems(["auto", "cuda", "metal", "vulkan", "cpu", "sycl"])
-        self.adv_backend_combo.setToolTip("Compute backend: 'auto' (default), 'cuda', 'metal', 'vulkan', 'cpu', or 'sycl'.")
-        server_layout.addRow(self._create_info_label("Backend (--backend):", "Compute backend: 'auto' (default), 'cuda', 'metal', 'vulkan', 'cpu', or 'sycl'."), self.adv_backend_combo)
-
-        self.adv_jinja_check = QCheckBox("--jinja/--no-jinja")
-        self.adv_jinja_check.setToolTip("Use Jinja template for prompt formatting. Default: disabled.")
-        server_layout.addRow(self._create_info_label("--jinja/--no-jinja", "Use Jinja template for prompt formatting. Default: disabled."), self.adv_jinja_check)
-
-        self.adv_warmup_check = QCheckBox("--warmup/--no-warmup")
-        self.adv_warmup_check.setChecked(True)
-        self.adv_warmup_check.setToolTip("Warm up the model on startup. Default: enabled.")
-        server_layout.addRow(self._create_info_label("--warmup/--no-warmup", "Warm up the model on startup. Default: enabled."), self.adv_warmup_check)
-
-        self.adv_embeddings_check = QCheckBox("--embeddings/--no-embeddings")
-        self.adv_embeddings_check.setToolTip("Return embeddings for prompts. Default: disabled.")
-        server_layout.addRow(self._create_info_label("--embeddings/--no-embeddings", "Return embeddings for prompts. Default: disabled."), self.adv_embeddings_check)
-
-        self.adv_reranking_check = QCheckBox("--reranking/--no-reranking")
-        self.adv_reranking_check.setToolTip("Enable reranking mode. Default: disabled.")
-        server_layout.addRow(self._create_info_label("--reranking/--no-reranking", "Enable reranking mode. Default: disabled."), self.adv_reranking_check)
-
-        self.adv_ui_check = QCheckBox("--ui/--no-ui")
-        self.adv_ui_check.setChecked(True)
-        self.adv_ui_check.setToolTip("Enable the web UI. Default: enabled.")
-        server_layout.addRow(self._create_info_label("--ui/--no-ui", "Enable the web UI. Default: enabled."), self.adv_ui_check)
-
-        self.adv_agent_check = QCheckBox("--agent/--no-agent")
-        self.adv_agent_check.setToolTip("Enable agent mode. Default: disabled.")
-        server_layout.addRow(self._create_info_label("--agent/--no-agent", "Enable agent mode. Default: disabled."), self.adv_agent_check)
-
-        self.adv_cont_batching_check = QCheckBox("--cont-batching/--no-cont-batching")
-        self.adv_cont_batching_check.setChecked(True)
-        self.adv_cont_batching_check.setToolTip("Enable continuous batching. Default: enabled.")
-        server_layout.addRow(self._create_info_label("--cont-batching/--no-cont-batching", "Enable continuous batching. Default: enabled."), self.adv_cont_batching_check)
-
-        self.adv_api_prefix_input = QLineEdit()
-        self.adv_api_prefix_input.setPlaceholderText("e.g. /v1")
-        self.adv_api_prefix_input.setToolTip("API endpoint prefix. Default: not set.")
-        server_layout.addRow(self._create_info_label("API Prefix (--api-prefix):", "API endpoint prefix. Default: not set."), self.adv_api_prefix_input)
-
-        self.adv_ui_config_input = QLineEdit()
-        self.adv_ui_config_input.setPlaceholderText("e.g. {...}")
-        self.adv_ui_config_input.setToolTip("UI configuration JSON string. Default: not set.")
-        server_layout.addRow(self._create_info_label("UI Config (--ui-config):", "UI configuration JSON string. Default: not set."), self.adv_ui_config_input)
-
-        self.adv_ui_config_file_input = QLineEdit()
-        self.adv_ui_config_file_input.setPlaceholderText("e.g. /path/to/ui-config.json")
-        self.adv_ui_config_file_input.setToolTip("Path to UI configuration file. Default: not set.")
-        server_layout.addRow(self._create_info_label("UI Config File (--ui-config-file):", "Path to UI configuration file. Default: not set."), self.adv_ui_config_file_input)
-
-        self.adv_tools_input = QLineEdit()
-        self.adv_tools_input.setPlaceholderText("e.g. tool1,tool2")
-        self.adv_tools_input.setToolTip("Comma-separated list of available tools. Default: not set.")
-        server_layout.addRow(self._create_info_label("Tools (--tools):", "Comma-separated list of available tools. Default: not set."), self.adv_tools_input)
-
-        server_group.setLayout(server_layout)
-        scroll_layout.addWidget(server_group)
-
-        # Generation & Cache group
-        gen_cache_group = QGroupBox("Generation & Cache Options")
-        gen_cache_layout = QFormLayout()
-
-        self.adv_reverse_prompt_input = QLineEdit()
-        self.adv_reverse_prompt_input.setPlaceholderText("e.g. User:")
-        self.adv_reverse_prompt_input.setToolTip("Reverse prompt to stop generation. Default: not set.")
-        gen_cache_layout.addRow(self._create_info_label("Reverse Prompt (--reverse-prompt):", "Reverse prompt to stop generation. Default: not set."), self.adv_reverse_prompt_input)
-
-        self.adv_pooling_combo = QComboBox()
-        self.adv_pooling_combo.addItems(["none", "mean", "cls", "last"])
-        self.adv_pooling_combo.setToolTip("Pooling method for embeddings: 'none' (default), 'mean', 'cls', or 'last'.")
-        gen_cache_layout.addRow(self._create_info_label("Pooling (--pooling):", "Pooling method for embeddings: 'none' (default), 'mean', 'cls', or 'last'."), self.adv_pooling_combo)
-
-        self.adv_kv_unified_check = QCheckBox("--kv-unified/--no-kv-unified")
-        self.adv_kv_unified_check.setChecked(True)
-        self.adv_kv_unified_check.setToolTip("Use unified KV cache. Default: enabled.")
-        gen_cache_layout.addRow(self._create_info_label("--kv-unified/--no-kv-unified", "Use unified KV cache. Default: enabled."), self.adv_kv_unified_check)
-
-        self.adv_lookup_cache_static_input = QLineEdit()
-        self.adv_lookup_cache_static_input.setPlaceholderText("e.g. /path/to/static-cache")
-        self.adv_lookup_cache_static_input.setToolTip("Static lookup cache path. Default: not set.")
-        gen_cache_layout.addRow(self._create_info_label("Lookup Cache Static (--lookup-cache-static):", "Static lookup cache path. Default: not set."), self.adv_lookup_cache_static_input)
-
-        self.adv_lookup_cache_dynamic_input = QLineEdit()
-        self.adv_lookup_cache_dynamic_input.setPlaceholderText("e.g. /path/to/dynamic-cache")
-        self.adv_lookup_cache_dynamic_input.setToolTip("Dynamic lookup cache path. Default: not set.")
-        gen_cache_layout.addRow(self._create_info_label("Lookup Cache Dynamic (--lookup-cache-dynamic):", "Dynamic lookup cache path. Default: not set."), self.adv_lookup_cache_dynamic_input)
-
-        self.adv_special_check = QCheckBox("--special/--no-special")
-        self.adv_special_check.setToolTip("Render special tokens in output. Default: disabled.")
-        gen_cache_layout.addRow(self._create_info_label("--special/--no-special", "Render special tokens in output. Default: disabled."), self.adv_special_check)
-
-        self.adv_spm_infill_check = QCheckBox("--spm-infill/--no-spm-infill")
-        self.adv_spm_infill_check.setToolTip("Enable SPM infill mode for fill-in-the-middle. Default: disabled.")
-        gen_cache_layout.addRow(self._create_info_label("--spm-infill/--no-spm-infill", "Enable SPM infill mode. Default: disabled."), self.adv_spm_infill_check)
-
-        gen_cache_group.setLayout(gen_cache_layout)
-        scroll_layout.addWidget(gen_cache_group)
-
-        # Multimodal group
-        multimodal_group = QGroupBox("Multimodal Parameters")
-        multimodal_layout = QFormLayout()
-
-        self.adv_mmproj_input = QLineEdit()
-        self.adv_mmproj_input.setPlaceholderText("e.g. /path/to/mmproj.gguf")
-        self.adv_mmproj_input.setToolTip("Path to multimodal projector model. Default: not set.")
-        multimodal_layout.addRow(self._create_info_label("MMProj (--mmproj):", "Path to multimodal projector model. Default: not set."), self.adv_mmproj_input)
-
-        self.adv_mmproj_url_input = QLineEdit()
-        self.adv_mmproj_url_input.setPlaceholderText("e.g. https://example.com/mmproj.gguf")
-        self.adv_mmproj_url_input.setToolTip("URL to download multimodal projector. Default: not set.")
-        multimodal_layout.addRow(self._create_info_label("MMProj URL (--mmproj-url):", "URL to download multimodal projector. Default: not set."), self.adv_mmproj_url_input)
-
-        self.adv_mmproj_auto_check = QCheckBox("--mmproj-auto/--no-mmproj-auto")
-        self.adv_mmproj_auto_check.setChecked(True)
-        self.adv_mmproj_auto_check.setToolTip("Auto-detect multimodal projector. Default: enabled.")
-        multimodal_layout.addRow(self._create_info_label("--mmproj-auto/--no-mmproj-auto", "Auto-detect multimodal projector. Default: enabled."), self.adv_mmproj_auto_check)
-
-        self.adv_mmproj_offload_check = QCheckBox("--mmproj-offload/--no-mmproj-offload")
-        self.adv_mmproj_offload_check.setChecked(True)
-        self.adv_mmproj_offload_check.setToolTip("Offload multimodal projector to GPU. Default: enabled.")
-        multimodal_layout.addRow(self._create_info_label("--mmproj-offload/--no-mmproj-offload", "Offload multimodal projector to GPU. Default: enabled."), self.adv_mmproj_offload_check)
-
-        self.adv_image_min_tokens_spin = QSpinBox()
-        self.adv_image_min_tokens_spin.setRange(0, 65536)
-        self.adv_image_min_tokens_spin.setValue(0)
-        self.adv_image_min_tokens_spin.setToolTip("Minimum tokens for image processing. Default: 0.")
-        multimodal_layout.addRow(self._create_info_label("Image Min Tokens (--image-min-tokens):", "Minimum tokens for image processing. Default: 0."), self.adv_image_min_tokens_spin)
-
-        self.adv_image_max_tokens_spin = QSpinBox()
-        self.adv_image_max_tokens_spin.setRange(0, 65536)
-        self.adv_image_max_tokens_spin.setValue(0)
-        self.adv_image_max_tokens_spin.setToolTip("Maximum tokens for image processing. Default: 0 (unlimited).")
-        multimodal_layout.addRow(self._create_info_label("Image Max Tokens (--image-max-tokens):", "Maximum tokens for image processing. Default: 0."), self.adv_image_max_tokens_spin)
-
-        self.adv_mtmd_batch_max_tokens_spin = QSpinBox()
-        self.adv_mtmd_batch_max_tokens_spin.setRange(0, 65536)
-        self.adv_mtmd_batch_max_tokens_spin.setValue(1024)
-        self.adv_mtmd_batch_max_tokens_spin.setToolTip("Maximum tokens per batch for mtmd. Default: 1024.")
-        multimodal_layout.addRow(self._create_info_label("MTMD Batch Max Tokens (--mtmd-batch-max-tokens):", "Maximum tokens per batch for mtmd. Default: 1024."), self.adv_mtmd_batch_max_tokens_spin)
-
-        multimodal_group.setLayout(multimodal_layout)
-        scroll_layout.addWidget(multimodal_group)
-
-        # Server & Embeddings Extras
-        server_extras_group = QGroupBox("Server & Embeddings Extras")
-        server_extras_layout = QFormLayout()
-
-        self.adv_alias_input = QLineEdit()
-        self.adv_alias_input.setPlaceholderText("e.g. my-model")
-        self.adv_alias_input.setToolTip("Model alias for the API. Default: not set.")
-        server_extras_layout.addRow(self._create_info_label("Alias (--alias):", "Model alias for the API. Default: not set."), self.adv_alias_input)
-
-        self.adv_tags_input = QLineEdit()
-        self.adv_tags_input.setPlaceholderText("e.g. coding,chat")
-        self.adv_tags_input.setToolTip("Comma-separated tags for the model. Default: not set.")
-        server_extras_layout.addRow(self._create_info_label("Tags (--tags):", "Comma-separated tags for the model. Default: not set."), self.adv_tags_input)
-
-        self.adv_embd_normalize_spin = QSpinBox()
-        self.adv_embd_normalize_spin.setRange(0, 2)
-        self.adv_embd_normalize_spin.setValue(2)
-        self.adv_embd_normalize_spin.setToolTip("Embedding normalization type: 0=none, 1=max absolute, 2=L2. Default: 2.")
-        server_extras_layout.addRow(self._create_info_label("Embedding Normalize (--embd-normalize):", "Embedding normalization: 0=none, 1=max abs, 2=L2. Default: 2."), self.adv_embd_normalize_spin)
-
-        self.adv_path_input = QLineEdit()
-        self.adv_path_input.setPlaceholderText("e.g. /api")
-        self.adv_path_input.setToolTip("Custom API path. Default: not set.")
-        server_extras_layout.addRow(self._create_info_label("Path (--path):", "Custom API path. Default: not set."), self.adv_path_input)
-
-        self.adv_reuse_port_check = QCheckBox("--reuse-port/--no-reuse-port")
-        self.adv_reuse_port_check.setToolTip("Allow port reuse. Default: disabled.")
-        server_extras_layout.addRow(self._create_info_label("--reuse-port/--no-reuse-port", "Allow port reuse. Default: disabled."), self.adv_reuse_port_check)
-
-        self.adv_ui_mcp_proxy_check = QCheckBox("--ui-mcp-proxy/--no-ui-mcp-proxy")
-        self.adv_ui_mcp_proxy_check.setToolTip("Enable UI MCP proxy. Default: disabled.")
-        server_extras_layout.addRow(self._create_info_label("--ui-mcp-proxy/--no-ui-mcp-proxy", "Enable UI MCP proxy. Default: disabled."), self.adv_ui_mcp_proxy_check)
-
-        server_extras_group.setLayout(server_extras_layout)
-        scroll_layout.addWidget(server_extras_group)
-
-        scroll_area.setWidget(scroll_widget)
-        layout.addWidget(scroll_area)
-        
-        self.tab_widget.addTab(tab, "Advanced Config")
-        
     def create_command_preview_tab(self):
         """Create command preview and launch tab."""
         tab = QWidget()
@@ -1842,229 +571,19 @@ class LlamaLauncherGUI(QMainWindow):
         
         self.tab_widget.addTab(tab, "Command Preview & Launch")
         
-        # Update command preview on config changes
-        self.model_combo.currentTextChanged.connect(self.update_command_preview)
-        self.mmproj_combo.currentTextChanged.connect(self.update_command_preview)
-        self.draft_combo.currentTextChanged.connect(self.update_command_preview)
-        self.ctx_spin.valueChanged.connect(self.update_command_preview)
-        self.gpu_spin.valueChanged.connect(self.update_command_preview)
-        self.threads_spin.valueChanged.connect(self.update_command_preview)
-        self.port_spin.valueChanged.connect(self.update_command_preview)
-        self.host_input.textChanged.connect(self.update_command_preview)
-        self.cache_combo.currentTextChanged.connect(self._sync_cache_to_adv)
-        self.cache_combo.currentTextChanged.connect(self.update_command_preview)
-        self.batch_spin.valueChanged.connect(self.update_command_preview)
-        self.mmap_check.stateChanged.connect(self.update_command_preview)
+        # Rebuild the preview (debounced) whenever any bound field changes.
+        self._preview_debounce = QTimer(self)
+        self._preview_debounce.setSingleShot(True)
+        self._preview_debounce.setInterval(250)
+        self._preview_debounce.timeout.connect(self.update_command_preview)
+        self.controller.field_changed.connect(self._schedule_preview_update)
+        self.update_command_preview()
 
-        # Wire advanced tab signals to update command preview
-        for attr, signal_name in [
-            ('adv_ctx_spin', 'valueChanged'),
-            ('adv_threads_spin', 'valueChanged'),
-            ('adv_threads_batch_spin', 'valueChanged'),
-            ('adv_predict_spin', 'valueChanged'),
-            ('adv_batch_spin', 'valueChanged'),
-            ('adv_ubatch_spin', 'valueChanged'),
-            ('adv_keep_spin', 'valueChanged'),
-            ('adv_rope_scaling_combo', 'currentTextChanged'),
-            ('adv_rope_scale_spin', 'valueChanged'),
-            ('adv_rope_freq_base_spin', 'valueChanged'),
-            ('adv_rope_freq_scale_spin', 'valueChanged'),
-            ('adv_cache_type_k_combo', 'currentTextChanged'),
-            ('adv_cache_type_v_combo', 'currentTextChanged'),
-            ('adv_mmap_check', 'stateChanged'),
-            ('adv_mlock_check', 'stateChanged'),
-            ('adv_gpu_layers_spin', 'valueChanged'),
-            ('adv_split_mode_combo', 'currentTextChanged'),
-            ('adv_tensor_split_input', 'textChanged'),
-            ('adv_main_gpu_spin', 'valueChanged'),
-            ('adv_temp_spin', 'valueChanged'),
-            ('adv_top_k_spin', 'valueChanged'),
-            ('adv_top_p_spin', 'valueChanged'),
-            ('adv_min_p_spin', 'valueChanged'),
-            ('adv_repeat_last_n_spin', 'valueChanged'),
-            ('adv_repeat_penalty_spin', 'valueChanged'),
-            ('adv_presence_penalty_spin', 'valueChanged'),
-            ('adv_frequency_penalty_spin', 'valueChanged'),
-            ('adv_draft_n_max_spin', 'valueChanged'),
-            ('adv_draft_n_min_spin', 'valueChanged'),
-            ('adv_spec_type_combo', 'currentTextChanged'),
-            ('adv_spec_draft_type_k_combo', 'currentTextChanged'),
-            ('adv_spec_draft_type_v_combo', 'currentTextChanged'),
-            ('adv_cpu_mask_input', 'textChanged'),
-            ('adv_cpu_range_input', 'textChanged'),
-            ('adv_cpu_strict_spin', 'valueChanged'),
-            ('adv_prio_spin', 'valueChanged'),
-            ('adv_poll_spin', 'valueChanged'),
-            ('adv_cpu_mask_batch_input', 'textChanged'),
-            ('adv_cpu_range_batch_input', 'textChanged'),
-            ('adv_cpu_strict_batch_spin', 'valueChanged'),
-            ('adv_prio_batch_spin', 'valueChanged'),
-            ('adv_poll_batch_spin', 'valueChanged'),
-            ('adv_swa_full_check', 'stateChanged'),
-            ('adv_flash_attn_combo', 'currentTextChanged'),
-            ('adv_perf_check', 'stateChanged'),
-            ('adv_escape_check', 'stateChanged'),
-            ('adv_yarn_orig_ctx_spin', 'valueChanged'),
-            ('adv_yarn_ext_factor_spin', 'valueChanged'),
-            ('adv_yarn_attn_factor_spin', 'valueChanged'),
-            ('adv_yarn_beta_slow_spin', 'valueChanged'),
-            ('adv_yarn_beta_fast_spin', 'valueChanged'),
-            ('adv_kv_offload_check', 'stateChanged'),
-            ('adv_repack_check', 'stateChanged'),
-            ('adv_no_host_check', 'stateChanged'),
-            ('adv_defrag_thold_spin', 'valueChanged'),
-            ('adv_direct_io_check', 'stateChanged'),
-            ('adv_numa_input', 'textChanged'),
-            ('adv_device_input', 'textChanged'),
-            ('adv_override_tensor_input', 'textChanged'),
-            ('adv_cpu_moe_check', 'stateChanged'),
-            ('adv_n_cpu_moe_spin', 'valueChanged'),
-            ('adv_fit_combo', 'currentTextChanged'),
-            ('adv_fit_target_input', 'textChanged'),
-            ('adv_fit_ctx_spin', 'valueChanged'),
-            ('adv_check_tensors_check', 'stateChanged'),
-            ('adv_override_kv_input', 'textChanged'),
-            ('adv_op_offload_check', 'stateChanged'),
-            ('adv_lora_input', 'textChanged'),
-            ('adv_lora_scaled_input', 'textChanged'),
-            ('adv_control_vector_input', 'textChanged'),
-            ('adv_control_vector_scaled_input', 'textChanged'),
-            ('adv_control_vector_layer_range_input', 'textChanged'),
-            ('adv_model_url_input', 'textChanged'),
-            ('adv_docker_repo_input', 'textChanged'),
-            ('adv_hf_repo_input', 'textChanged'),
-            ('adv_hf_file_input', 'textChanged'),
-            ('adv_hf_repo_v_input', 'textChanged'),
-            ('adv_hf_file_v_input', 'textChanged'),
-            ('adv_hf_token_input', 'textChanged'),
-            ('adv_log_disable_check', 'stateChanged'),
-            ('adv_log_file_input', 'textChanged'),
-            ('adv_log_colors_combo', 'currentTextChanged'),
-            ('adv_verbose_check', 'stateChanged'),
-            ('adv_offline_check', 'stateChanged'),
-            ('adv_verbosity_spin', 'valueChanged'),
-            ('adv_log_prefix_check', 'stateChanged'),
-            ('adv_log_timestamps_check', 'stateChanged'),
-            ('adv_grammar_input', 'textChanged'),
-            ('adv_grammar_file_input', 'textChanged'),
-            ('adv_json_schema_input', 'textChanged'),
-            ('adv_json_schema_file_input', 'textChanged'),
-            ('adv_spec_draft_hf_input', 'textChanged'),
-            ('adv_spec_draft_override_tensor_input', 'textChanged'),
-            ('adv_spec_draft_device_input', 'textChanged'),
-            ('adv_reverse_prompt_input', 'textChanged'),
-            ('adv_dry_sequence_breaker_input', 'textChanged'),
-            ('adv_api_prefix_input', 'textChanged'),
-            ('adv_ui_config_input', 'textChanged'),
-            ('adv_ui_config_file_input', 'textChanged'),
-            ('adv_tools_input', 'textChanged'),
-            ('adv_lookup_cache_static_input', 'textChanged'),
-            ('adv_lookup_cache_dynamic_input', 'textChanged'),
-            ('adv_mirostat_spin', 'valueChanged'),
-            ('adv_mirostat_lr_spin', 'valueChanged'),
-            ('adv_mirostat_ent_spin', 'valueChanged'),
-            ('adv_dry_multiplier_spin', 'valueChanged'),
-            ('adv_dry_base_spin', 'valueChanged'),
-            ('adv_dry_allowed_length_spin', 'valueChanged'),
-            ('adv_dry_penalty_last_n_spin', 'valueChanged'),
-            ('adv_ignore_eos_check', 'stateChanged'),
-            ('adv_backend_sampling_check', 'stateChanged'),
-            ('adv_spec_draft_model_input', 'textChanged'),
-            ('adv_spec_draft_threads_spin', 'valueChanged'),
-            ('adv_spec_draft_threads_batch_spin', 'valueChanged'),
-            ('adv_parallel_spin', 'valueChanged'),
-            ('adv_backend_combo', 'currentTextChanged'),
-            ('adv_jinja_check', 'stateChanged'),
-            ('adv_warmup_check', 'stateChanged'),
-            ('adv_embeddings_check', 'stateChanged'),
-            ('adv_reranking_check', 'stateChanged'),
-            ('adv_ui_check', 'stateChanged'),
-            ('adv_agent_check', 'stateChanged'),
-            ('adv_cont_batching_check', 'stateChanged'),
-            ('adv_pooling_combo', 'currentTextChanged'),
-            ('adv_kv_unified_check', 'stateChanged'),
-            # Extra sampling
-            ('adv_samplers_input', 'textChanged'),
-            ('adv_sampler_seq_input', 'textChanged'),
-            ('adv_seed_spin', 'valueChanged'),
-            ('adv_top_n_sigma_spin', 'valueChanged'),
-            ('adv_typical_p_spin', 'valueChanged'),
-            ('adv_xtc_probability_spin', 'valueChanged'),
-            ('adv_xtc_threshold_spin', 'valueChanged'),
-            ('adv_logit_bias_input', 'textChanged'),
-            # Adaptive & DynaTemp
-            ('adv_adaptive_target_spin', 'valueChanged'),
-            ('adv_adaptive_decay_spin', 'valueChanged'),
-            ('adv_dynatemp_range_spin', 'valueChanged'),
-            ('adv_dynatemp_exp_spin', 'valueChanged'),
-            # Spec draft extras
-            ('adv_spec_draft_n_max_spin', 'valueChanged'),
-            ('adv_spec_draft_n_min_spin', 'valueChanged'),
-            ('adv_spec_draft_p_split_spin', 'valueChanged'),
-            ('adv_spec_draft_p_min_spin', 'valueChanged'),
-            ('adv_spec_draft_backend_sampling_check', 'stateChanged'),
-            ('adv_spec_draft_ngl_spin', 'valueChanged'),
-            # Spec draft CPU affinity
-            ('adv_spec_draft_cpu_mask_input', 'textChanged'),
-            ('adv_spec_draft_cpu_range_input', 'textChanged'),
-            ('adv_spec_draft_cpu_strict_spin', 'valueChanged'),
-            ('adv_spec_draft_prio_spin', 'valueChanged'),
-            ('adv_spec_draft_poll_spin', 'valueChanged'),
-            ('adv_spec_draft_cpu_mask_batch_input', 'textChanged'),
-            ('adv_spec_draft_cpu_strict_batch_spin', 'valueChanged'),
-            ('adv_spec_draft_prio_batch_spin', 'valueChanged'),
-            ('adv_spec_draft_poll_batch_spin', 'valueChanged'),
-            ('adv_spec_draft_cpu_moe_check', 'stateChanged'),
-            ('adv_spec_draft_n_cpu_moe_spin', 'valueChanged'),
-            # Spec N-gram
-            ('adv_spec_ngram_mod_n_min_spin', 'valueChanged'),
-            ('adv_spec_ngram_mod_n_max_spin', 'valueChanged'),
-            ('adv_spec_ngram_mod_n_match_spin', 'valueChanged'),
-            ('adv_spec_ngram_simple_size_n_spin', 'valueChanged'),
-            ('adv_spec_ngram_simple_size_m_spin', 'valueChanged'),
-            ('adv_spec_ngram_simple_min_hits_spin', 'valueChanged'),
-            ('adv_spec_ngram_map_k_size_n_spin', 'valueChanged'),
-            ('adv_spec_ngram_map_k_size_m_spin', 'valueChanged'),
-            ('adv_spec_ngram_map_k_min_hits_spin', 'valueChanged'),
-            ('adv_spec_ngram_map_k4v_size_n_spin', 'valueChanged'),
-            ('adv_spec_ngram_map_k4v_size_m_spin', 'valueChanged'),
-            ('adv_spec_ngram_map_k4v_min_hits_spin', 'valueChanged'),
-            # Extra cache
-            ('adv_ctx_checkpoints_spin', 'valueChanged'),
-            ('adv_checkpoint_min_step_spin', 'valueChanged'),
-            ('adv_cache_ram_spin', 'valueChanged'),
-            ('adv_cache_idle_slots_check', 'stateChanged'),
-            ('adv_context_shift_check', 'stateChanged'),
-            # Generation extras
-            ('adv_special_check', 'stateChanged'),
-            ('adv_spm_infill_check', 'stateChanged'),
-            # Multimodal
-            ('adv_mmproj_input', 'textChanged'),
-            ('adv_mmproj_url_input', 'textChanged'),
-            ('adv_mmproj_auto_check', 'stateChanged'),
-            ('adv_mmproj_offload_check', 'stateChanged'),
-            ('adv_image_min_tokens_spin', 'valueChanged'),
-            ('adv_image_max_tokens_spin', 'valueChanged'),
-            ('adv_mtmd_batch_max_tokens_spin', 'valueChanged'),
-            # Server extras
-            ('adv_alias_input', 'textChanged'),
-            ('adv_tags_input', 'textChanged'),
-            ('adv_embd_normalize_spin', 'valueChanged'),
-            ('adv_path_input', 'textChanged'),
-            ('adv_reuse_port_check', 'stateChanged'),
-            ('adv_ui_mcp_proxy_check', 'stateChanged'),
-        ]:
-            widget = getattr(self, attr, None)
-            if widget is not None:
-                signal = getattr(widget, signal_name, None)
-                if signal is not None:
-                    signal.connect(self.update_command_preview)
+    def _schedule_preview_update(self, *_args):
+        """Restart the preview debounce timer after a field change."""
+        if hasattr(self, '_preview_debounce'):
+            self._preview_debounce.start()
 
-        # Sync advanced context spin back to basic
-        adv_ctx = getattr(self, 'adv_ctx_spin', None)
-        if adv_ctx is not None:
-            adv_ctx.valueChanged.connect(self._sync_adv_ctx_to_basic)
-        
     def browse_add_folder(self):
         """Browse and add a model directory."""
         dir_path = QFileDialog.getExistingDirectory(self, "Select Model Directory")
@@ -2138,6 +657,8 @@ class LlamaLauncherGUI(QMainWindow):
             
     def scan_models(self):
         """Scan models in a background thread for the selected server."""
+        if self._closing:
+            return
         server_name = self._get_browser_server()
         dirs_to_scan = []
 
@@ -2245,12 +766,11 @@ class LlamaLauncherGUI(QMainWindow):
         conn = self.server_manager.get_connection(server_name)
         if conn:
             cfg = conn.config
+            # Bound widgets propagate these into the config automatically.
             if cfg.hostname and cfg.hostname != "localhost":
                 self.host_input.setText(cfg.hostname)
-                self.config.host = cfg.hostname
             if cfg.server_port:
                 self.port_spin.setValue(cfg.server_port)
-                self.config.port = cfg.server_port
         self._reload_server_models()
 
     def _on_servers_changed(self):
@@ -2270,6 +790,8 @@ class LlamaLauncherGUI(QMainWindow):
         return state in (ConnectionState.DISCONNECTED, ConnectionState.ERROR)
 
     def _refresh_preset_combo_styles(self):
+        if self._closing:
+            return
         preset_names = [self.preset_combo.itemText(i) for i in range(self.preset_combo.count())]
         server_names = self.server_manager.get_all_names()
         worker = _PresetStyleWorker(preset_names, server_names, self.server_manager)
@@ -2317,6 +839,8 @@ class LlamaLauncherGUI(QMainWindow):
 
     def _deferred_init(self):
         """Run blocking init tasks after UI is shown."""
+        if self._closing:
+            return
         self.scan_models()
         self._preset_style_timer = QTimer(self)
         self._preset_style_timer.timeout.connect(self._refresh_preset_combo_styles)
@@ -2331,6 +855,8 @@ class LlamaLauncherGUI(QMainWindow):
                 "Refresh GPU Info" button).
         """
         if not force and (self.gpu_info.backend != "cpu" or self.gpu_info.device_name != "Detecting..."):
+            return
+        if self._closing:
             return
         worker = _GpuDetectWorker()
         worker.detect_done.connect(self._on_gpu_detect_done)
@@ -2347,6 +873,8 @@ class LlamaLauncherGUI(QMainWindow):
         self._update_resource_estimate()
 
     def _gpu_poll_stats(self):
+        if self._closing:
+            return
         worker = _GpuStatsWorker()
         worker.stats_done.connect(self._on_gpu_stats_done)
         self._start_worker(worker)
@@ -2363,556 +891,35 @@ class LlamaLauncherGUI(QMainWindow):
         self.gpu_info_label.setText(existing)
 
     def load_preset(self, preset_name):
-        """Load a preset configuration."""
+        """Load a preset configuration into the live config."""
+        if not preset_name:
+            return
         try:
-            # Update preset combo selections
-            if hasattr(self, 'preset_combo'):
-                self.preset_combo.setCurrentText(preset_name)
-            if hasattr(self, 'adv_preset_combo'):
-                self.adv_preset_combo.setCurrentText(preset_name)
-                
-            preset_config = PresetManager.get_preset(preset_name)
+            for combo in (getattr(self, 'preset_combo', None),
+                          getattr(self, 'adv_preset_combo', None)):
+                if combo is not None and combo.currentText() != preset_name:
+                    combo.blockSignals(True)
+                    combo.setCurrentText(preset_name)
+                    combo.blockSignals(False)
 
-            # Handle target_server from preset
-            target = getattr(preset_config, 'target_server', None)
+            preset_config = PresetManager.get_preset(preset_name)
+            self.controller.set_config(preset_config)
+
+            # Server selection glue
+            target = self.config.target_server
             if target and target in self.server_manager.get_all_names():
-                self.config.target_server = target
                 self._sync_server_combos(target)
                 self._reload_server_models()
-            elif hasattr(self, 'server_combo'):
-                target = self.server_combo.currentText() or None
-                self.config.target_server = target
-
-            # Load model paths from preset config - clear boxes if no value in preset
-            if preset_config.model_path:
-                self.config.model_path = preset_config.model_path
-                self.model_combo.setCurrentText(self.config.model_path)
-            else:
-                self.config.model_path = ""
-                if hasattr(self, 'model_combo'):
-                    self.model_combo.setCurrentText("")
-                    
-            if preset_config.mmproj_model_path is not None and preset_config.mmproj_model_path != "":
-                self.config.mmproj_model_path = preset_config.mmproj_model_path
-                self.mmproj_combo.setCurrentText(self.config.mmproj_model_path)
-            else:
-                self.config.mmproj_model_path = None
-                if hasattr(self, 'mmproj_combo'):
-                    self.mmproj_combo.setCurrentText("")
-                    
-            if preset_config.draft_model_path is not None and preset_config.draft_model_path != "":
-                self.config.draft_model_path = preset_config.draft_model_path
-                self.draft_combo.setCurrentText(self.config.draft_model_path)
-            else:
-                self.config.draft_model_path = None
-                if hasattr(self, 'draft_combo'):
-                    self.draft_combo.setCurrentText("")
-                
-            self.config.context_size = preset_config.context_size
-            self.config.gpu_layers = preset_config.gpu_layers
-            self.config.threads = preset_config.threads
-            self.config.port = preset_config.port
-            self.config.host = preset_config.host
-            self.config.backend = preset_config.backend
-            self.config.use_mmap = preset_config.use_mmap
-            self.config.kv_cache_type = preset_config.kv_cache_type
-            self.config.batch_size = preset_config.batch_size
-            self.config.threads_batch = getattr(preset_config, 'threads_batch', -1)
-            self.config.predict = getattr(preset_config, 'predict', -1)
-            self.config.logical_batch_size = getattr(preset_config, 'logical_batch_size', 2048)
-            self.config.ubatch_size = getattr(preset_config, 'ubatch_size', 512)
-            self.config.keep = getattr(preset_config, 'keep', 0)
-            self.config.rope_scaling = getattr(preset_config, 'rope_scaling', 'none')
-            self.config.rope_scale = getattr(preset_config, 'rope_scale', 1)
-            self.config.rope_freq_base = getattr(preset_config, 'rope_freq_base', 0)
-            self.config.rope_freq_scale = getattr(preset_config, 'rope_freq_scale', 0)
-            self.config.cache_type_k = getattr(preset_config, 'cache_type_k', 'f16')
-            self.config.cache_type_v = getattr(preset_config, 'cache_type_v', 'f16')
-            self.config.mlock = getattr(preset_config, 'mlock', False)
-            self.config.split_mode = getattr(preset_config, 'split_mode', 'layer')
-            self.config.tensor_split = getattr(preset_config, 'tensor_split', None)
-            self.config.main_gpu = getattr(preset_config, 'main_gpu', 0)
-            self.config.temp = getattr(preset_config, 'temp', 0.8)
-            self.config.top_k = getattr(preset_config, 'top_k', 40)
-            self.config.top_p = getattr(preset_config, 'top_p', 0.95)
-            self.config.min_p = getattr(preset_config, 'min_p', 0.05)
-            self.config.repeat_last_n = getattr(preset_config, 'repeat_last_n', 64)
-            self.config.repeat_penalty = getattr(preset_config, 'repeat_penalty', 1.0)
-            self.config.presence_penalty = getattr(preset_config, 'presence_penalty', 0.0)
-            self.config.frequency_penalty = getattr(preset_config, 'frequency_penalty', 0.0)
-            self.config.draft_n_max = getattr(preset_config, 'draft_n_max', 3)
-            self.config.draft_n_min = getattr(preset_config, 'draft_n_min', 0)
-            self.config.flash_attn = getattr(preset_config, 'flash_attn', 'auto')
-            self.config.parallel = getattr(preset_config, 'parallel', -1)
-            self.config.jinja = getattr(preset_config, 'jinja', False)
-            # New fields
-            self.config.mirostat = getattr(preset_config, 'mirostat', 0)
-            self.config.mirostat_lr = getattr(preset_config, 'mirostat_lr', 0.1)
-            self.config.mirostat_ent = getattr(preset_config, 'mirostat_ent', 5.0)
-            self.config.dry_multiplier = getattr(preset_config, 'dry_multiplier', 0.0)
-            self.config.dry_base = getattr(preset_config, 'dry_base', 1.75)
-            self.config.dry_allowed_length = getattr(preset_config, 'dry_allowed_length', 2)
-            self.config.dry_penalty_last_n = getattr(preset_config, 'dry_penalty_last_n', -1)
-            self.config.dry_sequence_breaker = getattr(preset_config, 'dry_sequence_breaker', "")
-            self.config.ignore_eos = getattr(preset_config, 'ignore_eos', False)
-            self.config.backend_sampling = getattr(preset_config, 'backend_sampling', False)
-            self.config.spec_draft_threads = getattr(preset_config, 'spec_draft_threads', 0)
-            self.config.spec_draft_threads_batch = getattr(preset_config, 'spec_draft_threads_batch', -1)
-            self.config.spec_draft_model = getattr(preset_config, 'spec_draft_model', "")
-            self.config.spec_draft_hf = getattr(preset_config, 'spec_draft_hf', "")
-            self.config.spec_draft_override_tensor = getattr(preset_config, 'spec_draft_override_tensor', "")
-            self.config.spec_draft_device = getattr(preset_config, 'spec_draft_device', "")
-            self.config.warmup = getattr(preset_config, 'warmup', True)
-            self.config.embeddings = getattr(preset_config, 'embeddings', False)
-            self.config.reranking = getattr(preset_config, 'reranking', False)
-            self.config.ui = getattr(preset_config, 'ui', True)
-            self.config.agent = getattr(preset_config, 'agent', False)
-            self.config.cont_batching = getattr(preset_config, 'cont_batching', True)
-            self.config.pooling = getattr(preset_config, 'pooling', 'none')
-            self.config.kv_unified = getattr(preset_config, 'kv_unified', True)
-            self.config.backend = getattr(preset_config, 'backend', 'auto')
-            self.config.reverse_prompt = getattr(preset_config, 'reverse_prompt', "")
-            self.config.lookup_cache_static = getattr(preset_config, 'lookup_cache_static', "")
-            self.config.lookup_cache_dynamic = getattr(preset_config, 'lookup_cache_dynamic', "")
-            self.config.api_prefix = getattr(preset_config, 'api_prefix', "")
-            self.config.ui_config = getattr(preset_config, 'ui_config', "")
-            self.config.ui_config_file = getattr(preset_config, 'ui_config_file', "")
-            self.config.tools = getattr(preset_config, 'tools', "")
-            self.config.grammar = getattr(preset_config, 'grammar', "")
-            self.config.grammar_file = getattr(preset_config, 'grammar_file', "")
-            self.config.json_schema = getattr(preset_config, 'json_schema', "")
-            self.config.json_schema_file = getattr(preset_config, 'json_schema_file', "")
-            # Extra sampling
-            self.config.samplers = getattr(preset_config, 'samplers', "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature")
-            self.config.sampler_seq = getattr(preset_config, 'sampler_seq', "edskypmxt")
-            self.config.seed = getattr(preset_config, 'seed', -1)
-            self.config.top_n_sigma = getattr(preset_config, 'top_n_sigma', -1.0)
-            self.config.typical_p = getattr(preset_config, 'typical_p', 1.0)
-            self.config.xtc_probability = getattr(preset_config, 'xtc_probability', 0.0)
-            self.config.xtc_threshold = getattr(preset_config, 'xtc_threshold', 0.1)
-            self.config.logit_bias = getattr(preset_config, 'logit_bias', "")
-            # Adaptive & DynaTemp
-            self.config.adaptive_target = getattr(preset_config, 'adaptive_target', -1.0)
-            self.config.adaptive_decay = getattr(preset_config, 'adaptive_decay', 0.9)
-            self.config.dynatemp_range = getattr(preset_config, 'dynatemp_range', 0.0)
-            self.config.dynatemp_exp = getattr(preset_config, 'dynatemp_exp', 1.0)
-            # Spec draft extras
-            self.config.spec_draft_n_max = getattr(preset_config, 'spec_draft_n_max', 3)
-            self.config.spec_draft_n_min = getattr(preset_config, 'spec_draft_n_min', 0)
-            self.config.spec_draft_p_split = getattr(preset_config, 'spec_draft_p_split', 0.1)
-            self.config.spec_draft_p_min = getattr(preset_config, 'spec_draft_p_min', 0.0)
-            self.config.spec_draft_backend_sampling = getattr(preset_config, 'spec_draft_backend_sampling', True)
-            self.config.spec_draft_ngl = getattr(preset_config, 'spec_draft_ngl', -1)
-            # Spec draft CPU affinity
-            self.config.spec_draft_cpu_mask = getattr(preset_config, 'spec_draft_cpu_mask', "")
-            self.config.spec_draft_cpu_range = getattr(preset_config, 'spec_draft_cpu_range', "")
-            self.config.spec_draft_cpu_strict = getattr(preset_config, 'spec_draft_cpu_strict', 0)
-            self.config.spec_draft_prio = getattr(preset_config, 'spec_draft_prio', 0)
-            self.config.spec_draft_poll = getattr(preset_config, 'spec_draft_poll', 0)
-            self.config.spec_draft_cpu_mask_batch = getattr(preset_config, 'spec_draft_cpu_mask_batch', "")
-            self.config.spec_draft_cpu_strict_batch = getattr(preset_config, 'spec_draft_cpu_strict_batch', 0)
-            self.config.spec_draft_prio_batch = getattr(preset_config, 'spec_draft_prio_batch', 0)
-            self.config.spec_draft_poll_batch = getattr(preset_config, 'spec_draft_poll_batch', 0)
-            self.config.spec_draft_cpu_moe = getattr(preset_config, 'spec_draft_cpu_moe', False)
-            self.config.spec_draft_n_cpu_moe = getattr(preset_config, 'spec_draft_n_cpu_moe', 0)
-            # Spec N-gram / mod params
-            self.config.spec_ngram_mod_n_min = getattr(preset_config, 'spec_ngram_mod_n_min', 48)
-            self.config.spec_ngram_mod_n_max = getattr(preset_config, 'spec_ngram_mod_n_max', 64)
-            self.config.spec_ngram_mod_n_match = getattr(preset_config, 'spec_ngram_mod_n_match', 24)
-            self.config.spec_ngram_simple_size_n = getattr(preset_config, 'spec_ngram_simple_size_n', 12)
-            self.config.spec_ngram_simple_size_m = getattr(preset_config, 'spec_ngram_simple_size_m', 48)
-            self.config.spec_ngram_simple_min_hits = getattr(preset_config, 'spec_ngram_simple_min_hits', 1)
-            self.config.spec_ngram_map_k_size_n = getattr(preset_config, 'spec_ngram_map_k_size_n', 12)
-            self.config.spec_ngram_map_k_size_m = getattr(preset_config, 'spec_ngram_map_k_size_m', 48)
-            self.config.spec_ngram_map_k_min_hits = getattr(preset_config, 'spec_ngram_map_k_min_hits', 1)
-            self.config.spec_ngram_map_k4v_size_n = getattr(preset_config, 'spec_ngram_map_k4v_size_n', 12)
-            self.config.spec_ngram_map_k4v_size_m = getattr(preset_config, 'spec_ngram_map_k4v_size_m', 48)
-            self.config.spec_ngram_map_k4v_min_hits = getattr(preset_config, 'spec_ngram_map_k4v_min_hits', 1)
-            # Extra cache
-            self.config.ctx_checkpoints = getattr(preset_config, 'ctx_checkpoints', 32)
-            self.config.checkpoint_min_step = getattr(preset_config, 'checkpoint_min_step', 256)
-            self.config.cache_ram = getattr(preset_config, 'cache_ram', 8192)
-            self.config.cache_idle_slots = getattr(preset_config, 'cache_idle_slots', True)
-            self.config.context_shift = getattr(preset_config, 'context_shift', False)
-            # Generation extras
-            self.config.special = getattr(preset_config, 'special', False)
-            self.config.spm_infill = getattr(preset_config, 'spm_infill', False)
-            # Multimodal
-            self.config.mmproj = getattr(preset_config, 'mmproj', "")
-            self.config.mmproj_url = getattr(preset_config, 'mmproj_url', "")
-            self.config.mmproj_auto = getattr(preset_config, 'mmproj_auto', True)
-            self.config.mmproj_offload = getattr(preset_config, 'mmproj_offload', True)
-            self.config.image_min_tokens = getattr(preset_config, 'image_min_tokens', 0)
-            self.config.image_max_tokens = getattr(preset_config, 'image_max_tokens', 0)
-            self.config.mtmd_batch_max_tokens = getattr(preset_config, 'mtmd_batch_max_tokens', 1024)
-            # Server extras
-            self.config.alias = getattr(preset_config, 'alias', "")
-            self.config.tags = getattr(preset_config, 'tags', "")
-            self.config.embd_normalize = getattr(preset_config, 'embd_normalize', 2)
-            self.config.path = getattr(preset_config, 'path', "")
-            self.config.reuse_port = getattr(preset_config, 'reuse_port', False)
-            self.config.ui_mcp_proxy = getattr(preset_config, 'ui_mcp_proxy', False)
-                        # Update UI (block signals to prevent sync cascade during bulk update)
-            self.ctx_spin.blockSignals(True)
-            if hasattr(self, 'adv_ctx_spin'):
-                self.adv_ctx_spin.blockSignals(True)
-            self.ctx_spin.setValue(self.config.context_size)
-            self.gpu_spin.setValue(self.config.gpu_layers)
-            self.threads_spin.setValue(self.config.threads)
-            self.port_spin.setValue(self.config.port)
-            self.host_input.setText(self.config.host)
-            self.cache_combo.setCurrentText(self.config.kv_cache_type)
-            self.batch_spin.setValue(self.config.batch_size)
-            self.mmap_check.setChecked(self.config.use_mmap)
-            
-            # Update advanced UI controls if they exist
-            if hasattr(self, 'adv_threads_spin'):
-                self.adv_threads_spin.setValue(self.config.threads if self.config.threads > 0 else -1)
-            if hasattr(self, 'adv_threads_batch_spin'):
-                self.adv_threads_batch_spin.setValue(self.config.threads_batch if self.config.threads_batch != -1 else -1)
-            if hasattr(self, 'adv_ctx_spin'):
-                self.adv_ctx_spin.setValue(self.config.context_size if self.config.context_size > 0 else 0)
-                self.adv_ctx_spin.blockSignals(False)
-            self.ctx_spin.blockSignals(False)
-            if hasattr(self, 'adv_predict_spin'):
-                self.adv_predict_spin.setValue(self.config.predict if self.config.predict != -1 else -1)
-            if hasattr(self, 'adv_batch_spin'):
-                self.adv_batch_spin.setValue(self.config.logical_batch_size)
-            if hasattr(self, 'adv_ubatch_spin'):
-                self.adv_ubatch_spin.setValue(self.config.ubatch_size)
-            if hasattr(self, 'adv_keep_spin'):
-                self.adv_keep_spin.setValue(self.config.keep)
-            if hasattr(self, 'adv_rope_scaling_combo'):
-                self.adv_rope_scaling_combo.setCurrentText(self.config.rope_scaling)
-            if hasattr(self, 'adv_rope_scale_spin'):
-                self.adv_rope_scale_spin.setValue(self.config.rope_scale)
-            if hasattr(self, 'adv_rope_freq_base_spin'):
-                self.adv_rope_freq_base_spin.setValue(self.config.rope_freq_base if self.config.rope_freq_base > 0 else 0)
-            if hasattr(self, 'adv_rope_freq_scale_spin'):
-                self.adv_rope_freq_scale_spin.setValue(self.config.rope_freq_scale if self.config.rope_freq_scale > 0 else 0)
-            if hasattr(self, 'adv_cache_type_k_combo'):
-                self.adv_cache_type_k_combo.setCurrentText(self.config.cache_type_k)
-            if hasattr(self, 'adv_cache_type_v_combo'):
-                self.adv_cache_type_v_combo.setCurrentText(self.config.cache_type_v)
-            if hasattr(self, 'cache_type_k_combo'):
-                self.cache_type_k_combo.setCurrentText(self.config.cache_type_k)
-            if hasattr(self, 'cache_type_v_combo'):
-                self.cache_type_v_combo.setCurrentText(self.config.cache_type_v)
-            if hasattr(self, 'adv_mmap_check'):
-                self.adv_mmap_check.setChecked(self.config.use_mmap)
-            if hasattr(self, 'adv_mlock_check'):
-                self.adv_mlock_check.setChecked(self.config.mlock)
-            if hasattr(self, 'adv_gpu_layers_spin'):
-                self.adv_gpu_layers_spin.setValue(self.config.gpu_layers if self.config.gpu_layers != -1 else -1)
-            if hasattr(self, 'adv_split_mode_combo'):
-                self.adv_split_mode_combo.setCurrentText(self.config.split_mode)
-            if hasattr(self, 'adv_tensor_split_input'):
-                self.adv_tensor_split_input.setText(self.config.tensor_split or "")
-            if hasattr(self, 'adv_main_gpu_spin'):
-                self.adv_main_gpu_spin.setValue(self.config.main_gpu)
-            if hasattr(self, 'adv_temp_spin'):
-                self.adv_temp_spin.setValue(self.config.temp)
-            if hasattr(self, 'adv_top_k_spin'):
-                self.adv_top_k_spin.setValue(self.config.top_k)
-            if hasattr(self, 'adv_top_p_spin'):
-                self.adv_top_p_spin.setValue(self.config.top_p)
-            if hasattr(self, 'adv_min_p_spin'):
-                self.adv_min_p_spin.setValue(self.config.min_p)
-            if hasattr(self, 'adv_repeat_last_n_spin'):
-                self.adv_repeat_last_n_spin.setValue(self.config.repeat_last_n)
-            if hasattr(self, 'adv_repeat_penalty_spin'):
-                self.adv_repeat_penalty_spin.setValue(self.config.repeat_penalty)
-            if hasattr(self, 'adv_presence_penalty_spin'):
-                self.adv_presence_penalty_spin.setValue(self.config.presence_penalty)
-            if hasattr(self, 'adv_frequency_penalty_spin'):
-                self.adv_frequency_penalty_spin.setValue(self.config.frequency_penalty)
-            if hasattr(self, 'adv_draft_n_max_spin'):
-                self.adv_draft_n_max_spin.setValue(self.config.draft_n_max)
-            if hasattr(self, 'adv_draft_n_min_spin'):
-                self.adv_draft_n_min_spin.setValue(self.config.draft_n_min)
-
-            # Mirostat
-            if hasattr(self, 'adv_mirostat_spin'):
-                self.adv_mirostat_spin.setValue(self.config.mirostat)
-            if hasattr(self, 'adv_mirostat_lr_spin'):
-                self.adv_mirostat_lr_spin.setValue(self.config.mirostat_lr)
-            if hasattr(self, 'adv_mirostat_ent_spin'):
-                self.adv_mirostat_ent_spin.setValue(self.config.mirostat_ent)
-
-            # DRY
-            if hasattr(self, 'adv_dry_multiplier_spin'):
-                self.adv_dry_multiplier_spin.setValue(self.config.dry_multiplier)
-            if hasattr(self, 'adv_dry_base_spin'):
-                self.adv_dry_base_spin.setValue(self.config.dry_base)
-            if hasattr(self, 'adv_dry_allowed_length_spin'):
-                self.adv_dry_allowed_length_spin.setValue(self.config.dry_allowed_length)
-            if hasattr(self, 'adv_dry_penalty_last_n_spin'):
-                self.adv_dry_penalty_last_n_spin.setValue(self.config.dry_penalty_last_n)
-
-            # Sampling extras
-            if hasattr(self, 'adv_ignore_eos_check'):
-                self.adv_ignore_eos_check.setChecked(self.config.ignore_eos)
-            if hasattr(self, 'adv_backend_sampling_check'):
-                self.adv_backend_sampling_check.setChecked(self.config.backend_sampling)
-
-            # Spec draft extras
-            if hasattr(self, 'adv_spec_draft_threads_spin'):
-                self.adv_spec_draft_threads_spin.setValue(self.config.spec_draft_threads)
-            if hasattr(self, 'adv_spec_draft_threads_batch_spin'):
-                self.adv_spec_draft_threads_batch_spin.setValue(self.config.spec_draft_threads_batch)
-
-            # Server options
-            if hasattr(self, 'adv_parallel_spin'):
-                self.adv_parallel_spin.setValue(self.config.parallel)
-            if hasattr(self, 'adv_backend_combo'):
-                self.adv_backend_combo.setCurrentText(self.config.backend)
-            if hasattr(self, 'adv_jinja_check'):
-                self.adv_jinja_check.setChecked(self.config.jinja)
-            if hasattr(self, 'adv_warmup_check'):
-                self.adv_warmup_check.setChecked(self.config.warmup)
-            if hasattr(self, 'adv_embeddings_check'):
-                self.adv_embeddings_check.setChecked(self.config.embeddings)
-            if hasattr(self, 'adv_reranking_check'):
-                self.adv_reranking_check.setChecked(self.config.reranking)
-            if hasattr(self, 'adv_ui_check'):
-                self.adv_ui_check.setChecked(self.config.ui)
-            if hasattr(self, 'adv_agent_check'):
-                self.adv_agent_check.setChecked(self.config.agent)
-            if hasattr(self, 'adv_cont_batching_check'):
-                self.adv_cont_batching_check.setChecked(self.config.cont_batching)
-
-            # Generation & cache extras
-            if hasattr(self, 'adv_pooling_combo'):
-                self.adv_pooling_combo.setCurrentText(self.config.pooling)
-            if hasattr(self, 'adv_kv_unified_check'):
-                self.adv_kv_unified_check.setChecked(self.config.kv_unified)
-
-            # Extra sampling
-            if hasattr(self, 'adv_seed_spin'):
-                self.adv_seed_spin.setValue(self.config.seed)
-            if hasattr(self, 'adv_top_n_sigma_spin'):
-                self.adv_top_n_sigma_spin.setValue(self.config.top_n_sigma)
-            if hasattr(self, 'adv_typical_p_spin'):
-                self.adv_typical_p_spin.setValue(self.config.typical_p)
-            if hasattr(self, 'adv_xtc_probability_spin'):
-                self.adv_xtc_probability_spin.setValue(self.config.xtc_probability)
-            if hasattr(self, 'adv_xtc_threshold_spin'):
-                self.adv_xtc_threshold_spin.setValue(self.config.xtc_threshold)
-            # Adaptive & DynaTemp
-            if hasattr(self, 'adv_adaptive_target_spin'):
-                self.adv_adaptive_target_spin.setValue(self.config.adaptive_target)
-            if hasattr(self, 'adv_adaptive_decay_spin'):
-                self.adv_adaptive_decay_spin.setValue(self.config.adaptive_decay)
-            if hasattr(self, 'adv_dynatemp_range_spin'):
-                self.adv_dynatemp_range_spin.setValue(self.config.dynatemp_range)
-            if hasattr(self, 'adv_dynatemp_exp_spin'):
-                self.adv_dynatemp_exp_spin.setValue(self.config.dynatemp_exp)
-            # Spec draft extras
-            if hasattr(self, 'adv_spec_draft_n_max_spin'):
-                self.adv_spec_draft_n_max_spin.setValue(self.config.spec_draft_n_max)
-            if hasattr(self, 'adv_spec_draft_n_min_spin'):
-                self.adv_spec_draft_n_min_spin.setValue(self.config.spec_draft_n_min)
-            if hasattr(self, 'adv_spec_draft_p_split_spin'):
-                self.adv_spec_draft_p_split_spin.setValue(self.config.spec_draft_p_split)
-            if hasattr(self, 'adv_spec_draft_p_min_spin'):
-                self.adv_spec_draft_p_min_spin.setValue(self.config.spec_draft_p_min)
-            if hasattr(self, 'adv_spec_draft_backend_sampling_check'):
-                self.adv_spec_draft_backend_sampling_check.setChecked(self.config.spec_draft_backend_sampling)
-            if hasattr(self, 'adv_spec_draft_ngl_spin'):
-                self.adv_spec_draft_ngl_spin.setValue(self.config.spec_draft_ngl)
-            # Spec draft CPU affinity
-            if hasattr(self, 'adv_spec_draft_cpu_strict_spin'):
-                self.adv_spec_draft_cpu_strict_spin.setValue(self.config.spec_draft_cpu_strict)
-            if hasattr(self, 'adv_spec_draft_prio_spin'):
-                self.adv_spec_draft_prio_spin.setValue(self.config.spec_draft_prio)
-            if hasattr(self, 'adv_spec_draft_poll_spin'):
-                self.adv_spec_draft_poll_spin.setValue(self.config.spec_draft_poll)
-            if hasattr(self, 'adv_spec_draft_cpu_strict_batch_spin'):
-                self.adv_spec_draft_cpu_strict_batch_spin.setValue(self.config.spec_draft_cpu_strict_batch)
-            if hasattr(self, 'adv_spec_draft_prio_batch_spin'):
-                self.adv_spec_draft_prio_batch_spin.setValue(self.config.spec_draft_prio_batch)
-            if hasattr(self, 'adv_spec_draft_poll_batch_spin'):
-                self.adv_spec_draft_poll_batch_spin.setValue(self.config.spec_draft_poll_batch)
-            if hasattr(self, 'adv_spec_draft_cpu_moe_check'):
-                self.adv_spec_draft_cpu_moe_check.setChecked(self.config.spec_draft_cpu_moe)
-            if hasattr(self, 'adv_spec_draft_n_cpu_moe_spin'):
-                self.adv_spec_draft_n_cpu_moe_spin.setValue(self.config.spec_draft_n_cpu_moe)
-            # Spec N-gram
-            if hasattr(self, 'adv_spec_ngram_mod_n_min_spin'):
-                self.adv_spec_ngram_mod_n_min_spin.setValue(self.config.spec_ngram_mod_n_min)
-            if hasattr(self, 'adv_spec_ngram_mod_n_max_spin'):
-                self.adv_spec_ngram_mod_n_max_spin.setValue(self.config.spec_ngram_mod_n_max)
-            if hasattr(self, 'adv_spec_ngram_mod_n_match_spin'):
-                self.adv_spec_ngram_mod_n_match_spin.setValue(self.config.spec_ngram_mod_n_match)
-            if hasattr(self, 'adv_spec_ngram_simple_size_n_spin'):
-                self.adv_spec_ngram_simple_size_n_spin.setValue(self.config.spec_ngram_simple_size_n)
-            if hasattr(self, 'adv_spec_ngram_simple_size_m_spin'):
-                self.adv_spec_ngram_simple_size_m_spin.setValue(self.config.spec_ngram_simple_size_m)
-            if hasattr(self, 'adv_spec_ngram_simple_min_hits_spin'):
-                self.adv_spec_ngram_simple_min_hits_spin.setValue(self.config.spec_ngram_simple_min_hits)
-            if hasattr(self, 'adv_spec_ngram_map_k_size_n_spin'):
-                self.adv_spec_ngram_map_k_size_n_spin.setValue(self.config.spec_ngram_map_k_size_n)
-            if hasattr(self, 'adv_spec_ngram_map_k_size_m_spin'):
-                self.adv_spec_ngram_map_k_size_m_spin.setValue(self.config.spec_ngram_map_k_size_m)
-            if hasattr(self, 'adv_spec_ngram_map_k_min_hits_spin'):
-                self.adv_spec_ngram_map_k_min_hits_spin.setValue(self.config.spec_ngram_map_k_min_hits)
-            if hasattr(self, 'adv_spec_ngram_map_k4v_size_n_spin'):
-                self.adv_spec_ngram_map_k4v_size_n_spin.setValue(self.config.spec_ngram_map_k4v_size_n)
-            if hasattr(self, 'adv_spec_ngram_map_k4v_size_m_spin'):
-                self.adv_spec_ngram_map_k4v_size_m_spin.setValue(self.config.spec_ngram_map_k4v_size_m)
-            if hasattr(self, 'adv_spec_ngram_map_k4v_min_hits_spin'):
-                self.adv_spec_ngram_map_k4v_min_hits_spin.setValue(self.config.spec_ngram_map_k4v_min_hits)
-            # Extra cache
-            if hasattr(self, 'adv_ctx_checkpoints_spin'):
-                self.adv_ctx_checkpoints_spin.setValue(self.config.ctx_checkpoints)
-            if hasattr(self, 'adv_checkpoint_min_step_spin'):
-                self.adv_checkpoint_min_step_spin.setValue(self.config.checkpoint_min_step)
-            if hasattr(self, 'adv_cache_ram_spin'):
-                self.adv_cache_ram_spin.setValue(self.config.cache_ram)
-            if hasattr(self, 'adv_cache_idle_slots_check'):
-                self.adv_cache_idle_slots_check.setChecked(self.config.cache_idle_slots)
-            if hasattr(self, 'adv_context_shift_check'):
-                self.adv_context_shift_check.setChecked(self.config.context_shift)
-            # Generation extras
-            if hasattr(self, 'adv_special_check'):
-                self.adv_special_check.setChecked(self.config.special)
-            if hasattr(self, 'adv_spm_infill_check'):
-                self.adv_spm_infill_check.setChecked(self.config.spm_infill)
-            # Multimodal
-            if hasattr(self, 'adv_mmproj_auto_check'):
-                self.adv_mmproj_auto_check.setChecked(self.config.mmproj_auto)
-            if hasattr(self, 'adv_mmproj_offload_check'):
-                self.adv_mmproj_offload_check.setChecked(self.config.mmproj_offload)
-            if hasattr(self, 'adv_image_min_tokens_spin'):
-                self.adv_image_min_tokens_spin.setValue(self.config.image_min_tokens)
-            if hasattr(self, 'adv_image_max_tokens_spin'):
-                self.adv_image_max_tokens_spin.setValue(self.config.image_max_tokens)
-            if hasattr(self, 'adv_mtmd_batch_max_tokens_spin'):
-                self.adv_mtmd_batch_max_tokens_spin.setValue(self.config.mtmd_batch_max_tokens)
-            # Server extras
-            if hasattr(self, 'adv_embd_normalize_spin'):
-                self.adv_embd_normalize_spin.setValue(self.config.embd_normalize)
-            if hasattr(self, 'adv_reuse_port_check'):
-                self.adv_reuse_port_check.setChecked(self.config.reuse_port)
-            if hasattr(self, 'adv_ui_mcp_proxy_check'):
-                self.adv_ui_mcp_proxy_check.setChecked(self.config.ui_mcp_proxy)
-
-            # Set or clear string input fields based on preset values
-            if hasattr(self, 'adv_cpu_mask_input'):
-                self.adv_cpu_mask_input.setText(preset_config.cpu_mask or "")
-            if hasattr(self, 'adv_cpu_range_input'):
-                self.adv_cpu_range_input.setText(preset_config.cpu_range or "")
-            if hasattr(self, 'adv_cpu_mask_batch_input'):
-                self.adv_cpu_mask_batch_input.setText(preset_config.cpu_mask_batch or "")
-            if hasattr(self, 'adv_cpu_range_batch_input'):
-                self.adv_cpu_range_batch_input.setText(preset_config.cpu_range_batch or "")
-            if hasattr(self, 'adv_numa_input'):
-                self.adv_numa_input.setText(preset_config.numa or "")
-            if hasattr(self, 'adv_device_input'):
-                self.adv_device_input.setText(preset_config.device or "")
-            if hasattr(self, 'adv_override_tensor_input'):
-                self.adv_override_tensor_input.setText(preset_config.override_tensor or "")
-            if hasattr(self, 'adv_fit_target_input'):
-                self.adv_fit_target_input.setText(preset_config.fit_target or "")
-            if hasattr(self, 'adv_override_kv_input'):
-                self.adv_override_kv_input.setText(preset_config.override_kv or "")
-            if hasattr(self, 'adv_lora_input'):
-                self.adv_lora_input.setText(preset_config.lora or "")
-            if hasattr(self, 'adv_lora_scaled_input'):
-                self.adv_lora_scaled_input.setText(preset_config.lora_scaled or "")
-            if hasattr(self, 'adv_control_vector_input'):
-                self.adv_control_vector_input.setText(preset_config.control_vector or "")
-            if hasattr(self, 'adv_control_vector_scaled_input'):
-                self.adv_control_vector_scaled_input.setText(preset_config.control_vector_scaled or "")
-            if hasattr(self, 'adv_control_vector_layer_range_input'):
-                self.adv_control_vector_layer_range_input.setText(preset_config.control_vector_layer_range or "")
-            if hasattr(self, 'adv_model_url_input'):
-                self.adv_model_url_input.setText(preset_config.model_url or "")
-            if hasattr(self, 'adv_docker_repo_input'):
-                self.adv_docker_repo_input.setText(preset_config.docker_repo or "")
-            if hasattr(self, 'adv_hf_repo_input'):
-                self.adv_hf_repo_input.setText(preset_config.hf_repo or "")
-            if hasattr(self, 'adv_hf_file_input'):
-                self.adv_hf_file_input.setText(preset_config.hf_file or "")
-            if hasattr(self, 'adv_hf_repo_v_input'):
-                self.adv_hf_repo_v_input.setText(preset_config.hf_repo_v or "")
-            if hasattr(self, 'adv_hf_file_v_input'):
-                self.adv_hf_file_v_input.setText(preset_config.hf_file_v or "")
-            if hasattr(self, 'adv_hf_token_input'):
-                self.adv_hf_token_input.setText(preset_config.hf_token or "")
-            if hasattr(self, 'adv_log_file_input'):
-                self.adv_log_file_input.setText(preset_config.log_file or "")
-            if hasattr(self, 'adv_grammar_input'):
-                self.adv_grammar_input.setText(preset_config.grammar or "")
-            if hasattr(self, 'adv_grammar_file_input'):
-                self.adv_grammar_file_input.setText(preset_config.grammar_file or "")
-            if hasattr(self, 'adv_json_schema_input'):
-                self.adv_json_schema_input.setText(preset_config.json_schema or "")
-            if hasattr(self, 'adv_json_schema_file_input'):
-                self.adv_json_schema_file_input.setText(preset_config.json_schema_file or "")
-            if hasattr(self, 'adv_spec_draft_hf_input'):
-                self.adv_spec_draft_hf_input.setText(preset_config.spec_draft_hf or "")
-            if hasattr(self, 'adv_spec_draft_override_tensor_input'):
-                self.adv_spec_draft_override_tensor_input.setText(preset_config.spec_draft_override_tensor or "")
-            if hasattr(self, 'adv_spec_draft_device_input'):
-                self.adv_spec_draft_device_input.setText(preset_config.spec_draft_device or "")
-            if hasattr(self, 'adv_spec_draft_model_input'):
-                self.adv_spec_draft_model_input.setText(preset_config.spec_draft_model or "")
-            if hasattr(self, 'adv_lookup_cache_static_input'):
-                self.adv_lookup_cache_static_input.setText(preset_config.lookup_cache_static or "")
-            if hasattr(self, 'adv_lookup_cache_dynamic_input'):
-                self.adv_lookup_cache_dynamic_input.setText(preset_config.lookup_cache_dynamic or "")
-            if hasattr(self, 'adv_reverse_prompt_input'):
-                self.adv_reverse_prompt_input.setText(preset_config.reverse_prompt or "")
-            if hasattr(self, 'adv_dry_sequence_breaker_input'):
-                self.adv_dry_sequence_breaker_input.setText(preset_config.dry_sequence_breaker or "")
-            if hasattr(self, 'adv_api_prefix_input'):
-                self.adv_api_prefix_input.setText(preset_config.api_prefix or "")
-            if hasattr(self, 'adv_ui_config_input'):
-                self.adv_ui_config_input.setText(preset_config.ui_config or "")
-            if hasattr(self, 'adv_ui_config_file_input'):
-                self.adv_ui_config_file_input.setText(preset_config.ui_config_file or "")
-            if hasattr(self, 'adv_tools_input'):
-                self.adv_tools_input.setText(preset_config.tools or "")
-            # Extra sampling string fields
-            if hasattr(self, 'adv_samplers_input'):
-                self.adv_samplers_input.setText(preset_config.samplers or "")
-            if hasattr(self, 'adv_sampler_seq_input'):
-                self.adv_sampler_seq_input.setText(preset_config.sampler_seq or "")
-            if hasattr(self, 'adv_logit_bias_input'):
-                self.adv_logit_bias_input.setText(preset_config.logit_bias or "")
-            # Spec draft CPU affinity string fields
-            if hasattr(self, 'adv_spec_draft_cpu_mask_input'):
-                self.adv_spec_draft_cpu_mask_input.setText(preset_config.spec_draft_cpu_mask or "")
-            if hasattr(self, 'adv_spec_draft_cpu_range_input'):
-                self.adv_spec_draft_cpu_range_input.setText(preset_config.spec_draft_cpu_range or "")
-            if hasattr(self, 'adv_spec_draft_cpu_mask_batch_input'):
-                self.adv_spec_draft_cpu_mask_batch_input.setText(preset_config.spec_draft_cpu_mask_batch or "")
-            # Multimodal string fields
-            if hasattr(self, 'adv_mmproj_input'):
-                self.adv_mmproj_input.setText(preset_config.mmproj or "")
-            if hasattr(self, 'adv_mmproj_url_input'):
-                self.adv_mmproj_url_input.setText(preset_config.mmproj_url or "")
-            # Server extras string fields
-            if hasattr(self, 'adv_alias_input'):
-                self.adv_alias_input.setText(preset_config.alias or "")
-            if hasattr(self, 'adv_tags_input'):
-                self.adv_tags_input.setText(preset_config.tags or "")
-            if hasattr(self, 'adv_path_input'):
-                self.adv_path_input.setText(preset_config.path or "")
 
             self.update_command_preview()
         except Exception as e:
-            error_msg = str(e)
+            logger.exception("Failed to load preset '%s'", preset_name)
             if hasattr(self, 'command_text'):
-                self.command_text.setText(f"Preset Load Error: {error_msg}")
-            QMessageBox.critical(self, "Preset Error", f"Failed to load preset '{preset_name}': {error_msg}")
-            
+                self.command_text.setText(f"Preset Load Error: {e}")
+            QMessageBox.critical(self, "Preset Error", f"Failed to load preset '{preset_name}': {e}")
+
     def update_command_preview(self):
         """Update the command preview based on current config."""
-        # Sync all UI state (basic + advanced tabs) into self.config
-        self.update_config_from_ui()
-
         # Build and display command
         try:
             validate_config(self.config)
@@ -2988,8 +995,6 @@ class LlamaLauncherGUI(QMainWindow):
     def launch_server(self):
         """Launch llama-server."""
         try:
-            # Sync all UI state (basic + advanced tabs) into self.config before launch
-            self.update_config_from_ui()
             validate_config(self.config)
             cmd = build_command(self.config)
             
@@ -3042,579 +1047,6 @@ class LlamaLauncherGUI(QMainWindow):
         """Handle server process finished."""
         self.command_text.append(f"\n--- Server process finished with exit code: {exit_code} ---")
 
-    def update_config_from_ui(self):
-        """Update config from UI elements."""
-        self.config.model_path = self.model_combo.currentText() or ""
-        self.config.target_server = self.server_combo.currentText() or None
-        mmproj_path = self.mmproj_combo.currentText().strip() if self.mmproj_combo.currentText() else None
-        self.config.mmproj_model_path = mmproj_path if mmproj_path else None
-        draft_path = self.draft_combo.currentText().strip() if self.draft_combo.currentText() else None
-        self.config.draft_model_path = draft_path if draft_path else None
-        self.config.context_size = self.ctx_spin.value()
-        self.config.gpu_layers = self.gpu_spin.value()
-        self.config.threads = self.threads_spin.value()
-
-        # Advanced parameters from advanced tab
-        if hasattr(self, 'adv_threads_spin'):
-            val = self.adv_threads_spin.value()
-            self.config.threads = val if val != -1 else 0
-
-        if hasattr(self, 'adv_threads_batch_spin'):
-            val = self.adv_threads_batch_spin.value()
-            self.config.threads_batch = val if val != -1 else -1
-
-        # Use advanced ctx only if explicitly set (non-zero), otherwise basic tab wins
-        if hasattr(self, 'adv_ctx_spin'):
-            val = self.adv_ctx_spin.value()
-            if val > 0:
-                self.config.context_size = val
-                
-        if hasattr(self, 'adv_predict_spin'):
-            val = self.adv_predict_spin.value()
-            self.config.predict = val if val != -1 else -1
-            
-        if hasattr(self, 'adv_batch_spin'):
-            self.config.logical_batch_size = self.adv_batch_spin.value()
-            
-        if hasattr(self, 'adv_ubatch_spin'):
-            self.config.ubatch_size = self.adv_ubatch_spin.value()
-            
-        if hasattr(self, 'adv_keep_spin'):
-            val = self.adv_keep_spin.value()
-            self.config.keep = val if val != 0 else 0
-            
-        if hasattr(self, 'adv_rope_scaling_combo'):
-            self.config.rope_scaling = self.adv_rope_scaling_combo.currentText()
-            
-        if hasattr(self, 'adv_rope_scale_spin'):
-            self.config.rope_scale = self.adv_rope_scale_spin.value()
-            
-        if hasattr(self, 'adv_rope_freq_base_spin'):
-            val = self.adv_rope_freq_base_spin.value()
-            if val != 0:
-                self.config.rope_freq_base = val
-                
-        if hasattr(self, 'adv_rope_freq_scale_spin'):
-            val = self.adv_rope_freq_scale_spin.value()
-            if val != 0:
-                self.config.rope_freq_scale = val
-                
-        if hasattr(self, 'cache_type_k_combo'):
-            self.config.cache_type_k = self.cache_type_k_combo.currentText()
-        elif hasattr(self, 'adv_cache_type_k_combo'):
-            self.config.cache_type_k = self.adv_cache_type_k_combo.currentText()
-            
-        if hasattr(self, 'cache_type_v_combo'):
-            self.config.cache_type_v = self.cache_type_v_combo.currentText()
-        elif hasattr(self, 'adv_cache_type_v_combo'):
-            self.config.cache_type_v = self.adv_cache_type_v_combo.currentText()
-            
-        if hasattr(self, 'adv_mmap_check'):
-            self.config.use_mmap = self.adv_mmap_check.isChecked()
-            
-        if hasattr(self, 'adv_mlock_check'):
-            self.config.mlock = self.adv_mlock_check.isChecked()
-            
-        if hasattr(self, 'adv_gpu_layers_spin'):
-            val = self.adv_gpu_layers_spin.value()
-            self.config.gpu_layers = val if val != -1 else -1
-            
-        if hasattr(self, 'adv_split_mode_combo'):
-            self.config.split_mode = self.adv_split_mode_combo.currentText()
-            
-        if hasattr(self, 'adv_tensor_split_input'):
-            text = self.adv_tensor_split_input.text().strip()
-            self.config.tensor_split = text if text else None
-            
-        if hasattr(self, 'adv_main_gpu_spin'):
-            self.config.main_gpu = self.adv_main_gpu_spin.value()
-            
-        if hasattr(self, 'adv_temp_spin'):
-            self.config.temp = self.adv_temp_spin.value()
-            
-        if hasattr(self, 'adv_top_k_spin'):
-            self.config.top_k = self.adv_top_k_spin.value()
-            
-        if hasattr(self, 'adv_top_p_spin'):
-            self.config.top_p = self.adv_top_p_spin.value()
-            
-        if hasattr(self, 'adv_min_p_spin'):
-            self.config.min_p = self.adv_min_p_spin.value()
-            
-        if hasattr(self, 'adv_repeat_last_n_spin'):
-            val = self.adv_repeat_last_n_spin.value()
-            self.config.repeat_last_n = val if val != 64 else 64
-            
-        if hasattr(self, 'adv_repeat_penalty_spin'):
-            self.config.repeat_penalty = self.adv_repeat_penalty_spin.value()
-            
-        if hasattr(self, 'adv_presence_penalty_spin'):
-            self.config.presence_penalty = self.adv_presence_penalty_spin.value()
-            
-        if hasattr(self, 'adv_frequency_penalty_spin'):
-            self.config.frequency_penalty = self.adv_frequency_penalty_spin.value()
-            
-        if hasattr(self, 'adv_draft_n_max_spin'):
-            self.config.draft_n_max = self.adv_draft_n_max_spin.value()
-            
-        if hasattr(self, 'adv_draft_n_min_spin'):
-            self.config.draft_n_min = self.adv_draft_n_min_spin.value()
-            
-        self.config.port = self.port_spin.value()
-        self.config.host = self.host_input.text()
-        
-        # kv_cache_type from basic or advanced tab
-        if hasattr(self, 'cache_combo'):
-            self.config.kv_cache_type = self.cache_combo.currentText()
-        elif hasattr(self, 'adv_cache_type_k_combo') and hasattr(self, 'adv_cache_type_v_combo'):
-            # Use cache type k as the main kv_cache_type for backward compatibility
-            self.config.kv_cache_type = self.adv_cache_type_k_combo.currentText()
-            
-        if hasattr(self, 'batch_spin'):
-            self.config.batch_size = self.batch_spin.value()
-        elif hasattr(self, 'adv_ubatch_spin'):
-            self.config.batch_size = self.adv_ubatch_spin.value()
-            
-        # String input fields from advanced tab
-        if hasattr(self, 'adv_cpu_mask_input'):
-            text = self.adv_cpu_mask_input.text().strip()
-            self.config.cpu_mask = text if text else None
-            
-        if hasattr(self, 'adv_cpu_range_input'):
-            text = self.adv_cpu_range_input.text().strip()
-            self.config.cpu_range = text if text else None
-            
-        if hasattr(self, 'adv_cpu_mask_batch_input'):
-            text = self.adv_cpu_mask_batch_input.text().strip()
-            self.config.cpu_mask_batch = text if text else None
-            
-        if hasattr(self, 'adv_cpu_range_batch_input'):
-            text = self.adv_cpu_range_batch_input.text().strip()
-            self.config.cpu_range_batch = text if text else None
-            
-        if hasattr(self, 'adv_numa_input'):
-            text = self.adv_numa_input.text().strip()
-            self.config.numa = text if text else None
-            
-        if hasattr(self, 'adv_device_input'):
-            text = self.adv_device_input.text().strip()
-            self.config.device = text if text else None
-            
-        if hasattr(self, 'adv_override_tensor_input'):
-            text = self.adv_override_tensor_input.text().strip()
-            self.config.override_tensor = text if text else None
-            
-        if hasattr(self, 'adv_fit_target_input'):
-            text = self.adv_fit_target_input.text().strip()
-            self.config.fit_target = text if text else None
-            
-        if hasattr(self, 'adv_override_kv_input'):
-            text = self.adv_override_kv_input.text().strip()
-            self.config.override_kv = text if text else None
-            
-        if hasattr(self, 'adv_lora_input'):
-            text = self.adv_lora_input.text().strip()
-            self.config.lora = text if text else None
-            
-        if hasattr(self, 'adv_lora_scaled_input'):
-            text = self.adv_lora_scaled_input.text().strip()
-            self.config.lora_scaled = text if text else None
-            
-        if hasattr(self, 'adv_control_vector_input'):
-            text = self.adv_control_vector_input.text().strip()
-            self.config.control_vector = text if text else None
-            
-        if hasattr(self, 'adv_control_vector_scaled_input'):
-            text = self.adv_control_vector_scaled_input.text().strip()
-            self.config.control_vector_scaled = text if text else None
-            
-        if hasattr(self, 'adv_control_vector_layer_range_input'):
-            text = self.adv_control_vector_layer_range_input.text().strip()
-            self.config.control_vector_layer_range = text if text else None
-            
-        if hasattr(self, 'adv_model_url_input'):
-            text = self.adv_model_url_input.text().strip()
-            self.config.model_url = text if text else None
-            
-        if hasattr(self, 'adv_docker_repo_input'):
-            text = self.adv_docker_repo_input.text().strip()
-            self.config.docker_repo = text if text else None
-            
-        if hasattr(self, 'adv_hf_repo_input'):
-            text = self.adv_hf_repo_input.text().strip()
-            self.config.hf_repo = text if text else None
-            
-        if hasattr(self, 'adv_hf_file_input'):
-            text = self.adv_hf_file_input.text().strip()
-            self.config.hf_file = text if text else None
-            
-        if hasattr(self, 'adv_hf_repo_v_input'):
-            text = self.adv_hf_repo_v_input.text().strip()
-            self.config.hf_repo_v = text if text else None
-            
-        if hasattr(self, 'adv_hf_file_v_input'):
-            text = self.adv_hf_file_v_input.text().strip()
-            self.config.hf_file_v = text if text else None
-            
-        if hasattr(self, 'adv_hf_token_input'):
-            text = self.adv_hf_token_input.text().strip()
-            self.config.hf_token = text if text else None
-            
-        if hasattr(self, 'adv_log_file_input'):
-            text = self.adv_log_file_input.text().strip()
-            self.config.log_file = text if text else None
-            
-        if hasattr(self, 'adv_grammar_input'):
-            text = self.adv_grammar_input.text().strip()
-            self.config.grammar = text if text else None
-            
-        if hasattr(self, 'adv_grammar_file_input'):
-            text = self.adv_grammar_file_input.text().strip()
-            self.config.grammar_file = text if text else None
-            
-        if hasattr(self, 'adv_json_schema_input'):
-            text = self.adv_json_schema_input.text().strip()
-            self.config.json_schema = text if text else None
-            
-        if hasattr(self, 'adv_json_schema_file_input'):
-            text = self.adv_json_schema_file_input.text().strip()
-            self.config.json_schema_file = text if text else None
-            
-        if hasattr(self, 'adv_spec_draft_hf_input'):
-            text = self.adv_spec_draft_hf_input.text().strip()
-            self.config.spec_draft_hf = text if text else None
-            
-        if hasattr(self, 'adv_spec_draft_override_tensor_input'):
-            text = self.adv_spec_draft_override_tensor_input.text().strip()
-            self.config.spec_draft_override_tensor = text if text else None
-            
-        if hasattr(self, 'adv_spec_draft_device_input'):
-            text = self.adv_spec_draft_device_input.text().strip()
-            self.config.spec_draft_device = text if text else None
-
-        # --- Missing advanced fields (context/predict) ---
-        if hasattr(self, 'adv_swa_full_check'):
-            self.config.swa_full = self.adv_swa_full_check.isChecked()
-        if hasattr(self, 'adv_flash_attn_combo'):
-            self.config.flash_attn = self.adv_flash_attn_combo.currentText()
-        if hasattr(self, 'adv_perf_check'):
-            self.config.perf = self.adv_perf_check.isChecked()
-        if hasattr(self, 'adv_escape_check'):
-            self.config.escape = self.adv_escape_check.isChecked()
-
-        # --- YaRN fields ---
-        if hasattr(self, 'adv_yarn_orig_ctx_spin'):
-            self.config.yarn_orig_ctx = self.adv_yarn_orig_ctx_spin.value()
-        if hasattr(self, 'adv_yarn_ext_factor_spin'):
-            self.config.yarn_ext_factor = self.adv_yarn_ext_factor_spin.value()
-        if hasattr(self, 'adv_yarn_attn_factor_spin'):
-            self.config.yarn_attn_factor = self.adv_yarn_attn_factor_spin.value()
-        if hasattr(self, 'adv_yarn_beta_slow_spin'):
-            self.config.yarn_beta_slow = self.adv_yarn_beta_slow_spin.value()
-        if hasattr(self, 'adv_yarn_beta_fast_spin'):
-            self.config.yarn_beta_fast = self.adv_yarn_beta_fast_spin.value()
-
-        # --- Cache & memory fields ---
-        if hasattr(self, 'adv_kv_offload_check'):
-            self.config.kv_offload = self.adv_kv_offload_check.isChecked()
-        if hasattr(self, 'adv_repack_check'):
-            self.config.repack = self.adv_repack_check.isChecked()
-        if hasattr(self, 'adv_no_host_check'):
-            self.config.no_host = self.adv_no_host_check.isChecked()
-        if hasattr(self, 'adv_defrag_thold_spin'):
-            self.config.defrag_thold = self.adv_defrag_thold_spin.value()
-        if hasattr(self, 'adv_direct_io_check'):
-            self.config.direct_io = self.adv_direct_io_check.isChecked()
-
-        # --- GPU & NUMA fields ---
-        if hasattr(self, 'adv_cpu_moe_check'):
-            self.config.cpu_moe = self.adv_cpu_moe_check.isChecked()
-        if hasattr(self, 'adv_n_cpu_moe_spin'):
-            self.config.n_cpu_moe = self.adv_n_cpu_moe_spin.value()
-        if hasattr(self, 'adv_fit_combo'):
-            self.config.fit = self.adv_fit_combo.currentText()
-        if hasattr(self, 'adv_fit_ctx_spin'):
-            self.config.fit_ctx = self.adv_fit_ctx_spin.value()
-        if hasattr(self, 'adv_check_tensors_check'):
-            self.config.check_tensors = self.adv_check_tensors_check.isChecked()
-        if hasattr(self, 'adv_op_offload_check'):
-            self.config.op_offload = self.adv_op_offload_check.isChecked()
-
-        # --- Threads & batching fields ---
-        if hasattr(self, 'adv_cpu_strict_spin'):
-            self.config.cpu_strict = self.adv_cpu_strict_spin.value()
-        if hasattr(self, 'adv_prio_spin'):
-            self.config.prio = self.adv_prio_spin.value()
-        if hasattr(self, 'adv_poll_spin'):
-            self.config.poll = self.adv_poll_spin.value()
-        if hasattr(self, 'adv_cpu_strict_batch_spin'):
-            self.config.cpu_strict_batch = self.adv_cpu_strict_batch_spin.value()
-        if hasattr(self, 'adv_prio_batch_spin'):
-            self.config.prio_batch = self.adv_prio_batch_spin.value()
-        if hasattr(self, 'adv_poll_batch_spin'):
-            self.config.poll_batch = self.adv_poll_batch_spin.value()
-
-        # --- Speculative decoding fields ---
-        if hasattr(self, 'adv_spec_type_combo'):
-            self.config.spec_type = self.adv_spec_type_combo.currentText()
-        if hasattr(self, 'adv_spec_draft_type_k_combo'):
-            self.config.spec_draft_type_k = self.adv_spec_draft_type_k_combo.currentText()
-        if hasattr(self, 'adv_spec_draft_type_v_combo'):
-            self.config.spec_draft_type_v = self.adv_spec_draft_type_v_combo.currentText()
-
-        # --- Logging fields ---
-        if hasattr(self, 'adv_log_disable_check'):
-            self.config.log_disable = self.adv_log_disable_check.isChecked()
-        if hasattr(self, 'adv_verbose_check'):
-            self.config.verbose = self.adv_verbose_check.isChecked()
-        if hasattr(self, 'adv_offline_check'):
-            self.config.offline = self.adv_offline_check.isChecked()
-        if hasattr(self, 'adv_verbosity_spin'):
-            self.config.verbosity = self.adv_verbosity_spin.value()
-        if hasattr(self, 'adv_log_prefix_check'):
-            self.config.log_prefix = self.adv_log_prefix_check.isChecked()
-        if hasattr(self, 'adv_log_timestamps_check'):
-            self.config.log_timestamps = self.adv_log_timestamps_check.isChecked()
-        if hasattr(self, 'adv_log_colors_combo'):
-            self.config.log_colors = self.adv_log_colors_combo.currentText()
-
-        # --- Remaining string input fields ---
-        if hasattr(self, 'adv_reverse_prompt_input'):
-            text = self.adv_reverse_prompt_input.text().strip()
-            self.config.reverse_prompt = text if text else ""
-        if hasattr(self, 'adv_dry_sequence_breaker_input'):
-            text = self.adv_dry_sequence_breaker_input.text().strip()
-            self.config.dry_sequence_breaker = text if text else ""
-        if hasattr(self, 'adv_api_prefix_input'):
-            text = self.adv_api_prefix_input.text().strip()
-            self.config.api_prefix = text if text else ""
-        if hasattr(self, 'adv_ui_config_input'):
-            text = self.adv_ui_config_input.text().strip()
-            self.config.ui_config = text if text else ""
-        if hasattr(self, 'adv_ui_config_file_input'):
-            text = self.adv_ui_config_file_input.text().strip()
-            self.config.ui_config_file = text if text else ""
-        if hasattr(self, 'adv_tools_input'):
-            text = self.adv_tools_input.text().strip()
-            self.config.tools = text if text else ""
-        if hasattr(self, 'adv_lookup_cache_static_input'):
-            text = self.adv_lookup_cache_static_input.text().strip()
-            self.config.lookup_cache_static = text if text else ""
-        if hasattr(self, 'adv_lookup_cache_dynamic_input'):
-            text = self.adv_lookup_cache_dynamic_input.text().strip()
-            self.config.lookup_cache_dynamic = text if text else ""
-
-        # --- Mirostat fields ---
-        if hasattr(self, 'adv_mirostat_spin'):
-            self.config.mirostat = self.adv_mirostat_spin.value()
-        if hasattr(self, 'adv_mirostat_lr_spin'):
-            self.config.mirostat_lr = self.adv_mirostat_lr_spin.value()
-        if hasattr(self, 'adv_mirostat_ent_spin'):
-            self.config.mirostat_ent = self.adv_mirostat_ent_spin.value()
-
-        # --- DRY fields ---
-        if hasattr(self, 'adv_dry_multiplier_spin'):
-            self.config.dry_multiplier = self.adv_dry_multiplier_spin.value()
-        if hasattr(self, 'adv_dry_base_spin'):
-            self.config.dry_base = self.adv_dry_base_spin.value()
-        if hasattr(self, 'adv_dry_allowed_length_spin'):
-            self.config.dry_allowed_length = self.adv_dry_allowed_length_spin.value()
-        if hasattr(self, 'adv_dry_penalty_last_n_spin'):
-            self.config.dry_penalty_last_n = self.adv_dry_penalty_last_n_spin.value()
-
-        # --- Sampling extras ---
-        if hasattr(self, 'adv_ignore_eos_check'):
-            self.config.ignore_eos = self.adv_ignore_eos_check.isChecked()
-        if hasattr(self, 'adv_backend_sampling_check'):
-            self.config.backend_sampling = self.adv_backend_sampling_check.isChecked()
-
-        # --- Spec draft extras ---
-        if hasattr(self, 'adv_spec_draft_model_input'):
-            text = self.adv_spec_draft_model_input.text().strip()
-            self.config.spec_draft_model = text if text else ""
-        if hasattr(self, 'adv_spec_draft_threads_spin'):
-            self.config.spec_draft_threads = self.adv_spec_draft_threads_spin.value()
-        if hasattr(self, 'adv_spec_draft_threads_batch_spin'):
-            self.config.spec_draft_threads_batch = self.adv_spec_draft_threads_batch_spin.value()
-
-        # --- Server options ---
-        if hasattr(self, 'adv_parallel_spin'):
-            val = self.adv_parallel_spin.value()
-            self.config.parallel = val if val != -1 else -1
-        if hasattr(self, 'adv_backend_combo'):
-            self.config.backend = self.adv_backend_combo.currentText()
-        if hasattr(self, 'adv_jinja_check'):
-            self.config.jinja = self.adv_jinja_check.isChecked()
-        if hasattr(self, 'adv_warmup_check'):
-            self.config.warmup = self.adv_warmup_check.isChecked()
-        if hasattr(self, 'adv_embeddings_check'):
-            self.config.embeddings = self.adv_embeddings_check.isChecked()
-        if hasattr(self, 'adv_reranking_check'):
-            self.config.reranking = self.adv_reranking_check.isChecked()
-        if hasattr(self, 'adv_ui_check'):
-            self.config.ui = self.adv_ui_check.isChecked()
-        if hasattr(self, 'adv_agent_check'):
-            self.config.agent = self.adv_agent_check.isChecked()
-        if hasattr(self, 'adv_cont_batching_check'):
-            self.config.cont_batching = self.adv_cont_batching_check.isChecked()
-
-        # --- Generation & cache extras ---
-        if hasattr(self, 'adv_pooling_combo'):
-            self.config.pooling = self.adv_pooling_combo.currentText()
-        if hasattr(self, 'adv_kv_unified_check'):
-            self.config.kv_unified = self.adv_kv_unified_check.isChecked()
-
-        # --- Extra sampling ---
-        if hasattr(self, 'adv_samplers_input'):
-            text = self.adv_samplers_input.text().strip()
-            self.config.samplers = text if text else "penalties;dry;top_n_sigma;top_k;typ_p;top_p;min_p;xtc;temperature"
-        if hasattr(self, 'adv_sampler_seq_input'):
-            text = self.adv_sampler_seq_input.text().strip()
-            self.config.sampler_seq = text if text else "edskypmxt"
-        if hasattr(self, 'adv_seed_spin'):
-            self.config.seed = self.adv_seed_spin.value()
-        if hasattr(self, 'adv_top_n_sigma_spin'):
-            self.config.top_n_sigma = self.adv_top_n_sigma_spin.value()
-        if hasattr(self, 'adv_typical_p_spin'):
-            self.config.typical_p = self.adv_typical_p_spin.value()
-        if hasattr(self, 'adv_xtc_probability_spin'):
-            self.config.xtc_probability = self.adv_xtc_probability_spin.value()
-        if hasattr(self, 'adv_xtc_threshold_spin'):
-            self.config.xtc_threshold = self.adv_xtc_threshold_spin.value()
-        if hasattr(self, 'adv_logit_bias_input'):
-            text = self.adv_logit_bias_input.text().strip()
-            self.config.logit_bias = text if text else ""
-
-        # --- Adaptive & DynaTemp ---
-        if hasattr(self, 'adv_adaptive_target_spin'):
-            self.config.adaptive_target = self.adv_adaptive_target_spin.value()
-        if hasattr(self, 'adv_adaptive_decay_spin'):
-            self.config.adaptive_decay = self.adv_adaptive_decay_spin.value()
-        if hasattr(self, 'adv_dynatemp_range_spin'):
-            self.config.dynatemp_range = self.adv_dynatemp_range_spin.value()
-        if hasattr(self, 'adv_dynatemp_exp_spin'):
-            self.config.dynatemp_exp = self.adv_dynatemp_exp_spin.value()
-
-        # --- Spec draft extras ---
-        if hasattr(self, 'adv_spec_draft_n_max_spin'):
-            self.config.spec_draft_n_max = self.adv_spec_draft_n_max_spin.value()
-        if hasattr(self, 'adv_spec_draft_n_min_spin'):
-            self.config.spec_draft_n_min = self.adv_spec_draft_n_min_spin.value()
-        if hasattr(self, 'adv_spec_draft_p_split_spin'):
-            self.config.spec_draft_p_split = self.adv_spec_draft_p_split_spin.value()
-        if hasattr(self, 'adv_spec_draft_p_min_spin'):
-            self.config.spec_draft_p_min = self.adv_spec_draft_p_min_spin.value()
-        if hasattr(self, 'adv_spec_draft_backend_sampling_check'):
-            self.config.spec_draft_backend_sampling = self.adv_spec_draft_backend_sampling_check.isChecked()
-        if hasattr(self, 'adv_spec_draft_ngl_spin'):
-            self.config.spec_draft_ngl = self.adv_spec_draft_ngl_spin.value()
-
-        # --- Spec draft CPU affinity ---
-        if hasattr(self, 'adv_spec_draft_cpu_mask_input'):
-            text = self.adv_spec_draft_cpu_mask_input.text().strip()
-            self.config.spec_draft_cpu_mask = text if text else ""
-        if hasattr(self, 'adv_spec_draft_cpu_range_input'):
-            text = self.adv_spec_draft_cpu_range_input.text().strip()
-            self.config.spec_draft_cpu_range = text if text else ""
-        if hasattr(self, 'adv_spec_draft_cpu_strict_spin'):
-            self.config.spec_draft_cpu_strict = self.adv_spec_draft_cpu_strict_spin.value()
-        if hasattr(self, 'adv_spec_draft_prio_spin'):
-            self.config.spec_draft_prio = self.adv_spec_draft_prio_spin.value()
-        if hasattr(self, 'adv_spec_draft_poll_spin'):
-            self.config.spec_draft_poll = self.adv_spec_draft_poll_spin.value()
-        if hasattr(self, 'adv_spec_draft_cpu_mask_batch_input'):
-            text = self.adv_spec_draft_cpu_mask_batch_input.text().strip()
-            self.config.spec_draft_cpu_mask_batch = text if text else ""
-        if hasattr(self, 'adv_spec_draft_cpu_strict_batch_spin'):
-            self.config.spec_draft_cpu_strict_batch = self.adv_spec_draft_cpu_strict_batch_spin.value()
-        if hasattr(self, 'adv_spec_draft_prio_batch_spin'):
-            self.config.spec_draft_prio_batch = self.adv_spec_draft_prio_batch_spin.value()
-        if hasattr(self, 'adv_spec_draft_poll_batch_spin'):
-            self.config.spec_draft_poll_batch = self.adv_spec_draft_poll_batch_spin.value()
-        if hasattr(self, 'adv_spec_draft_cpu_moe_check'):
-            self.config.spec_draft_cpu_moe = self.adv_spec_draft_cpu_moe_check.isChecked()
-        if hasattr(self, 'adv_spec_draft_n_cpu_moe_spin'):
-            self.config.spec_draft_n_cpu_moe = self.adv_spec_draft_n_cpu_moe_spin.value()
-
-        # --- Spec N-gram / mod params ---
-        if hasattr(self, 'adv_spec_ngram_mod_n_min_spin'):
-            self.config.spec_ngram_mod_n_min = self.adv_spec_ngram_mod_n_min_spin.value()
-        if hasattr(self, 'adv_spec_ngram_mod_n_max_spin'):
-            self.config.spec_ngram_mod_n_max = self.adv_spec_ngram_mod_n_max_spin.value()
-        if hasattr(self, 'adv_spec_ngram_mod_n_match_spin'):
-            self.config.spec_ngram_mod_n_match = self.adv_spec_ngram_mod_n_match_spin.value()
-        if hasattr(self, 'adv_spec_ngram_simple_size_n_spin'):
-            self.config.spec_ngram_simple_size_n = self.adv_spec_ngram_simple_size_n_spin.value()
-        if hasattr(self, 'adv_spec_ngram_simple_size_m_spin'):
-            self.config.spec_ngram_simple_size_m = self.adv_spec_ngram_simple_size_m_spin.value()
-        if hasattr(self, 'adv_spec_ngram_simple_min_hits_spin'):
-            self.config.spec_ngram_simple_min_hits = self.adv_spec_ngram_simple_min_hits_spin.value()
-        if hasattr(self, 'adv_spec_ngram_map_k_size_n_spin'):
-            self.config.spec_ngram_map_k_size_n = self.adv_spec_ngram_map_k_size_n_spin.value()
-        if hasattr(self, 'adv_spec_ngram_map_k_size_m_spin'):
-            self.config.spec_ngram_map_k_size_m = self.adv_spec_ngram_map_k_size_m_spin.value()
-        if hasattr(self, 'adv_spec_ngram_map_k_min_hits_spin'):
-            self.config.spec_ngram_map_k_min_hits = self.adv_spec_ngram_map_k_min_hits_spin.value()
-        if hasattr(self, 'adv_spec_ngram_map_k4v_size_n_spin'):
-            self.config.spec_ngram_map_k4v_size_n = self.adv_spec_ngram_map_k4v_size_n_spin.value()
-        if hasattr(self, 'adv_spec_ngram_map_k4v_size_m_spin'):
-            self.config.spec_ngram_map_k4v_size_m = self.adv_spec_ngram_map_k4v_size_m_spin.value()
-        if hasattr(self, 'adv_spec_ngram_map_k4v_min_hits_spin'):
-            self.config.spec_ngram_map_k4v_min_hits = self.adv_spec_ngram_map_k4v_min_hits_spin.value()
-
-        # --- Extra cache ---
-        if hasattr(self, 'adv_ctx_checkpoints_spin'):
-            self.config.ctx_checkpoints = self.adv_ctx_checkpoints_spin.value()
-        if hasattr(self, 'adv_checkpoint_min_step_spin'):
-            self.config.checkpoint_min_step = self.adv_checkpoint_min_step_spin.value()
-        if hasattr(self, 'adv_cache_ram_spin'):
-            self.config.cache_ram = self.adv_cache_ram_spin.value()
-        if hasattr(self, 'adv_cache_idle_slots_check'):
-            self.config.cache_idle_slots = self.adv_cache_idle_slots_check.isChecked()
-        if hasattr(self, 'adv_context_shift_check'):
-            self.config.context_shift = self.adv_context_shift_check.isChecked()
-
-        # --- Generation extras ---
-        if hasattr(self, 'adv_special_check'):
-            self.config.special = self.adv_special_check.isChecked()
-        if hasattr(self, 'adv_spm_infill_check'):
-            self.config.spm_infill = self.adv_spm_infill_check.isChecked()
-
-        # --- Multimodal ---
-        if hasattr(self, 'adv_mmproj_input'):
-            text = self.adv_mmproj_input.text().strip()
-            self.config.mmproj = text if text else ""
-        if hasattr(self, 'adv_mmproj_url_input'):
-            text = self.adv_mmproj_url_input.text().strip()
-            self.config.mmproj_url = text if text else ""
-        if hasattr(self, 'adv_mmproj_auto_check'):
-            self.config.mmproj_auto = self.adv_mmproj_auto_check.isChecked()
-        if hasattr(self, 'adv_mmproj_offload_check'):
-            self.config.mmproj_offload = self.adv_mmproj_offload_check.isChecked()
-        if hasattr(self, 'adv_image_min_tokens_spin'):
-            self.config.image_min_tokens = self.adv_image_min_tokens_spin.value()
-        if hasattr(self, 'adv_image_max_tokens_spin'):
-            self.config.image_max_tokens = self.adv_image_max_tokens_spin.value()
-        if hasattr(self, 'adv_mtmd_batch_max_tokens_spin'):
-            self.config.mtmd_batch_max_tokens = self.adv_mtmd_batch_max_tokens_spin.value()
-
-        # --- Server extras ---
-        if hasattr(self, 'adv_alias_input'):
-            text = self.adv_alias_input.text().strip()
-            self.config.alias = text if text else ""
-        if hasattr(self, 'adv_tags_input'):
-            text = self.adv_tags_input.text().strip()
-            self.config.tags = text if text else ""
-        if hasattr(self, 'adv_embd_normalize_spin'):
-            self.config.embd_normalize = self.adv_embd_normalize_spin.value()
-        if hasattr(self, 'adv_path_input'):
-            text = self.adv_path_input.text().strip()
-            self.config.path = text if text else ""
-        if hasattr(self, 'adv_reuse_port_check'):
-            self.config.reuse_port = self.adv_reuse_port_check.isChecked()
-        if hasattr(self, 'adv_ui_mcp_proxy_check'):
-            self.config.ui_mcp_proxy = self.adv_ui_mcp_proxy_check.isChecked()
-
     def on_context_editing_finished(self):
         """Snap a hand-typed context size to the nearest binary size.
 
@@ -3626,46 +1058,9 @@ class LlamaLauncherGUI(QMainWindow):
         if rounded != value:
             self.ctx_spin.setValue(rounded)
 
-    def _sync_ctx_to_adv(self, value):
-        """Sync basic context spin to advanced context spin."""
-        self._ctx_auto_set = False
-        if hasattr(self, 'adv_ctx_spin') and value > 0:
-            self.adv_ctx_spin.blockSignals(True)
-            self.adv_ctx_spin.setValue(value)
-            self.adv_ctx_spin.blockSignals(False)
-
-    def _sync_adv_ctx_to_basic(self, value):
-        """Sync advanced context spin to basic context spin."""
-        self._ctx_auto_set = False
-        if hasattr(self, 'ctx_spin') and value > 0:
-            self.ctx_spin.blockSignals(True)
-            self.ctx_spin.setValue(value)
-            self.ctx_spin.blockSignals(False)
-
-    def _sync_cache_to_adv(self, value):
-        """Sync basic cache type combo to advanced cache type combos and config."""
-        if hasattr(self, 'adv_cache_type_k_combo') and hasattr(self, 'adv_cache_type_v_combo'):
-            self.adv_cache_type_k_combo.blockSignals(True)
-            self.adv_cache_type_v_combo.blockSignals(True)
-            self.adv_cache_type_k_combo.setCurrentText(value)
-            self.adv_cache_type_v_combo.setCurrentText(value)
-            self.adv_cache_type_k_combo.blockSignals(False)
-            self.adv_cache_type_v_combo.blockSignals(False)
-        # Also update the config values the estimator uses
-        self.config.cache_type_k = value
-        self.config.cache_type_v = value
-
     def _set_ctx_from_model(self, training_ctx: int):
-        """Set context slider to model's training context."""
-        self.ctx_spin.blockSignals(True)
-        self.ctx_spin.setValue(training_ctx)
-        self.ctx_spin.blockSignals(False)
-        self.config.context_size = training_ctx
-
-        if hasattr(self, 'adv_ctx_spin'):
-            self.adv_ctx_spin.blockSignals(True)
-            self.adv_ctx_spin.setValue(training_ctx)
-            self.adv_ctx_spin.blockSignals(False)
+        """Set context size from the model's training context."""
+        self.controller.set("context_size", training_ctx)
 
     def open_preset_manager(self):
         """Open preset manager dialog for CRUD operations."""
@@ -3688,10 +1083,7 @@ class LlamaLauncherGUI(QMainWindow):
             
         if not preset_name:
             return
-            
-        # Update config from UI
-        self.update_config_from_ui()
-        
+
         # Save as custom preset (overwrites if exists)
         PresetManager.save_custom_preset(preset_name, self.config)
         QMessageBox.information(self, "Success", f"Preset '{preset_name}' saved successfully.")
@@ -3726,7 +1118,6 @@ class LlamaLauncherGUI(QMainWindow):
         Used by the Server Management tab so Start/Restart runs the same
         command shown in the Command Preview.
         """
-        self.update_config_from_ui()
         return build_command(self.config)
 
     def create_import_launch_command_tab(self):
@@ -3801,15 +1192,12 @@ class LlamaLauncherGUI(QMainWindow):
                 return
 
             # Build config from all parsed parameters that map to config fields
+            migrated = migrate_config_dict(params)
             valid_fields = {f.name for f in dataclasses.fields(LlamaConfig)}
-            filtered = {k: v for k, v in params.items() if k in valid_fields}
-            dropped = sorted(set(params) - valid_fields)
+            filtered = {k: v for k, v in migrated.items() if k in valid_fields}
+            dropped = sorted(set(migrated) - valid_fields)
             if dropped:
                 logger.warning("Import: ignoring unknown parameters: %s", ", ".join(dropped))
-
-            # Backfill kv_cache_type from cache_type_k for backwards compatibility
-            if 'kv_cache_type' not in filtered and 'cache_type_k' in filtered:
-                filtered['kv_cache_type'] = filtered['cache_type_k']
 
             config = LlamaConfig(
                 **filtered,
@@ -3880,16 +1268,6 @@ class PresetManagerDialog(QDialog):
             
             # Create default config for new preset
             new_config = LlamaConfig(
-                model_path="",
-                context_size=4096,
-                gpu_layers=-1,
-                threads=0,
-                port=8080,
-                host="127.0.0.1",
-                backend="auto",
-                use_mmap=True,
-                kv_cache_type="f16",
-                batch_size=512,
                 name=name,
                 description=f"Custom preset: {name}"
             )
@@ -3932,7 +1310,6 @@ class PresetManagerDialog(QDialog):
 
         parent = self.parent()
         if parent:
-            parent.update_config_from_ui()
             config = parent.config
             config.name = name
             config.description = f"Custom preset: {name}"

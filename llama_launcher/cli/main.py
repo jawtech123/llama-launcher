@@ -55,7 +55,8 @@ def cmd_launch(args: argparse.Namespace) -> int:
             host=args.host,
             backend=args.backend,
             use_mmap=True,
-            kv_cache_type=args.kv_cache,
+            cache_type_k=args.kv_cache,
+            cache_type_v=args.kv_cache,
             batch_size=args.batch,
         )
 
