@@ -88,10 +88,14 @@ class PreviewTab(QWidget):
         self.log_text.clear()
 
     def append_log(self, text: str):
+        sb = self.log_text.verticalScrollBar()
+        at_bottom = sb is None or sb.value() >= sb.maximum() - 4
+
         cursor = self.log_text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.log_text.setTextCursor(cursor)
         self.log_text.insertPlainText(text)
-        scrollbar = self.log_text.verticalScrollBar()
-        if scrollbar:
-            scrollbar.setValue(scrollbar.maximum())
+
+        # Auto-scroll only if the user is already at the bottom.
+        if at_bottom and sb is not None:
+            sb.setValue(sb.maximum())

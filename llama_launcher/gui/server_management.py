@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QListView,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread
+from PySide6.QtGui import QTextCursor
 
 from llama_launcher.remote.types import (
     ServerConfig, ServerStatus, FileEntry,
@@ -707,9 +708,21 @@ class ServerStatusWidget(QWidget):
         self.console_stop_btn.clicked.connect(self._on_stop_console)
         self.console_tail_btn = QPushButton("Tail 100 Lines")
         self.console_tail_btn.clicked.connect(self._on_tail)
+        self.console_follow_btn = QPushButton("Follow")
+        self.console_follow_btn.setCheckable(True)
+        self.console_follow_btn.setChecked(True)
+        self.console_follow_btn.setToolTip(
+            "Auto-scroll to the newest log lines.\n"
+            "Scrolling up pauses following; scroll back down or re-enable to resume.")
+        self.console_follow_btn.toggled.connect(self._on_follow_toggled)
+        self.console_clear_btn = QPushButton("Clear")
+        self.console_clear_btn.clicked.connect(self.console_text.clear)
         console_btn_layout.addWidget(self.console_start_btn)
         console_btn_layout.addWidget(self.console_stop_btn)
         console_btn_layout.addWidget(self.console_tail_btn)
+        console_btn_layout.addStretch()
+        console_btn_layout.addWidget(self.console_follow_btn)
+        console_btn_layout.addWidget(self.console_clear_btn)
         console_layout.addLayout(console_btn_layout)
         self.tabs.addTab(console_tab, "Live Console")
 
@@ -986,19 +999,33 @@ class ServerStatusWidget(QWidget):
         )
 
     def _append_console_line(self, line: str):
+        sb = self.console_text.verticalScrollBar()
+        at_bottom = sb is None or sb.value() >= sb.maximum() - 4
+
+        # Always insert at the document end, not at the user-visible cursor.
+        cursor = self.console_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.console_text.setTextCursor(cursor)
         self.console_text.insertPlainText(line + "\n")
-        scrollbar = self.console_text.verticalScrollBar()
-        if scrollbar:
-            scrollbar.setValue(scrollbar.maximum())
+
+        # Follow only when enabled and the user hasn't scrolled up.
+        if self.console_follow_btn.isChecked() and at_bottom and sb is not None:
+            sb.setValue(sb.maximum())
+
+    def _on_follow_toggled(self, checked: bool):
+        if checked:
+            sb = self.console_text.verticalScrollBar()
+            if sb is not None:
+                sb.setValue(sb.maximum())
 
     def _console_error(self, error: str):
-        self.console_text.insertPlainText(f"[ERROR] {error}\n")
+        self._append_console_line(f"[ERROR] {error}")
 
     def _console_disconnected(self):
-        self.console_text.insertPlainText("[CONNECTION LOST]\n")
+        self._append_console_line("[CONNECTION LOST]")
 
     def _console_connected(self):
-        self.console_text.insertPlainText("[CONNECTED - streaming logs]\n")
+        self._append_console_line("[CONNECTED - streaming logs]")
 
     def _refresh_file_list(self):
         if not self._selected_server:
