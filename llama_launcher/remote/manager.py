@@ -83,7 +83,13 @@ class ServerManager:
 
     def disconnect_all(self) -> None:
         for conn in self._connections.values():
-            conn.disconnect()
+            # shutdown() (when available) also blocks reconnect attempts,
+            # so in-flight workers can't dial again during app teardown.
+            shutdown = getattr(conn, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+            else:
+                conn.disconnect()
 
     def get_status(self, friendly_name: str) -> Optional[ServerStatus]:
         conn = self._connections.get(friendly_name)

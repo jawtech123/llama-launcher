@@ -2,29 +2,58 @@
 
 A desktop + CLI application that generates, saves, and launches `llama-server` (llama.cpp) configurations.
 
+![Main window](docs/screenshots/main.png)
+
 ## Features
 
 - **GUI (PySide6)**: Basic + Advanced configuration tabs, GPU info, model browser,
-  live command preview & launch, server management (local + SSH), and launch-command import.
+  live command preview & launch, server management (local + SSH), benchmark stats,
+  and launch-command import.
 - **Config-First Architecture**: every UI action manipulates a shared `LlamaConfig`;
   commands are produced by a single `build_command(config)` and parsed back by `core/parser.py`.
 - **GPU Auto-Detection**: CUDA (NVIDIA), Metal (Apple), Vulkan, with CPU fallback.
-- **Resource Estimation**: VRAM/RAM usage estimated from GGUF metadata before launch.
+- **Resource Estimation**: VRAM/RAM usage estimated from GGUF metadata before launch,
+  plus realtime CPU/GPU utilization bars.
+- **Benchmark**: parses llama-server logs for tokens/second in/out and token usage,
+  per session and in total. Benchmarks are linked to presets (ℹ button next to the
+  preset selector) and automatically reset when any parameter changes.
 - **Preset System**: built-in presets (Small 8GB, Medium 12GB, Large 32GB) plus custom presets.
-- **Remote Servers**: manage llama-server on remote hosts over SSH (status, logs, file browser, key install).
+- **Remote Servers**: manage llama-server on remote hosts over SSH (status, logs, file
+  browser, one-click SSH key install that switches the server to key auth).
 - **Structured Logging**: console + rotating log file; no silent failures.
 
 ## Installation
 
+The installer creates a virtual environment in `./venv`, installs the application
+into it, and registers a desktop entry (Linux):
+
 ```bash
-pip install .
-pip install ".[dev]"   # with test tooling
+git clone <this-repo>
+cd llama-launcher
+./install.sh            # add --dev for test tooling, --no-desktop to skip the launcher entry
 ```
 
-A convenience script is provided for running from a source checkout:
+Then run:
 
 ```bash
-./start.sh
+./start.sh                       # GUI (uses ./venv)
+# or directly:
+venv/bin/llama-launcher-gui      # GUI entry point
+venv/bin/llama-launcher --help   # CLI entry point
+```
+
+Requirements: Python 3.10+ (with `python3-venv` on Debian/Ubuntu), and a
+`llama-server` binary (from [llama.cpp](https://github.com/ggml-org/llama.cpp))
+either on `PATH` or configured per-server in Server Management.
+See [docs/SETUP.md](docs/SETUP.md) for the full setup guide (manual install,
+remote servers, SSH keys, benchmarking, uninstall).
+
+### Manual installation
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install .            # or: pip install ".[dev]"
 ```
 
 ## Usage
@@ -33,7 +62,7 @@ A convenience script is provided for running from a source checkout:
 
 ```bash
 llama-launcher-gui          # installed entry point
-python -m llama_launcher    # from the source checkout
+python -m llama_launcher    # from the source checkout (inside the venv)
 ```
 
 ### CLI
@@ -52,6 +81,15 @@ llama-launcher launch --model model.gguf --context 8192 --gpu-layers 99 --thread
 llama-launcher launch --preset "Small 8GB" --model model.gguf
 ```
 
+## Screenshots
+
+| | |
+|---|---|
+| ![Benchmark tab](docs/screenshots/benchmark.png) | ![Server management](docs/screenshots/server-management.png) |
+| *Benchmark: tokens/sec in/out per session + totals* | *Server Management: status, live log, remote file browser* |
+| ![Command preview](docs/screenshots/command-preview.png) | |
+| *Command Preview & Launch* | |
+
 ## Tests
 
 ```bash
@@ -66,6 +104,7 @@ Runtime state lives in `~/.config/llama-launcher/` (honors `XDG_CONFIG_HOME`):
 - `servers.json` — server definitions (chmod 600, contains credentials)
 - `models.json` — per-server model scan cache
 - `folders.json` — model browser source folders
+- `benchmarks.json` — benchmark session history (linked to presets via config fingerprints)
 - `logs/` — rotating application logs
 
 Legacy `~/.llama_launcher_*.json` files are migrated automatically on first run.
@@ -87,11 +126,12 @@ llama_launcher/
 │   ├── theme.py             # enforced dark theme
 │   ├── widgets.py           # shared widgets (BinaryContextSpinBox, info labels)
 │   ├── workers.py           # background QThread workers
-│   ├── tabs/                # basic, advanced, gpu, models, preview, import tabs
+│   ├── tabs/                # basic, advanced, gpu, models, preview, benchmark, import tabs
 │   ├── dialogs/             # preset manager dialog
 │   ├── advanced_tab.py      # registry-generated advanced editor
 │   ├── server_management.py # local/SSH server management
 │   └── resource_usage_panel.py
+├── benchmark/     # log timing parser, session storage, config fingerprints
 ├── gpu/           # GPU auto-detection (CUDA, Metal, Vulkan)
 ├── estimator/     # GGUF metadata reader (cached) + VRAM/RAM estimation
 ├── models/        # Model filesystem scanner + per-server scan cache
@@ -107,8 +147,8 @@ command builder, command parser, validator, advanced-tab editor generation,
 and widget bindings are all driven by it. Adding a parameter means adding one
 `Field` entry.
 
-Retired subsystems (benchmarks, quant recommender, VRAM optimizer, legacy profiles)
-are preserved under `_attic/` and are not part of the package.
+Retired subsystems (legacy benchmarks, quant recommender, VRAM optimizer, legacy
+profiles) are preserved under `_attic/` and are not part of the package.
 
 ## Configuration Flow
 

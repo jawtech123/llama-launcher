@@ -25,11 +25,17 @@ class LogStreamWorker(QThread):
 
         try:
             if hasattr(self._connection, 'execute_and_capture'):
+                import socket
                 import paramiko
                 config = self._connection.config
-                transport = paramiko.Transport(
-                    (config.hostname, config.port)
+                # create_connection applies a connect timeout; passing a
+                # (host, port) tuple to Transport would connect with no
+                # timeout and can hang the thread indefinitely.
+                sock = socket.create_connection(
+                    (config.hostname, config.port), timeout=10
                 )
+                transport = paramiko.Transport(sock)
+                transport.banner_timeout = 15
                 connect_kwargs = {"username": config.username}
                 if config.private_key_path:
                     key = paramiko.RSAKey.from_private_key_file(

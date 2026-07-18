@@ -14,6 +14,7 @@ from llama_launcher.core.builder import build_command
 from llama_launcher.core.config import LlamaConfig
 from llama_launcher.core.presets import PresetManager
 from llama_launcher.core.validator import validate_config
+from llama_launcher.benchmark import config_fingerprint, latest_session_for_preset
 from llama_launcher.estimator import ResourceEstimator
 from llama_launcher.gpu.types import GPUInfo
 from llama_launcher.gui.advanced_tab import AdvancedConfigTab
@@ -22,13 +23,15 @@ from llama_launcher.gui.dialogs.preset_dialog import PresetManagerDialog
 from llama_launcher.gui.resource_usage_panel import ResourceUsagePanel
 from llama_launcher.gui.server_management import ServerManagementWidget
 from llama_launcher.gui.tabs.basic_tab import BasicTab
+from llama_launcher.gui.tabs.benchmark_tab import BenchmarkTab
 from llama_launcher.gui.tabs.gpu_tab import GpuTab
 from llama_launcher.gui.tabs.import_tab import ImportTab
 from llama_launcher.gui.tabs.models_tab import ModelsTab
 from llama_launcher.gui.tabs.preview_tab import PreviewTab
 from llama_launcher.gui import theme
 from llama_launcher.gui.workers import (
-    EstimateWorker, GpuDetectWorker, GpuStatsWorker, ModelScanWorker, PresetStyleWorker,
+    EstimateWorker, GpuDetectWorker, GpuStatsWorker, ModelScanWorker,
+    PresetStyleWorker, RealtimeStatsWorker,
 )
 from llama_launcher.models.storage import (
     load_models as load_cached_models,
@@ -141,11 +144,11 @@ class LlamaLauncherGUI(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.addWidget(self.tab_widget)
         self.resource_panel = ResourceUsagePanel()
-        self.resource_panel.setMinimumHeight(110)
+        self.resource_panel.setMinimumHeight(150)
         splitter.addWidget(self.resource_panel)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
-        splitter.setSizes([580, 170])
+        splitter.setSizes([560, 190])
         main_layout.addWidget(splitter)
 
         self._create_tabs()
@@ -183,7 +186,11 @@ class LlamaLauncherGUI(QMainWindow):
         self.tab_widget.addTab(self.models_tab, "Model Browser")
 
         self.preview_tab = PreviewTab()
-        self.tab_widget.addTab(self.preview_tab, "Command Preview & Launch")
+        # "&&" escapes the Qt mnemonic marker so a literal '&' is shown.
+        self.tab_widget.addTab(self.preview_tab, "Command Preview && Launch")
+
+        self.benchmark_tab = BenchmarkTab(self.server_manager, self._get_current_server)
+        self.tab_widget.addTab(self.benchmark_tab, "Benchmark")
 
         self.server_management_widget = ServerManagementWidget(self.server_manager, self)
         self.server_management_widget.list_widget.servers_changed.connect(
@@ -199,6 +206,8 @@ class LlamaLauncherGUI(QMainWindow):
         self.basic_tab.preset_combo.currentTextChanged.connect(self.load_preset)
         self.basic_tab.save_preset_btn.clicked.connect(self.save_current_preset)
         self.basic_tab.manage_presets_btn.clicked.connect(self.open_preset_manager)
+        self.basic_tab.benchmark_info_btn.clicked.connect(
+            self._show_preset_benchmark_info)
         self.basic_tab.server_combo.currentTextChanged.connect(self.on_server_changed)
         self.basic_tab.ctx_spin.valueChanged.connect(
             lambda *_: setattr(self, "_ctx_auto_set", False))
@@ -254,17 +263,23 @@ class LlamaLauncherGUI(QMainWindow):
         self._save_state()
         # Stop a locally launched llama-server first so it can't hold us open.
         self.stop_server()
-        for timer_name in ("_preset_style_timer", "_gpu_stats_timer"):
+        for timer_name in ("_preset_style_timer", "_gpu_stats_timer",
+                           "_live_stats_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
                 timer.stop()
+        # Close SSH connections BEFORE waiting on workers: a worker blocked
+        # inside a paramiko call errors out as soon as its transport closes,
+        # so the waits below actually complete. (The old order waited first
+        # and tore down with threads still running -> "QThread: Destroyed
+        # while thread is still running" abort.)
+        self.server_manager.disconnect_all()
         mgmt = getattr(self, "server_management_widget", None)
         if mgmt is not None:
             mgmt.shutdown()
         for w in list(self._active_workers):
             if w.isRunning():
-                w.wait(1000)
-        self.server_manager.disconnect_all()
+                w.wait(1500)
         event.accept()
 
     def _start_worker(self, worker: QThread) -> None:
@@ -289,6 +304,9 @@ class LlamaLauncherGUI(QMainWindow):
         self._preset_style_timer = QTimer(self)
         self._preset_style_timer.timeout.connect(self._refresh_preset_combo_styles)
         self._preset_style_timer.start(15000)
+        self._live_stats_timer = QTimer(self)
+        self._live_stats_timer.timeout.connect(self._poll_live_stats)
+        self._live_stats_timer.start(2000)
         QTimer.singleShot(300, self._detect_gpu_async)
 
     # ------------------------------------------------------------------
@@ -395,6 +413,66 @@ class LlamaLauncherGUI(QMainWindow):
                 else:
                     combo.setItemData(i, None, Qt.ItemDataRole.ForegroundRole)
                 combo.setFont(font)
+
+    # ------------------------------------------------------------------
+    # Preset benchmark info
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fmt_benchmark_lines(session) -> list:
+        from datetime import datetime
+        started = session.get("started", 0)
+        when = (datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M")
+                if started else "unknown")
+        prompt_ms = float(session.get("prompt_ms", 0))
+        gen_ms = float(session.get("gen_ms", 0))
+        p_tok = int(session.get("prompt_tokens", 0))
+        g_tok = int(session.get("gen_tokens", 0))
+        speed_in = p_tok / (prompt_ms / 1000.0) if prompt_ms > 0 else 0.0
+        speed_out = g_tok / (gen_ms / 1000.0) if gen_ms > 0 else 0.0
+        return [
+            f"Recorded:  {when}",
+            f"Requests:  {int(session.get('requests', 0))}",
+            f"Speed in:  {speed_in:.1f} tok/s   ({p_tok:,} tokens)",
+            f"Speed out: {speed_out:.1f} tok/s   ({g_tok:,} tokens)",
+        ]
+
+    def _show_preset_benchmark_info(self):
+        """Show the benchmark recorded for the current preset.
+
+        The info is only valid for the exact parameters it was measured
+        with: if any parameter changed since the recording (fingerprint
+        mismatch), the info is reported as reset.
+        """
+        preset = self.basic_tab.preset_combo.currentText().strip()
+        if not preset:
+            return
+        session = latest_session_for_preset(preset)
+        if session is None:
+            QMessageBox.information(
+                self, "Preset Benchmark",
+                f"No benchmark data recorded for preset '{preset}' yet.\n\n"
+                f"Launch a server with this preset and run some requests — "
+                f"the throughput stats will appear here and in the Benchmark tab.")
+            return
+
+        lines = self._fmt_benchmark_lines(session)
+        fp_now = config_fingerprint(self.config)
+        recorded_fp = session.get("fingerprint") or ""
+        if recorded_fp != fp_now:
+            QMessageBox.information(
+                self, "Preset Benchmark",
+                f"Benchmark info for '{preset}' was RESET because the "
+                f"parameters changed since it was recorded.\n\n"
+                f"Last recorded values (stale):\n" + "\n".join(lines) +
+                "\n\nLaunch the server to benchmark the current parameters.")
+            return
+
+        QMessageBox.information(
+            self, "Preset Benchmark",
+            f"Benchmark for preset '{preset}' (current parameters):\n\n"
+            + "\n".join(lines)
+            + "\n\nFull history is in the Benchmark tab.")
 
     # ------------------------------------------------------------------
     # Server selection glue
@@ -588,6 +666,27 @@ class LlamaLauncherGUI(QMainWindow):
         self.gpu_tab.set_info_text(existing)
 
     # ------------------------------------------------------------------
+    # Live CPU/GPU usage bars
+    # ------------------------------------------------------------------
+
+    def _poll_live_stats(self):
+        if self._closing:
+            return
+        existing = getattr(self, "_rt_worker", None)
+        if existing is not None and existing.isRunning():
+            return
+        self._rt_worker = RealtimeStatsWorker()
+        self._rt_worker.stats_ready.connect(self._on_live_stats)
+        self._rt_worker.finished.connect(lambda: setattr(self, "_rt_worker", None))
+        self._start_worker(self._rt_worker)
+
+    def _on_live_stats(self, cpu_pct, gpu_pct, gpu_used_mb, gpu_total_mb):
+        if self._closing:
+            return
+        self.resource_panel.update_live_usage(
+            cpu_pct, gpu_pct, gpu_used_mb, gpu_total_mb)
+
+    # ------------------------------------------------------------------
     # Command preview + resource estimate
     # ------------------------------------------------------------------
 
@@ -698,6 +797,10 @@ class LlamaLauncherGUI(QMainWindow):
                     f"Set the correct path in Server Management > Edit Server > Server Exec."
                 )
             self.preview_tab.set_running(True)
+            self.benchmark_tab.begin_session(
+                preset=self.basic_tab.preset_combo.currentText().strip(),
+                fingerprint=config_fingerprint(self.config),
+            )
         except Exception as e:
             # Non-modal: show in the log pane so nothing can trap the window.
             logger.exception("Launch failed")
@@ -735,11 +838,13 @@ class LlamaLauncherGUI(QMainWindow):
             output = bytes(proc.readAll()).decode("utf-8", errors="ignore")
             if output:
                 self.preview_tab.append_log(output)
+                self.benchmark_tab.feed_log(output)
 
     def on_server_finished(self, exit_code, exit_status=None):
         """Handle server process finished."""
         self.preview_tab.append_log(f"\n--- Server process finished (exit code {exit_code}) ---\n")
         self.preview_tab.set_running(False)
+        self.benchmark_tab.end_session()
 
     def _build_launch_command(self) -> str:
         """Build the llama-server command for the current configuration.

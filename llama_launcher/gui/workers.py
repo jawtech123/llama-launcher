@@ -5,7 +5,9 @@ run in these QThread workers so the UI never freezes. Workers are started via
 ``LlamaLauncherGUI._start_worker`` which parents them and frees them on finish.
 """
 import logging
+import platform
 import subprocess
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -160,6 +162,83 @@ class GpuStatsWorker(QThread):
         except Exception:
             logger.debug("nvidia-smi stats poll failed", exc_info=True)
         self.stats_done.emit("")
+
+
+def _read_cpu_times() -> tuple:
+    """Return (total, idle) jiffies from /proc/stat."""
+    with open("/proc/stat", "r") as f:
+        parts = f.readline().split()
+    vals = [float(x) for x in parts[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0.0)  # idle + iowait
+    return sum(vals), idle
+
+
+def _sample_cpu_percent(interval: float = 0.25) -> float:
+    """Sample aggregate CPU utilization over ``interval`` seconds. -1 if N/A."""
+    try:
+        import psutil  # optional dependency
+        return float(psutil.cpu_percent(interval=interval))
+    except ImportError:
+        pass
+    except Exception:
+        return -1.0
+    if platform.system() == "Linux":
+        try:
+            total1, idle1 = _read_cpu_times()
+            time.sleep(interval)
+            total2, idle2 = _read_cpu_times()
+            d_total, d_idle = total2 - total1, idle2 - idle1
+            if d_total > 0:
+                return max(0.0, min(100.0, (1.0 - d_idle / d_total) * 100.0))
+        except Exception:
+            logger.debug("CPU sample failed", exc_info=True)
+    return -1.0
+
+
+def _sample_gpu() -> tuple:
+    """Sample GPU utilization and memory via nvidia-smi.
+
+    Returns (util_pct, mem_used_mb, mem_total_mb); all -1 when unavailable.
+    Multi-GPU: util is the max across GPUs, memory is summed.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            utils, useds, totals = [], [], []
+            for line in result.stdout.strip().split("\n"):
+                vals = [v.strip() for v in line.split(",")]
+                if len(vals) >= 3:
+                    try:
+                        utils.append(float(vals[0]))
+                        useds.append(float(vals[1]))
+                        totals.append(float(vals[2]))
+                    except ValueError:
+                        continue
+            if utils:
+                return max(utils), sum(useds), sum(totals)
+    except Exception:
+        logger.debug("nvidia-smi live sample failed", exc_info=True)
+    return -1.0, -1.0, -1.0
+
+
+class RealtimeStatsWorker(QThread):
+    """Samples local CPU% and GPU utilization/memory for the live usage bars.
+
+    Runs briefly (~0.3s for the CPU sampling interval) and is re-launched
+    on a timer by the main window.
+    """
+
+    stats_ready = Signal(float, float, float, float)
+
+    def run(self):
+        cpu_pct = _sample_cpu_percent()
+        gpu_pct, gpu_used_mb, gpu_total_mb = _sample_gpu()
+        self.stats_ready.emit(cpu_pct, gpu_pct, gpu_used_mb, gpu_total_mb)
 
 
 _QUANT_PATTERNS = (

@@ -52,13 +52,13 @@ class GpuBreakdown:
 
     @property
     def remaining_vram_mb(self) -> float:
-        return self.available_vram_mb - self.total_used_mb
+        return self.total_vram_mb - self.total_used_mb
 
     @property
     def usage_percentage(self) -> float:
-        if self.available_vram_mb <= 0:
+        if self.total_vram_mb <= 0:
             return 0.0
-        return (self.total_used_mb / self.available_vram_mb) * 100.0
+        return (self.total_used_mb / self.total_vram_mb) * 100.0
 
 
 @dataclass

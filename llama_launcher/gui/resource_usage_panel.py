@@ -158,6 +158,46 @@ class _ResourceRow(QWidget):
         self._value_label.setToolTip(tooltip)
 
 
+class _UsageRow(QWidget):
+    """Compact row showing a realtime utilization percentage bar."""
+
+    def __init__(self, label: str, tooltip: str, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(6)
+
+        self._label_widget = QLabel(label)
+        self._label_widget.setFixedWidth(85)
+        self._label_widget.setToolTip(tooltip)
+        self._label_widget.setStyleSheet(
+            f"font-weight: bold; color: {theme.FG_TEXT}; font-size: 11px;")
+        layout.addWidget(self._label_widget)
+
+        self._bar = _ProgressBar()
+        self._bar.setToolTip(tooltip)
+        self._bar.setMinimumWidth(120)
+        layout.addWidget(self._bar, 1)
+
+        self._value_label = QLabel("--")
+        self._value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._value_label.setMinimumWidth(120)
+        self._value_label.setToolTip(tooltip)
+        self._value_label.setStyleSheet(theme.monospace_style(theme.FG_TEXT, 11))
+        layout.addWidget(self._value_label)
+
+    def set_usage(self, pct: float, text: str = ""):
+        if pct < 0:
+            self._bar.set_percentage(0)
+            self._bar.repaint()
+            self._value_label.setText("N/A")
+            return
+        self._bar.set_percentage(pct)
+        self._bar.repaint()
+        self._value_label.setText(text or f"{pct:.0f}%")
+
+
 class _ModelInfoPanel(QWidget):
     """Compact single-line panel showing model metadata from GGUF."""
 
@@ -340,6 +380,45 @@ class ResourceUsagePanel(QWidget):
         self._warning_label.setVisible(False)
         layout.addWidget(self._warning_label)
 
+        # Live (realtime) usage section
+        live_sep = QFrame()
+        live_sep.setFrameShape(QFrame.Shape.HLine)
+        live_sep.setStyleSheet(f"color: {theme.BORDER};")
+        layout.addWidget(live_sep)
+
+        live_header = QLabel("Live Usage")
+        live_header.setFont(QFont("sans-serif", 9, QFont.Weight.Bold))
+        live_header.setStyleSheet(f"color: {theme.FG_DIM};")
+        layout.addWidget(live_header)
+
+        self._cpu_row = _UsageRow(
+            "CPU",
+            "Realtime CPU utilization of this machine (all cores, sampled over 0.25s)."
+        )
+        layout.addWidget(self._cpu_row)
+
+        self._gpu_live_row = _UsageRow(
+            "GPU",
+            "Realtime GPU utilization and VRAM usage of this machine (nvidia-smi).\n"
+            "Multi-GPU: shows the highest utilization and summed memory."
+        )
+        layout.addWidget(self._gpu_live_row)
+
+    def update_live_usage(self, cpu_pct: float, gpu_pct: float,
+                          gpu_mem_used_mb: float = -1.0,
+                          gpu_mem_total_mb: float = -1.0):
+        """Update the realtime CPU/GPU utilization bars (local machine)."""
+        self._cpu_row.set_usage(cpu_pct)
+        if gpu_pct < 0:
+            self._gpu_live_row.set_usage(-1)
+            return
+        if gpu_mem_total_mb > 0:
+            text = (f"{gpu_pct:.0f}%  |  "
+                    f"{gpu_mem_used_mb / 1024:.1f}/{gpu_mem_total_mb / 1024:.1f} GB")
+        else:
+            text = f"{gpu_pct:.0f}%"
+        self._gpu_live_row.set_usage(gpu_pct, text)
+
     def update_estimate(self, estimate: Optional[ResourceEstimate], selected_ctx: int = 0):
         """Update the panel with a new resource estimate."""
         if estimate is None:
@@ -395,7 +474,7 @@ class ResourceUsagePanel(QWidget):
         if estimate.gpu_breakdowns and len(estimate.gpu_breakdowns) > 1:
             gpu_info_text = "\n".join(
                 f"GPU {gb.gpu_index} ({str(gb.gpu_name)}): "
-                f"{gb.total_used_mb / 1024:.1f}/{gb.available_vram_mb / 1024:.1f} GB"
+                f"{gb.total_used_mb / 1024:.1f}/{gb.total_vram_mb / 1024:.1f} GB"
                 for gb in estimate.gpu_breakdowns
             )
             split_mode = str(estimate.split_mode) if estimate.split_mode else "layer"

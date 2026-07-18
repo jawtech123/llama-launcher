@@ -1,6 +1,7 @@
 """SSH Server Connection Implementation."""
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -24,7 +25,16 @@ logger = logging.getLogger(__name__)
 
 
 class SSHServerConnection(IServerConnection):
-    """Manages a remote llama-server instance via SSH/SFTP."""
+    """Manages a remote llama-server instance via SSH/SFTP.
+
+    Thread-safety: several GUI worker threads (status polls, file browser,
+    model scans) share one connection. ``_lock`` serializes connect and
+    client reference swaps; SFTP operations hold ``_sftp_lock`` because
+    SFTPClient is not thread-safe (the SSH Transport itself is fine with
+    concurrent channels). ``disconnect()`` swaps the references out under
+    the lock but closes the transport *outside* it, so a thread blocked in
+    a paramiko call errors out immediately instead of deadlocking.
+    """
 
     SSH_TIMEOUT = 15
     COMMAND_TIMEOUT = 30
@@ -35,6 +45,9 @@ class SSHServerConnection(IServerConnection):
         self._client: Optional[paramiko.SSHClient] = None
         self._sftp = None
         self._stored_pid: Optional[int] = None
+        self._lock = threading.RLock()
+        self._sftp_lock = threading.Lock()
+        self._closing = False
 
     @property
     def config(self) -> ServerConfig:
@@ -44,12 +57,23 @@ class SSHServerConnection(IServerConnection):
     def connection_state(self) -> ConnectionState:
         return self._state
 
+    @staticmethod
+    def _transport_active(client) -> bool:
+        if client is None:
+            return False
+        try:
+            transport = client.get_transport()
+        except Exception:
+            return False
+        return bool(transport) and transport.is_active()
+
     def _get_client(self) -> paramiko.SSHClient:
-        if self._client is None or not self._client.get_transport().is_active():
+        if not self._transport_active(self._client):
             self.connect()
-        if self._client is None:
+        client = self._client
+        if client is None or not self._transport_active(client):
             raise ConnectionError("Not connected")
-        return self._client
+        return client
 
     def _get_sftp(self):
         """Return a live SFTP client, recreating it if the channel died."""
@@ -69,54 +93,68 @@ class SSHServerConnection(IServerConnection):
             self._state = ConnectionState.ERROR
             return False
 
-        try:
+        with self._lock:
+            if self._closing:
+                return False
+            if self._transport_active(self._client):
+                self._state = ConnectionState.CONNECTED
+                return True
             self._state = ConnectionState.CONNECTING
-            self._client = paramiko.SSHClient()
-            self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            try:
+                client = paramiko.SSHClient()
+                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-            kwargs = {
-                "hostname": self._config.hostname,
-                "port": self._config.port,
-                "username": self._config.username,
-                "timeout": self.SSH_TIMEOUT,
-                "allow_agent": False,
-                "look_for_keys": False,
-            }
+                kwargs = {
+                    "hostname": self._config.hostname,
+                    "port": self._config.port,
+                    "username": self._config.username,
+                    "timeout": self.SSH_TIMEOUT,
+                    "allow_agent": False,
+                    "look_for_keys": False,
+                }
 
-            if self._config.auth_method == AuthMethod.SSH_KEY:
-                if self._config.private_key_path:
-                    kwargs["key_filename"] = str(
-                        Path(self._config.private_key_path).expanduser()
-                    )
+                if self._config.auth_method == AuthMethod.SSH_KEY:
+                    if self._config.private_key_path:
+                        kwargs["key_filename"] = str(
+                            Path(self._config.private_key_path).expanduser()
+                        )
 
-            if self._config.password:
-                kwargs["password"] = self._config.password
+                if self._config.password:
+                    kwargs["password"] = self._config.password
 
-            self._client.connect(**kwargs)
-            self._state = ConnectionState.CONNECTED
-            return True
+                client.connect(**kwargs)
+                self._client = client
+                self._state = ConnectionState.CONNECTED
+                return True
 
-        except Exception:
-            self._state = ConnectionState.ERROR
-            if self._client:
-                self._client.close()
-                self._client = None
-            return False
+            except Exception:
+                self._state = ConnectionState.ERROR
+                return False
 
     def disconnect(self) -> None:
-        if self._sftp:
-            try:
-                self._sftp.close()
-            except Exception:
-                logger.debug("Suppressed exception", exc_info=True)
-            self._sftp = None
-        if self._client:
-            try:
-                self._client.close()
-            except Exception:
-                logger.debug("Suppressed exception", exc_info=True)
+        with self._lock:
+            client, sftp = self._client, self._sftp
             self._client = None
-        self._state = ConnectionState.DISCONNECTED
+            self._sftp = None
+            self._state = ConnectionState.DISCONNECTED
+        # Close outside the lock: if another thread is blocked inside a
+        # paramiko call on this transport, closing it makes that call raise
+        # right away instead of waiting for the lock to free up.
+        if sftp is not None:
+            try:
+                sftp.close()
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
+
+    def shutdown(self) -> None:
+        """Close for application teardown; blocks any further reconnects."""
+        self._closing = True
+        self.disconnect()
 
     def execute(self, command: str) -> bool:
         try:
@@ -147,31 +185,33 @@ class SSHServerConnection(IServerConnection):
             raise
 
     def upload_file(self, local_path: str, remote_path: str, progress_cb=None) -> bool:
-        try:
-            sftp = self._get_sftp()
-            remote_dir = str(Path(remote_path).parent)
+        with self._sftp_lock:
             try:
-                sftp.stat(remote_dir)
-            except FileNotFoundError:
-                self._mkdirs(sftp, remote_dir)
-            sftp.put(str(Path(local_path).expanduser()), remote_path,
-                     callback=progress_cb)
-            return True
-        except Exception:
-            logger.debug("upload_file failed", exc_info=True)
-            return False
+                sftp = self._get_sftp()
+                remote_dir = str(Path(remote_path).parent)
+                try:
+                    sftp.stat(remote_dir)
+                except FileNotFoundError:
+                    self._mkdirs(sftp, remote_dir)
+                sftp.put(str(Path(local_path).expanduser()), remote_path,
+                         callback=progress_cb)
+                return True
+            except Exception:
+                logger.debug("upload_file failed", exc_info=True)
+                return False
 
     def download_file(self, remote_path: str, local_path: str, progress_cb=None) -> bool:
-        try:
-            sftp = self._get_sftp()
-            local_dir = Path(local_path).parent
-            local_dir.mkdir(parents=True, exist_ok=True)
-            sftp.get(remote_path, str(local_dir / Path(local_path).name),
-                     callback=progress_cb)
-            return True
-        except Exception:
-            logger.debug("download_file failed", exc_info=True)
-            return False
+        with self._sftp_lock:
+            try:
+                sftp = self._get_sftp()
+                local_dir = Path(local_path).parent
+                local_dir.mkdir(parents=True, exist_ok=True)
+                sftp.get(remote_path, str(local_dir / Path(local_path).name),
+                         callback=progress_cb)
+                return True
+            except Exception:
+                logger.debug("download_file failed", exc_info=True)
+                return False
 
     def _mkdirs(self, sftp, path: str) -> None:
         parts = Path(path).parts
@@ -188,57 +228,61 @@ class SSHServerConnection(IServerConnection):
 
     def list_directory(self, remote_path: str) -> List[FileEntry]:
         entries = []
-        try:
-            sftp = self._get_sftp()
-            for item in sftp.listdir_attr(remote_path):
-                entries.append(FileEntry(
-                    name=item.filename,
-                    path=f"{remote_path}/{item.filename}",
-                    is_directory=item.st_mode & 0o40000 != 0,
-                    size_bytes=item.st_size,
-                    modified_time=float(item.st_mtime),
-                ))
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
+        with self._sftp_lock:
+            try:
+                sftp = self._get_sftp()
+                for item in sftp.listdir_attr(remote_path):
+                    entries.append(FileEntry(
+                        name=item.filename,
+                        path=f"{remote_path}/{item.filename}",
+                        is_directory=item.st_mode & 0o40000 != 0,
+                        size_bytes=item.st_size,
+                        modified_time=float(item.st_mtime),
+                    ))
+            except Exception:
+                logger.debug("Suppressed exception", exc_info=True)
         return entries
 
     def create_directory(self, remote_path: str) -> bool:
-        try:
-            sftp = self._get_sftp()
+        with self._sftp_lock:
             try:
-                # Idempotent: already-existing directory is success.
-                if sftp.stat(remote_path).st_mode & 0o40000:
-                    return True
-            except FileNotFoundError:
-                pass
-            parent = str(Path(remote_path).parent)
-            try:
-                sftp.stat(parent)
-            except FileNotFoundError:
-                self._mkdirs(sftp, parent)
-            sftp.mkdir(remote_path, 0o755)
-            return True
-        except Exception:
-            logger.debug("create_directory failed", exc_info=True)
-            return False
+                sftp = self._get_sftp()
+                try:
+                    # Idempotent: already-existing directory is success.
+                    if sftp.stat(remote_path).st_mode & 0o40000:
+                        return True
+                except FileNotFoundError:
+                    pass
+                parent = str(Path(remote_path).parent)
+                try:
+                    sftp.stat(parent)
+                except FileNotFoundError:
+                    self._mkdirs(sftp, parent)
+                sftp.mkdir(remote_path, 0o755)
+                return True
+            except Exception:
+                logger.debug("create_directory failed", exc_info=True)
+                return False
 
     def delete_file(self, remote_path: str) -> bool:
-        try:
-            sftp = self._get_sftp()
-            sftp.remove(remote_path)
-            return True
-        except FileNotFoundError:
-            return False
-        except Exception:
-            return False
+        with self._sftp_lock:
+            try:
+                sftp = self._get_sftp()
+                sftp.remove(remote_path)
+                return True
+            except FileNotFoundError:
+                return False
+            except Exception:
+                return False
 
     def rename_file(self, old_path: str, new_path: str) -> bool:
-        try:
-            sftp = self._get_sftp()
-            sftp.rename(old_path, new_path)
-            return True
-        except Exception:
-            return False
+        with self._sftp_lock:
+            try:
+                sftp = self._get_sftp()
+                sftp.rename(old_path, new_path)
+                return True
+            except Exception:
+                return False
 
     def get_server_pid(self) -> Optional[int]:
         """PID of the remote llama-server (stored -> PID file -> pgrep)."""

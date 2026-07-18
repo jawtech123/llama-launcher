@@ -994,14 +994,24 @@ class ResourceEstimator:
                 est.gpu_breakdowns[0].model_weights_mb += mmproj_model_size_mb
 
         # ---- 9. TOTALS ----
-        # Single-GPU / backward-compatible breakdown
+        # Single-GPU / backward-compatible breakdown.
+        # backend_overhead_mb includes the flash-attention workspace (added
+        # above), so split it back out to avoid counting it twice. Likewise
+        # the runtime part must land in exactly one of cuda_runtime_mb /
+        # backend_overhead_mb -- assigning both double-counts it.
+        runtime_overhead_mb = backend_overhead_mb - flash_attn_workspace_mb
+        is_cuda = bool(gpu_info) and gpu_info.backend in ("cuda", "hip")
+        is_gpu_backend = bool(gpu_info) and gpu_info.backend in (
+            "cuda", "hip", "vulkan", "metal")
         vram_bd = VramBreakdown(
             gpu_weights_mb=est.gpu_weights_mb,
             kv_cache_mb=est.kv_cache_gpu_mb,
             inference_buffers_mb=est.compute_buffers_gpu_mb,
-            cuda_runtime_mb=backend_overhead_mb if gpu_info and gpu_info.backend in ("cuda", "hip") else 0,
+            cuda_runtime_mb=runtime_overhead_mb if is_cuda else 0.0,
             temp_allocations_mb=flash_attn_workspace_mb,
-            backend_overhead_mb=backend_overhead_mb if config.flash_attn != "enable" else 0,
+            backend_overhead_mb=(
+                runtime_overhead_mb if (is_gpu_backend and not is_cuda) else 0.0
+            ),
             safety_margin_mb=est.safety_margin_mb / max(num_gpus, 1),
             draft_model_mb=est.draft_model_mb if gpu_layers > 0 else 0.0,
             mmproj_model_mb=est.mmproj_model_mb if gpu_layers > 0 else 0.0,
@@ -1049,7 +1059,12 @@ class ResourceEstimator:
             est.gpu_available_vram_mb = sum(gb.available_vram_mb for gb in est.gpu_breakdowns)
 
         if est.gpu_total_vram_mb > 0:
-            est.gpu_remaining_vram_mb = est.gpu_available_vram_mb - est.total_vram_mb
+            # Remaining is measured against total VRAM, matching the usage
+            # bar (used/total). Using "available" (the nvidia-smi free-memory
+            # snapshot from detection time) produced nonsense like
+            # "Remaining: -16.6 GB (OVER)" next to a 26.2/31.8 GB bar whenever
+            # a server was already holding VRAM at detection time.
+            est.gpu_remaining_vram_mb = est.gpu_total_vram_mb - est.total_vram_mb
 
         # ---- 10. WARNINGS ----
         est.warnings = []
@@ -1080,7 +1095,7 @@ class ResourceEstimator:
                 if gb.usage_percentage > 100:
                     est.warnings.append(
                         f"GPU {gb.gpu_index} ({gb.gpu_name}) exceeds capacity: "
-                        f"{self._fmt_mb(gb.total_used_mb)} / {self._fmt_mb(gb.available_vram_mb)}. "
+                        f"{self._fmt_mb(gb.total_used_mb)} / {self._fmt_mb(gb.total_vram_mb)}. "
                         f"Even with multiple GPUs, this GPU is the limiting factor."
                     )
 

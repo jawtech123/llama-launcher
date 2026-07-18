@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QGroupBox, QFormLayout, QDialog, QFileDialog,
     QMessageBox, QInputDialog, QSplitter, QListWidget, QListWidgetItem,
     QTextEdit, QTabWidget, QHeaderView, QAbstractItemView,
-    QTreeWidget, QTreeWidgetItem, QProgressBar, QProgressDialog, QFrame,
+    QTreeWidget, QTreeWidgetItem, QProgressDialog, QFrame,
     QScrollArea, QTableWidget, QTableWidgetItem, QColumnView,
     QListView,
 )
@@ -96,11 +96,19 @@ class _FileTreeItem(QTreeWidgetItem):
 
     def __lt__(self, other):
         tree = self.treeWidget()
-        if tree is not None and tree.sortColumn() == 1:
+        column = tree.sortColumn() if tree is not None else 0
+        if column == 1:
             a = self.data(0, Qt.UserRole + 2) or 0
             b = other.data(0, Qt.UserRole + 2) or 0
-            return a < b
-        return super().__lt__(other)
+            try:
+                return a < b
+            except TypeError:
+                return False
+        # The default QTreeWidgetItem comparison is the sort column's text.
+        # Reimplement it directly: calling super().__lt__() from a Python
+        # override re-dispatches virtually back into this method, causing
+        # infinite recursion (RecursionError -> stack exhaustion -> crash).
+        return self.text(column) < other.text(column)
 
 
 class ServerEditDialog(QDialog):
@@ -293,143 +301,6 @@ class ServerEditDialog(QDialog):
             log_file=self.log_file_edit.text().strip(),
             server_port=self.server_port_spin.value(),
         )
-
-
-class SSHKeyInstallDialog(QDialog):
-    """Dialog to install an SSH key onto a remote server."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Install SSH Key")
-        self.setMinimumWidth(450)
-        self._build_ui()
-
-    def _build_ui(self):
-        layout = QVBoxLayout(self)
-
-        info = QLabel(
-            "Enter the server details and password to install your SSH key.\n"
-            "After installation, you can switch to key-based authentication."
-        )
-        info.setWordWrap(True)
-        layout.addWidget(info)
-
-        form = QFormLayout()
-        self.host_edit = QLineEdit()
-        self.port_spin = QSpinBox()
-        self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(22)
-        self.user_edit = QLineEdit()
-        self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.key_path_edit = QLineEdit(str(DEFAULT_KEY_DIR / DEFAULT_KEY_NAME))
-        self.key_browse_btn = QPushButton("Browse...")
-        self.key_browse_btn.clicked.connect(self._browse_key)
-        key_layout = QHBoxLayout()
-        key_layout.addWidget(self.key_path_edit)
-        key_layout.addWidget(self.key_browse_btn)
-        form.addRow("Host:", self.host_edit)
-        form.addRow("Port:", self.port_spin)
-        form.addRow("Username:", self.user_edit)
-        form.addRow("Password:", self.password_edit)
-        form.addRow("Key Path:", key_layout)
-        layout.addLayout(form)
-
-        self.gen_key_check = QCheckBox("Generate new key if none exists")
-        self.gen_key_check.setChecked(True)
-        layout.addWidget(self.gen_key_check)
-
-        self.progress = QProgressBar()
-        self.progress.setVisible(False)
-        layout.addWidget(self.progress)
-
-        self.status_label = QLabel("")
-        layout.addWidget(self.status_label)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        self.install_btn = QPushButton("Install Key")
-        self.install_btn.clicked.connect(self._install)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(self.install_btn)
-        btn_layout.addWidget(self.cancel_btn)
-        layout.addLayout(btn_layout)
-
-    def _browse_key(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select SSH Private Key", str(Path.home() / ".ssh")
-        )
-        if path:
-            self.key_path_edit.setText(path)
-
-    def _install(self):
-        hostname = self.host_edit.text().strip()
-        port = self.port_spin.value()
-        username = self.user_edit.text().strip()
-        password = self.password_edit.text()
-
-        if not all([hostname, username, password]):
-            QMessageBox.warning(self, "Missing Fields",
-                                "Host, username, and password are required.")
-            return
-
-        self.install_btn.setEnabled(False)
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 0)
-        self.status_label.setText("Connecting...")
-
-        QTimer.singleShot(50, self._do_install)
-
-    def _do_install(self):
-        hostname = self.host_edit.text().strip()
-        port = self.port_spin.value()
-        username = self.user_edit.text().strip()
-        password = self.password_edit.text()
-        key_path = self.key_path_edit.text().strip()
-
-        generate_new = self.gen_key_check.isChecked()
-        if generate_new and not Path(key_path).expanduser().exists():
-            try:
-                generate_key_pair(key_path)
-            except Exception as e:
-                self.status_label.setText(f"Key generation failed: {e}")
-                self._done(False)
-                return
-
-        self.status_label.setText("Installing key...")
-        self._install_worker = _TaskWorker(
-            lambda: self._install_task(hostname, port, username, password, key_path),
-            self,
-        )
-        self._install_worker.done.connect(self._on_install_done)
-        self._install_worker.failed.connect(self._on_install_failed)
-        self._install_worker.finished.connect(self._install_worker.deleteLater)
-        self._install_worker.start()
-
-    @staticmethod
-    def _install_task(hostname, port, username, password, key_path) -> bool:
-        from llama_launcher.remote.ssh_key import read_public_key
-        pub_key = read_public_key(key_path)
-        return install_key_to_server(hostname, port, username, password, pub_key, key_path)
-
-    def _on_install_done(self, success):
-        if success:
-            self.status_label.setText("Key installed and verified successfully!")
-        else:
-            self.status_label.setText("Installation failed or verification failed.")
-        self._done(bool(success))
-
-    def _on_install_failed(self, message):
-        self.status_label.setText(f"Error: {message}")
-        self._done(False)
-
-    def _done(self, success: bool):
-        self.progress.setVisible(False)
-        self.install_btn.setEnabled(True)
-        if success:
-            QMessageBox.information(self, "Success",
-                                    "SSH key installed successfully.")
 
 
 class ServerListWidget(QWidget):
@@ -794,6 +665,8 @@ class ServerStatusWidget(QWidget):
 
     def _run_task(self, fn, on_done=None, on_failed=None, worker_class=_TaskWorker):
         """Run ``fn`` in a background thread; route result/failure to callbacks."""
+        if getattr(self, '_closing', False):
+            return None
         worker = worker_class(fn, self)
         if on_done is not None:
             worker.done.connect(on_done)
@@ -957,8 +830,115 @@ class ServerStatusWidget(QWidget):
         self._refresh_status()
 
     def _on_install_key(self):
-        dialog = SSHKeyInstallDialog(self)
-        dialog.exec()
+        """Install the launcher SSH key on the selected server.
+
+        Uses the server's stored host/username/password, then switches the
+        server configuration to key-based auth and persists it.
+        """
+        if not self._selected_server or not self._manager:
+            return
+        conn = self._manager.get_connection(self._selected_server)
+        if not conn:
+            return
+        config = conn.config
+        if config.connection_type != ConnectionType.SSH:
+            QMessageBox.information(
+                self, "Install SSH Key",
+                "SSH key installation only applies to SSH servers.")
+            return
+        if not config.hostname or not config.username:
+            QMessageBox.warning(
+                self, "Install SSH Key",
+                "The selected server has no hostname/username configured.\n"
+                "Edit the server first.")
+            return
+
+        already_key_auth = (config.auth_method == AuthMethod.SSH_KEY
+                            and bool(config.private_key_path))
+        if already_key_auth:
+            reply = QMessageBox.question(
+                self, "Install SSH Key",
+                f"'{self._selected_server}' already uses key authentication "
+                f"({config.private_key_path}).\n\n"
+                f"Re-install/verify the key on {config.username}@{config.hostname}?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        password = config.password
+        if not password:
+            password, ok = QInputDialog.getText(
+                self, "Server Password",
+                f"Password for {config.username}@{config.hostname}\n"
+                f"(used once to install the key; not stored):",
+                QLineEdit.Password)
+            if not ok or not password:
+                return
+
+        key_path = config.private_key_path or str(DEFAULT_KEY_DIR / DEFAULT_KEY_NAME)
+        key_path = str(Path(key_path).expanduser())
+
+        reply = QMessageBox.question(
+            self, "Install SSH Key",
+            f"This will:\n"
+            f"  1. Use the local key: {key_path}\n"
+            f"     (generated automatically if missing)\n"
+            f"  2. Install it on {config.username}@{config.hostname}:{config.port}\n"
+            f"     using the {'stored' if config.password else 'entered'} password\n"
+            f"  3. Switch '{self._selected_server}' to SSH key authentication\n\n"
+            f"Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.install_key_btn.setEnabled(False)
+        self.state_label.setText("Installing SSH key...")
+        self._run_task(
+            lambda: self._install_key_task(config, key_path, password),
+            on_done=lambda ok: self._on_key_installed(bool(ok), config, key_path),
+            on_failed=lambda msg: self._on_key_installed(False, config, key_path, msg),
+        )
+
+    @staticmethod
+    def _install_key_task(config: ServerConfig, key_path: str, password: str) -> bool:
+        """Worker: generate the key if needed and install it on the server."""
+        from llama_launcher.remote.ssh_key import read_public_key
+        if not Path(key_path).exists():
+            generate_key_pair(key_path)
+        pub_key = read_public_key(key_path)
+        return install_key_to_server(
+            config.hostname, config.port, config.username,
+            password, pub_key, key_path,
+        )
+
+    def _on_key_installed(self, success: bool, config: ServerConfig,
+                          key_path: str, error: str = ""):
+        self.install_key_btn.setEnabled(True)
+        if not success:
+            self.state_label.setText("Key install failed")
+            QMessageBox.warning(
+                self, "Install SSH Key",
+                f"Could not install the SSH key on "
+                f"{config.username}@{config.hostname}.\n\n"
+                f"{error or 'Check the host, username, and password.'}")
+            return
+
+        # Switch the server to key auth and persist the change.
+        conn = self._manager.get_connection(self._selected_server)
+        if conn is not None:
+            conn.disconnect()
+        config.auth_method = AuthMethod.SSH_KEY
+        config.private_key_path = key_path
+        self._manager.add_server(config)  # persists + recreates the connection
+        self.state_label.setText("Key installed - switched to key auth")
+        QMessageBox.information(
+            self, "Install SSH Key",
+            f"SSH key installed and verified on {config.username}@{config.hostname}.\n\n"
+            f"'{self._selected_server}' now uses key authentication "
+            f"({key_path}).")
+        self._refresh_status()
 
     def _on_generate_key(self):
         if default_key_exists():

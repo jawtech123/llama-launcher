@@ -45,6 +45,13 @@ class BasicTab(QWidget):
         self.preset_combo = QComboBox()
         bar.addWidget(self.preset_combo)
 
+        self.benchmark_info_btn = QPushButton("ℹ")
+        self.benchmark_info_btn.setFixedWidth(32)
+        self.benchmark_info_btn.setToolTip(
+            "Show benchmark info for this preset (tokens/sec from your last run).\n"
+            "The info resets when any parameter is changed.")
+        bar.addWidget(self.benchmark_info_btn)
+
         self.save_preset_btn = QPushButton("Save Preset")
         bar.addWidget(self.save_preset_btn)
 
