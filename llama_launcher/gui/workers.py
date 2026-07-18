@@ -14,6 +14,7 @@ from llama_launcher.core.presets import PresetManager
 from llama_launcher.gpu.detector import detect_gpu
 from llama_launcher.models.scanner import scan_models
 from llama_launcher.remote.types import ConnectionState
+from llama_launcher.utils.helpers import get_file_size_mb
 
 logger = logging.getLogger(__name__)
 
@@ -159,3 +160,79 @@ class GpuStatsWorker(QThread):
         except Exception:
             logger.debug("nvidia-smi stats poll failed", exc_info=True)
         self.stats_done.emit("")
+
+
+_QUANT_PATTERNS = (
+    ("q8_0", "Q8_0"), ("q6_k", "Q6_K"), ("q5_k_m", "Q5_K_M"),
+    ("q5_0", "Q5_0"), ("q5_1", "Q5_1"), ("q4_k_m", "Q4_K_M"),
+    ("q4_0", "Q4_0"), ("q4_1", "Q4_1"), ("q3_k_m", "Q3_K_M"),
+    ("q3_k_s", "Q3_K_S"), ("q2_k", "Q2_K"),
+)
+
+_FAMILY_HINTS = (
+    ("llama", "llama"), ("llm", "llama"), ("mistral", "mistral"),
+    ("qwen", "qwen"), ("qwq", "qwen"), ("gemma", "gemma"),
+    ("phi", "phi"), ("codellama", "codellama"),
+)
+
+
+def infer_model_hints(model_path: str) -> tuple:
+    """Infer (family, quant_type) from a model file name."""
+    name_lower = model_path.lower()
+    family = "unknown"
+    for hint, family_name in _FAMILY_HINTS:
+        if hint in name_lower:
+            family = family_name
+            break
+    quant = ""
+    for pattern, quant_name in _QUANT_PATTERNS:
+        if pattern in name_lower:
+            quant = quant_name
+            break
+    return family, quant
+
+
+class EstimateWorker(QThread):
+    """Compute a resource estimate in a background thread.
+
+    Reads GGUF metadata (cached) and file sizes off the GUI thread so typing
+    in any field never stalls the UI.
+    """
+
+    estimate_done = Signal(object)
+
+    def __init__(self, estimator, config_snapshot, gpu_info,
+                 model_path, draft_path, mmproj_path):
+        super().__init__()
+        self._estimator = estimator
+        self._config = config_snapshot
+        self._gpu_info = gpu_info
+        self._model_path = model_path
+        self._draft_path = draft_path
+        self._mmproj_path = mmproj_path
+
+    def run(self):
+        try:
+            model_size_mb = get_file_size_mb(self._model_path)
+            if model_size_mb <= 0:
+                self.estimate_done.emit(None)
+                return
+
+            draft_size_mb = get_file_size_mb(self._draft_path) if self._draft_path else 0.0
+            mmproj_size_mb = get_file_size_mb(self._mmproj_path) if self._mmproj_path else 0.0
+            family, quant = infer_model_hints(self._model_path)
+
+            estimate = self._estimator.calculate(
+                config=self._config,
+                gpu_info=self._gpu_info,
+                model_size_mb=model_size_mb,
+                model_family=family,
+                quant_type=quant,
+                model_path=self._model_path,
+                draft_model_size_mb=draft_size_mb,
+                mmproj_model_size_mb=mmproj_size_mb,
+            )
+            self.estimate_done.emit(estimate)
+        except Exception:
+            logger.exception("Estimate worker failed")
+            self.estimate_done.emit(None)

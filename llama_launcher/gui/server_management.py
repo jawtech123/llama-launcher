@@ -1,15 +1,16 @@
 """Server Management GUI Components."""
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
     QGroupBox, QFormLayout, QDialog, QFileDialog,
     QMessageBox, QInputDialog, QSplitter, QListWidget, QListWidgetItem,
     QTextEdit, QTabWidget, QHeaderView, QAbstractItemView,
-    QTreeWidget, QTreeWidgetItem, QProgressBar, QFrame,
+    QTreeWidget, QTreeWidgetItem, QProgressBar, QProgressDialog, QFrame,
     QScrollArea, QTableWidget, QTableWidgetItem, QColumnView,
     QListView,
 )
@@ -63,6 +64,30 @@ class _ServerStatusWorker(QThread):
             self.done.emit(status, "")
         except Exception as e:
             self.done.emit(None, str(e))
+
+
+class _TaskWorker(QThread):
+    """Run an arbitrary callable in a background thread."""
+
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, parent=None):
+        super().__init__(parent)
+        self._fn = fn
+
+    def run(self):
+        try:
+            self.done.emit(self._fn())
+        except Exception as e:
+            logger.debug("Background task failed: %s", e, exc_info=True)
+            self.failed.emit(str(e))
+
+
+class _TransferWorker(_TaskWorker):
+    """A task worker with a progress signal for file transfers."""
+
+    progress = Signal(int)
 
 
 class ServerEditDialog(QDialog):
@@ -359,25 +384,32 @@ class SSHKeyInstallDialog(QDialog):
                 self._done(False)
                 return
 
-        try:
-            from llama_launcher.remote.ssh_key import read_public_key
-            pub_key = read_public_key(key_path)
-            self.status_label.setText("Installing key...")
-            QApplication.processEvents()
-            success = install_key_to_server(
-                hostname, port, username, password, pub_key, key_path
-            )
-            if success:
-                self.status_label.setText("Key installed and verified successfully!")
-                self._done(True)
-            else:
-                self.status_label.setText(
-                    "Installation failed or verification failed."
-                )
-                self._done(False)
-        except Exception as e:
-            self.status_label.setText(f"Error: {e}")
-            self._done(False)
+        self.status_label.setText("Installing key...")
+        self._install_worker = _TaskWorker(
+            lambda: self._install_task(hostname, port, username, password, key_path),
+            self,
+        )
+        self._install_worker.done.connect(self._on_install_done)
+        self._install_worker.failed.connect(self._on_install_failed)
+        self._install_worker.finished.connect(self._install_worker.deleteLater)
+        self._install_worker.start()
+
+    @staticmethod
+    def _install_task(hostname, port, username, password, key_path) -> bool:
+        from llama_launcher.remote.ssh_key import read_public_key
+        pub_key = read_public_key(key_path)
+        return install_key_to_server(hostname, port, username, password, pub_key, key_path)
+
+    def _on_install_done(self, success):
+        if success:
+            self.status_label.setText("Key installed and verified successfully!")
+        else:
+            self.status_label.setText("Installation failed or verification failed.")
+        self._done(bool(success))
+
+    def _on_install_failed(self, message):
+        self.status_label.setText(f"Error: {message}")
+        self._done(False)
 
     def _done(self, success: bool):
         self.progress.setVisible(False)
@@ -687,6 +719,7 @@ class ServerStatusWidget(QWidget):
         self.file_tree.setHeaderLabels(["Name", "Size", "Modified"])
         self.file_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.file_tree.setSortingEnabled(True)
+        self.file_tree.itemDoubleClicked.connect(self._on_file_double_clicked)
         file_layout.addWidget(self.file_tree)
         self.tabs.addTab(file_tab, "File Browser")
 
@@ -727,6 +760,22 @@ class ServerStatusWidget(QWidget):
             self._workers.remove(worker)
         except ValueError:
             pass
+
+    def _run_task(self, fn, on_done=None, on_failed=None, worker_class=_TaskWorker):
+        """Run ``fn`` in a background thread; route result/failure to callbacks."""
+        worker = worker_class(fn, self)
+        if on_done is not None:
+            worker.done.connect(on_done)
+        if on_failed is not None:
+            worker.failed.connect(on_failed)
+        else:
+            worker.failed.connect(
+                lambda msg: logger.warning("Background task failed: %s", msg))
+        worker.finished.connect(worker.deleteLater)
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
+        worker.start()
+        return worker
 
     def shutdown(self) -> None:
         """Stop timers/console and wait for workers (called on app close)."""
@@ -779,7 +828,15 @@ class ServerStatusWidget(QWidget):
     def _on_connect(self):
         if not self._selected_server:
             return
-        result = self._manager.connect(self._selected_server)
+        self.connect_btn.setEnabled(False)
+        self.state_label.setText("Connecting...")
+        self._run_task(
+            lambda: self._manager.connect(self._selected_server),
+            on_done=self._on_connect_done,
+        )
+
+    def _on_connect_done(self, result):
+        self.connect_btn.setEnabled(True)
         if result:
             QMessageBox.information(self, "Connected",
                                     f"Connected to {self._selected_server}.")
@@ -787,18 +844,18 @@ class ServerStatusWidget(QWidget):
         else:
             QMessageBox.warning(self, "Connection Failed",
                                 f"Could not connect to {self._selected_server}.")
+            self.state_label.setText("Connection failed")
 
     def _on_disconnect(self):
         if not self._selected_server:
             return
-        self._manager.disconnect(self._selected_server)
-        self._refresh_status()
+        self._run_task(
+            lambda: self._manager.disconnect(self._selected_server),
+            on_done=lambda _r: self._refresh_status(),
+        )
 
     def _on_start(self):
         if not self._selected_server:
-            return
-        conn = self._manager.get_connection(self._selected_server)
-        if not conn:
             return
         cmd = self._launch_command()
         if QMessageBox.question(
@@ -806,34 +863,48 @@ class ServerStatusWidget(QWidget):
             f"Start llama-server on {self._selected_server}?\n\n{cmd}",
             QMessageBox.Yes | QMessageBox.No,
         ) == QMessageBox.Yes:
-            result = self._manager.start_server(self._selected_server, cmd)
-            if result:
-                QMessageBox.information(self, "Started",
-                                        "Server started.")
-                self._refresh_status()
-            else:
-                QMessageBox.warning(self, "Failed",
-                                    "Could not start server.")
+            self.start_btn.setEnabled(False)
+            self._run_task(
+                lambda: self._manager.start_server(self._selected_server, cmd),
+                on_done=self._on_start_done,
+            )
+
+    def _on_start_done(self, result):
+        self.start_btn.setEnabled(True)
+        if result:
+            QMessageBox.information(self, "Started", "Server started.")
+        else:
+            QMessageBox.warning(self, "Failed", "Could not start server.")
+        self._refresh_status()
 
     def _on_stop(self):
         if not self._selected_server:
             return
-        result = self._manager.stop_server(self._selected_server)
-        if result:
-            self._refresh_status()
+        self.stop_btn.setEnabled(False)
+        self._run_task(
+            lambda: self._manager.stop_server(self._selected_server),
+            on_done=self._on_stop_done,
+        )
+
+    def _on_stop_done(self, _result):
+        self.stop_btn.setEnabled(True)
+        self._refresh_status()
 
     def _on_restart(self):
         if not self._selected_server:
             return
-        conn = self._manager.get_connection(self._selected_server)
-        if not conn:
-            return
         cmd = self._launch_command()
-        result = self._manager.restart_server(self._selected_server, cmd)
+        self.restart_btn.setEnabled(False)
+        self._run_task(
+            lambda: self._manager.restart_server(self._selected_server, cmd),
+            on_done=self._on_restart_done,
+        )
+
+    def _on_restart_done(self, result):
+        self.restart_btn.setEnabled(True)
         if result:
-            QMessageBox.information(self, "Restarted",
-                                    "Server restarted.")
-            self._refresh_status()
+            QMessageBox.information(self, "Restarted", "Server restarted.")
+        self._refresh_status()
 
     def _on_install_key(self):
         dialog = SSHKeyInstallDialog(self)
@@ -872,8 +943,10 @@ class ServerStatusWidget(QWidget):
     def _on_tail(self):
         if not self._selected_server:
             return
-        log = self._manager.tail_log(self._selected_server, 100)
-        self.console_text.setPlainText(log)
+        self._run_task(
+            lambda: self._manager.tail_log(self._selected_server, 100),
+            on_done=lambda log: self.console_text.setPlainText(log or ""),
+        )
 
     def _append_console_line(self, line: str):
         self.console_text.insertPlainText(line + "\n")
@@ -901,7 +974,14 @@ class ServerStatusWidget(QWidget):
         if not remote_path:
             return
         self.file_path_edit.setText(remote_path)
-        entries = self._manager.list_directory(self._selected_server, remote_path)
+        self.file_tree.setEnabled(False)
+        self._run_task(
+            lambda: self._manager.list_directory(self._selected_server, remote_path),
+            on_done=self._populate_file_tree,
+        )
+
+    def _populate_file_tree(self, entries):
+        self.file_tree.setEnabled(True)
         self.file_tree.clear()
         for entry in sorted(entries, key=lambda e: (not e.is_directory, e.name.lower())):
             item = QTreeWidgetItem(self.file_tree)
@@ -916,6 +996,15 @@ class ServerStatusWidget(QWidget):
                 entry.modified_time).strftime("%Y-%m-%d %H:%M"))
             item.setData(0, Qt.UserRole, entry.path)
             item.setData(0, Qt.UserRole + 1, entry.is_directory)
+            item.setData(0, Qt.UserRole + 2, entry.size_bytes)
+
+    def _on_file_double_clicked(self, item, _column=0):
+        """Navigate into a directory on double-click."""
+        is_dir = item.data(0, Qt.UserRole + 1)
+        path = item.data(0, Qt.UserRole)
+        if is_dir and path:
+            self.file_path_edit.setText(path)
+            self._refresh_file_list()
 
     def _file_go_up(self):
         path = self.file_path_edit.text().strip()
@@ -930,11 +1019,11 @@ class ServerStatusWidget(QWidget):
             return
         name, ok = QInputDialog.getItem(self, "New Directory", "Directory name:", [], 0, False)
         if ok and name:
-            result = self._manager.create_directory(
-                self._selected_server, f"{path}/{name}"
+            self._run_task(
+                lambda: self._manager.create_directory(
+                    self._selected_server, f"{path}/{name}"),
+                on_done=lambda result: self._refresh_file_list() if result else None,
             )
-            if result:
-                self._refresh_file_list()
 
     def _file_delete(self):
         item = self.file_tree.currentItem()
@@ -948,8 +1037,10 @@ class ServerStatusWidget(QWidget):
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
-            self._manager.delete_file(self._selected_server, path)
-            self._refresh_file_list()
+            self._run_task(
+                lambda: self._manager.delete_file(self._selected_server, path),
+                on_done=lambda _r: self._refresh_file_list(),
+            )
 
     def _file_upload(self):
         local, _ = QFileDialog.getOpenFileName(self, "Upload File")
@@ -960,11 +1051,15 @@ class ServerStatusWidget(QWidget):
             conn = self._manager.get_connection(self._selected_server)
             remote = conn.config.model_directory if conn else "~"
         remote = f"{remote}/{Path(local).name}"
-        result = self._manager.upload_file(
-            self._selected_server, local, remote
+        try:
+            total = os.path.getsize(local)
+        except OSError:
+            total = 0
+        self._start_transfer(
+            f"Uploading {Path(local).name}", total,
+            lambda cb: self._manager.upload_file(
+                self._selected_server, local, remote, progress_cb=cb),
         )
-        if result:
-            self._refresh_file_list()
 
     def _file_download(self):
         item = self.file_tree.currentItem()
@@ -977,14 +1072,57 @@ class ServerStatusWidget(QWidget):
         remote = item.data(0, Qt.UserRole)
         if not remote:
             return
+        size_bytes = item.data(0, Qt.UserRole + 2) or 0
         local_dir = QFileDialog.getExistingDirectory(self, "Download to")
         if not local_dir:
             return
-        result = self._manager.download_file(
-            self._selected_server, remote, f"{local_dir}/{item.text(0)}"
+        self._start_transfer(
+            f"Downloading {item.text(0)}", size_bytes,
+            lambda cb: self._manager.download_file(
+                self._selected_server, remote, f"{local_dir}/{item.text(0)}",
+                progress_cb=cb),
         )
+
+    def _start_transfer(self, title: str, total_bytes: int, fn):
+        """Run a transfer in a worker with a cancellable progress dialog."""
+        progress = QProgressDialog(title, "Cancel", 0, 100, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(300)
+        progress.setValue(0)
+
+        holder = {}
+
+        def cb(done, total):
+            if progress.wasCanceled():
+                raise RuntimeError("Transfer cancelled")
+            worker = holder.get("worker")
+            if worker is not None:
+                denom = total or total_bytes or 1
+                worker.progress.emit(int(done * 100 / max(denom, 1)))
+
+        worker = _TransferWorker(lambda: fn(cb), self)
+        holder["worker"] = worker
+        worker.progress.connect(progress.setValue)
+        worker.done.connect(lambda result: self._on_transfer_done(progress, result))
+        worker.failed.connect(lambda msg: self._on_transfer_failed(progress, msg))
+        worker.finished.connect(worker.deleteLater)
+        self._workers.append(worker)
+        worker.finished.connect(lambda: self._untrack(worker))
+        worker.start()
+
+    def _on_transfer_done(self, progress, result):
+        progress.close()
         if result:
             self._refresh_file_list()
+        else:
+            QMessageBox.warning(self, "Transfer Failed",
+                                "The file transfer did not complete.")
+
+    def _on_transfer_failed(self, progress, message):
+        progress.close()
+        if "cancelled" not in message.lower():
+            QMessageBox.warning(self, "Transfer Error", message)
 
 
 class ServerManagementWidget(QWidget):

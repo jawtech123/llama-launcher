@@ -14,6 +14,7 @@ import os
 import struct
 import platform
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -117,6 +118,23 @@ def _ggml_type_name(t: int) -> str:
 # ---------------------------------------------------------------------------
 # GGUF header reader
 # ---------------------------------------------------------------------------
+
+#: Cache for GGUF metadata, keyed by (path, mtime_ns, size). Avoids re-parsing
+#: multi-GB model files on every config change.
+_METADATA_CACHE: dict = {}
+_METADATA_CACHE_MAX = 64
+
+
+def _metadata_cache_key(model_path: str):
+    """Return a cache key for a model file, or None if it can't be stat'ed."""
+    if not model_path:
+        return None
+    try:
+        st = os.stat(model_path)
+    except OSError:
+        return None
+    return (model_path, st.st_mtime_ns, st.st_size)
+
 
 class _GgufReader:
     """GGUF v2/v3 header reader for architecture parameters and tensor information."""
@@ -295,7 +313,13 @@ class _GgufReader:
         """Read complete model metadata from GGUF file header.
 
         Returns ModelMetadata with architecture params, tensor info, and parameter count.
+        Results are cached by (path, mtime, size) so repeated estimates for the
+        same file are free.
         """
+        cache_key = _metadata_cache_key(model_path)
+        if cache_key is not None and cache_key in _METADATA_CACHE:
+            return _METADATA_CACHE[cache_key]
+
         meta = ModelMetadata()
 
         if not model_path or not os.path.isfile(model_path):
@@ -310,10 +334,11 @@ class _GgufReader:
         _bytes_read = 0
 
         # Timeout: abort GGUF read if it takes more than 2 seconds
-        # This prevents hanging on slow network files or locked files
+        # This prevents hanging on slow network files or locked files.
+        # (SIGALRM only works in the main thread; worker threads skip this.)
         _read_timeout = 2
         _timeout_handler = None
-        if platform.system() != "Windows":
+        if platform.system() != "Windows" and threading.current_thread() is threading.main_thread():
             import signal
             def _handler(signum, frame):
                 raise TimeoutError("GGUF read timeout")
@@ -479,6 +504,12 @@ class _GgufReader:
             if _timeout_handler is not None:
                 signal.alarm(0)
                 signal.signal(signal.SIGALRM, _timeout_handler)
+
+        if cache_key is not None:
+            if len(_METADATA_CACHE) >= _METADATA_CACHE_MAX:
+                # FIFO eviction of the oldest cached entry
+                _METADATA_CACHE.pop(next(iter(_METADATA_CACHE)))
+            _METADATA_CACHE[cache_key] = meta
 
         return meta
 

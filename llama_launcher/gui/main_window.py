@@ -26,7 +26,7 @@ from llama_launcher.gui.tabs.models_tab import ModelsTab
 from llama_launcher.gui.tabs.preview_tab import PreviewTab
 from llama_launcher.gui import theme
 from llama_launcher.gui.workers import (
-    GpuDetectWorker, GpuStatsWorker, ModelScanWorker, PresetStyleWorker,
+    EstimateWorker, GpuDetectWorker, GpuStatsWorker, ModelScanWorker, PresetStyleWorker,
 )
 from llama_launcher.models.storage import (
     load_models as load_cached_models,
@@ -34,7 +34,6 @@ from llama_launcher.models.storage import (
 )
 from llama_launcher.remote.manager import ServerManager
 from llama_launcher.remote.types import ConnectionState, ConnectionType, ServerConfig
-from llama_launcher.utils.helpers import get_file_size_mb
 
 logger = logging.getLogger(__name__)
 
@@ -549,66 +548,49 @@ class LlamaLauncherGUI(QMainWindow):
         combo.style().polish(combo)
 
     def _update_resource_estimate(self):
-        """Update the resource usage panel with the current estimate."""
-        try:
-            model_size_mb = get_file_size_mb(self.config.model_path)
+        """Schedule a debounced background estimate (never blocks the UI)."""
+        if not hasattr(self, "_estimate_debounce"):
+            self._estimate_debounce = QTimer(self)
+            self._estimate_debounce.setSingleShot(True)
+            self._estimate_debounce.setInterval(300)
+            self._estimate_debounce.timeout.connect(self._start_estimate_worker)
+        self._estimate_debounce.start()
 
-            if model_size_mb <= 0:
-                self.resource_panel.update_estimate(None)
-                return
+    def _start_estimate_worker(self):
+        if self._closing:
+            return
+        existing = getattr(self, "_estimate_worker", None)
+        if existing is not None and existing.isRunning():
+            self._estimate_rerun = True  # rerun with latest config when done
+            return
+        import dataclasses
 
-            draft_size_mb = (
-                get_file_size_mb(self.config.draft_model_path)
-                if self.config.draft_model_path else 0.0
-            )
-            mmproj_size_mb = (
-                get_file_size_mb(self.config.mmproj_model_path)
-                if self.config.mmproj_model_path else 0.0
-            )
+        snapshot = dataclasses.replace(self.config)
+        worker = EstimateWorker(
+            self.resource_estimator, snapshot, self.gpu_info,
+            self.config.model_path, self.config.draft_model_path,
+            self.config.mmproj_model_path,
+        )
+        worker.estimate_done.connect(self._on_estimate_done)
+        worker.finished.connect(lambda: setattr(self, "_estimate_worker", None))
+        self._estimate_worker = worker
+        self._start_worker(worker)
 
-            quant_type = ""
-            model_family = "unknown"
-            name_lower = self.config.model_path.lower()
-            if "llama" in name_lower or "llm" in name_lower:
-                model_family = "llama"
-            elif "mistral" in name_lower:
-                model_family = "mistral"
-            elif "qwen" in name_lower or "qwen2" in name_lower or "qwq" in name_lower:
-                model_family = "qwen"
-            elif "gemma" in name_lower:
-                model_family = "gemma"
-            elif "phi" in name_lower:
-                model_family = "phi"
-            elif "codellama" in name_lower:
-                model_family = "codellama"
+    def _on_estimate_done(self, estimate):
+        self.resource_panel.update_estimate(estimate,
+                                            selected_ctx=self.config.context_size)
 
-            for pattern in ["q8_0", "q6_k", "q5_k_m", "q5_0", "q5_1",
-                            "q4_k_m", "q4_0", "q4_1", "q3_k_m", "q3_k_s", "q2_k"]:
-                if pattern in name_lower:
-                    quant_type = pattern.upper()
-                    break
+        # Auto-set context default from training context on first model load
+        if (estimate is not None
+                and self._ctx_auto_set
+                and estimate.training_context_length > 0
+                and self.config.context_size < estimate.training_context_length):
+            self.controller.set("context_size", estimate.training_context_length)
+            self._ctx_auto_set = False
 
-            estimate = self.resource_estimator.calculate(
-                config=self.config,
-                gpu_info=self.gpu_info,
-                model_size_mb=model_size_mb,
-                model_family=model_family,
-                quant_type=quant_type,
-                model_path=self.config.model_path,
-                draft_model_size_mb=draft_size_mb,
-                mmproj_model_size_mb=mmproj_size_mb,
-            )
-            self.resource_panel.update_estimate(estimate,
-                                                selected_ctx=self.config.context_size)
-
-            # Auto-set context default from training context on first model load
-            if (self._ctx_auto_set
-                    and estimate.training_context_length > 0
-                    and self.config.context_size < estimate.training_context_length):
-                self.controller.set("context_size", estimate.training_context_length)
-                self._ctx_auto_set = False
-        except Exception:
-            logger.exception("Failed to update resource estimate")
+        if getattr(self, "_estimate_rerun", False):
+            self._estimate_rerun = False
+            self._update_resource_estimate()
 
     # ------------------------------------------------------------------
     # Local launch

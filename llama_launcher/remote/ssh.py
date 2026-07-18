@@ -144,7 +144,7 @@ class SSHServerConnection(IServerConnection):
             self._state = ConnectionState.ERROR
             raise
 
-    def upload_file(self, local_path: str, remote_path: str) -> bool:
+    def upload_file(self, local_path: str, remote_path: str, progress_cb=None) -> bool:
         try:
             sftp = self._get_sftp()
             remote_dir = str(Path(remote_path).parent)
@@ -152,19 +152,23 @@ class SSHServerConnection(IServerConnection):
                 sftp.stat(remote_dir)
             except FileNotFoundError:
                 self._mkdirs(sftp, remote_dir)
-            sftp.put(str(Path(local_path).expanduser()), remote_path)
+            sftp.put(str(Path(local_path).expanduser()), remote_path,
+                     callback=progress_cb)
             return True
         except Exception:
+            logger.debug("upload_file failed", exc_info=True)
             return False
 
-    def download_file(self, remote_path: str, local_path: str) -> bool:
+    def download_file(self, remote_path: str, local_path: str, progress_cb=None) -> bool:
         try:
             sftp = self._get_sftp()
             local_dir = Path(local_path).parent
             local_dir.mkdir(parents=True, exist_ok=True)
-            sftp.get(remote_path, str(local_dir / Path(local_path).name))
+            sftp.get(remote_path, str(local_dir / Path(local_path).name),
+                     callback=progress_cb)
             return True
         except Exception:
+            logger.debug("download_file failed", exc_info=True)
             return False
 
     def _mkdirs(self, sftp, path: str) -> None:

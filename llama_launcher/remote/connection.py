@@ -49,12 +49,22 @@ class IServerConnection(ABC):
         """
 
     @abstractmethod
-    def upload_file(self, local_path: str, remote_path: str) -> bool:
-        """Upload a file to the target host."""
+    def upload_file(self, local_path: str, remote_path: str, progress_cb=None) -> bool:
+        """Upload a file to the target host.
+
+        Args:
+            progress_cb: Optional callable(bytes_done, total_bytes) invoked
+                during the transfer. Raising inside it aborts the transfer.
+        """
 
     @abstractmethod
-    def download_file(self, remote_path: str, local_path: str) -> bool:
-        """Download a file from the target host."""
+    def download_file(self, remote_path: str, local_path: str, progress_cb=None) -> bool:
+        """Download a file from the target host.
+
+        Args:
+            progress_cb: Optional callable(bytes_done, total_bytes) invoked
+                during the transfer. Raising inside it aborts the transfer.
+        """
 
     @abstractmethod
     def list_directory(self, remote_path: str) -> List[FileEntry]:

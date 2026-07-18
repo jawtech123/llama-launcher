@@ -96,27 +96,43 @@ class LocalServerConnection(IServerConnection):
             raise RuntimeError(f"Command failed: {command}")
         return output
 
-    def upload_file(self, local_path: str, remote_path: str) -> bool:
+    def upload_file(self, local_path: str, remote_path: str, progress_cb=None) -> bool:
         try:
             target = str(Path(remote_path).expanduser())
             parent = Path(target).parent
             parent.mkdir(parents=True, exist_ok=True)
-            import shutil
-            shutil.copy2(local_path, target)
+            self._copy_with_progress(local_path, target, progress_cb)
             return True
         except Exception:
+            logger.debug("upload_file failed", exc_info=True)
             return False
 
-    def download_file(self, remote_path: str, local_path: str) -> bool:
+    def download_file(self, remote_path: str, local_path: str, progress_cb=None) -> bool:
         try:
             source = str(Path(remote_path).expanduser())
             parent = Path(local_path).parent
             parent.mkdir(parents=True, exist_ok=True)
-            import shutil
-            shutil.copy2(source, local_path)
+            self._copy_with_progress(source, local_path, progress_cb)
             return True
         except Exception:
+            logger.debug("download_file failed", exc_info=True)
             return False
+
+    @staticmethod
+    def _copy_with_progress(source: str, target: str, progress_cb=None) -> None:
+        import shutil
+
+        total = os.path.getsize(source)
+        copied = 0
+        with open(source, "rb") as src, open(target, "wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+                copied += len(chunk)
+                if progress_cb:
+                    progress_cb(copied, total)
 
     def list_directory(self, remote_path: str) -> List[FileEntry]:
         target = Path(remote_path).expanduser()

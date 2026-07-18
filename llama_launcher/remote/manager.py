@@ -123,17 +123,19 @@ class ServerManager:
             raise ConnectionError(f"No connection: {friendly_name}")
         return conn.execute_and_capture(command)
 
-    def upload_file(self, friendly_name: str, local_path: str, remote_path: str) -> bool:
+    def upload_file(self, friendly_name: str, local_path: str, remote_path: str,
+                    progress_cb=None) -> bool:
         conn = self._connections.get(friendly_name)
         if not conn:
             return False
-        return conn.upload_file(local_path, remote_path)
+        return conn.upload_file(local_path, remote_path, progress_cb=progress_cb)
 
-    def download_file(self, friendly_name: str, remote_path: str, local_path: str) -> bool:
+    def download_file(self, friendly_name: str, remote_path: str, local_path: str,
+                      progress_cb=None) -> bool:
         conn = self._connections.get(friendly_name)
         if not conn:
             return False
-        return conn.download_file(remote_path, local_path)
+        return conn.download_file(remote_path, local_path, progress_cb=progress_cb)
 
     def list_directory(self, friendly_name: str, remote_path: str) -> List[FileEntry]:
         conn = self._connections.get(friendly_name)
