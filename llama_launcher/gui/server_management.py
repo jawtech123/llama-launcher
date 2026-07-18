@@ -90,6 +90,18 @@ class _TransferWorker(_TaskWorker):
     progress = Signal(int)
 
 
+class _FileTreeItem(QTreeWidgetItem):
+    """Tree item that sorts the Size column numerically (bytes), not as text."""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        if tree is not None and tree.sortColumn() == 1:
+            a = self.data(0, Qt.UserRole + 2) or 0
+            b = other.data(0, Qt.UserRole + 2) or 0
+            return a < b
+        return super().__lt__(other)
+
+
 class ServerEditDialog(QDialog):
     """Dialog for adding or editing a server configuration."""
 
@@ -497,7 +509,6 @@ class ServerListWidget(QWidget):
 
     def _on_states_done(self, results):
         self.list_widget.clear()
-        state_map = {name: state for name, state in results}
         for name, state in results:
             conn = self._manager.get_connection(name)
             config = conn.config if conn else None
@@ -507,12 +518,21 @@ class ServerListWidget(QWidget):
             elif state == ConnectionState.ERROR:
                 icon = "✗ "
             type_label = "[SSH]" if config and config.connection_type == ConnectionType.SSH else "[Local]"
-            item = QListWidgetItem(f"{icon}{type_label} {name}")
+            disabled = config is not None and not config.enabled
+            text = f"{icon}{type_label} {name}"
+            if disabled:
+                text += " (disabled)"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, name)  # robust identity; never parse display text
+            if disabled:
+                item.setForeground(Qt.gray)
             self.list_widget.addItem(item)
 
     def _on_selected(self, current, previous):
         if current:
-            self.server_selected.emit(current.text().split("] ")[-1] if "] " in current.text() else current.text().split(" ", 1)[-1])
+            name = current.data(Qt.UserRole)
+            if name:
+                self.server_selected.emit(name)
 
     def _on_add(self):
         if not self._manager:
@@ -531,8 +551,8 @@ class ServerListWidget(QWidget):
         current = self.list_widget.currentItem()
         if not current or not self._manager:
             return
-        name = self._extract_name(current.text())
-        conn = self._manager.get_connection(name)
+        name = current.data(Qt.UserRole)
+        conn = self._manager.get_connection(name) if name else None
         if not conn:
             return
         dialog = ServerEditDialog(self, conn.config)
@@ -547,7 +567,7 @@ class ServerListWidget(QWidget):
         current = self.list_widget.currentItem()
         if not current or not self._manager:
             return
-        name = self._extract_name(current.text())
+        name = current.data(Qt.UserRole)
         reply = QMessageBox.question(
             self, "Remove Server",
             f"Remove server '{name}'?",
@@ -560,14 +580,17 @@ class ServerListWidget(QWidget):
 
     @staticmethod
     def _extract_name(text: str) -> str:
+        """Legacy display-text parsing; kept for backwards compatibility."""
         for prefix in ("● ", "✗ ", "○ "):
             if text.startswith(prefix):
                 text = text[len(prefix):]
                 break
         if text.startswith("[SSH] "):
-            return text[6:]
+            text = text[6:]
         if text.startswith("[Local] "):
-            return text[8:]
+            text = text[8:]
+        if text.endswith(" (disabled)"):
+            text = text[:-11]
         return text
 
 
@@ -731,11 +754,6 @@ class ServerStatusWidget(QWidget):
             self._status_timer = QTimer(self)
             self._status_timer.timeout.connect(self._auto_refresh)
             self._status_timer.start(15000)
-
-    def closeEvent(self, event):
-        if self._status_timer:
-            self._status_timer.stop()
-        event.accept()
 
     def select_server(self, name: str):
         self._selected_server = name
@@ -984,7 +1002,7 @@ class ServerStatusWidget(QWidget):
         self.file_tree.setEnabled(True)
         self.file_tree.clear()
         for entry in sorted(entries, key=lambda e: (not e.is_directory, e.name.lower())):
-            item = QTreeWidgetItem(self.file_tree)
+            item = _FileTreeItem(self.file_tree)
             item.setText(0, ("[DIR] " if entry.is_directory else "") + entry.name)
             if entry.is_directory:
                 item.setText(1, "-")

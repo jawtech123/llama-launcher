@@ -78,9 +78,10 @@ class LocalLogWorker(QThread):
     def run(self):
         self._running = True
         try:
+            import shlex
             import subprocess
             proc = subprocess.Popen(
-                f"tail -f {self._log_path}",
+                f"tail -f {shlex.quote(self._log_path)}",
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,

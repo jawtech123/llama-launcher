@@ -177,17 +177,56 @@ class LocalServerConnection(IServerConnection):
             return False
 
     def get_server_pid(self) -> Optional[int]:
+        """PID of the llama-server process for this connection.
+
+        Resolution order: in-memory stored PID -> PID file (written at start)
+        -> pgrep fallback (status display only; stopping uses tracked PIDs).
+        """
         pid = self._stored_pid
+        if pid and self._pid_alive(pid):
+            return pid
         if pid:
-            try:
-                os.kill(pid, 0)
-                return pid
-            except OSError:
-                self._stored_pid = None
+            self._stored_pid = None
+
+        pid = self._read_pid_file()
+        if pid and self._pid_alive(pid):
+            self._stored_pid = pid
+            return pid
+
         pids = self._find_llama_pids()
         if pids:
             return pids[0]
         return None
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _pid_file_path(self) -> Path:
+        return Path(self._config.working_directory).expanduser() / ".llama_launcher_server.pid"
+
+    def _read_pid_file(self) -> Optional[int]:
+        try:
+            text = self._pid_file_path().read_text().strip()
+            return int(text) if text else None
+        except (OSError, ValueError):
+            return None
+
+    def _write_pid_file(self, pid: int) -> None:
+        try:
+            self._pid_file_path().write_text(f"{pid}\n")
+        except OSError:
+            logger.debug("Could not write PID file", exc_info=True)
+
+    def _remove_pid_file(self) -> None:
+        try:
+            self._pid_file_path().unlink(missing_ok=True)
+        except OSError:
+            logger.debug("Could not remove PID file", exc_info=True)
 
     def _find_llama_pids(self) -> List[int]:
         try:
@@ -281,6 +320,7 @@ class LocalServerConnection(IServerConnection):
             )
             if result.returncode == 0 and result.stdout.strip():
                 self._stored_pid = int(result.stdout.strip())
+                self._write_pid_file(self._stored_pid)
                 return True
             logger.warning("start_server failed (rc=%s): %s", result.returncode, result.stderr.strip())
             return False
@@ -288,20 +328,35 @@ class LocalServerConnection(IServerConnection):
             logger.exception("start_server raised")
             return False
 
+    def _tracked_pid(self) -> Optional[int]:
+        """PID of a process started by the launcher (stored or PID file)."""
+        if self._stored_pid and self._pid_alive(self._stored_pid):
+            return self._stored_pid
+        pid = self._read_pid_file()
+        if pid and self._pid_alive(pid):
+            return pid
+        return None
+
     def stop_server(self) -> bool:
-        pid = self.get_server_pid()
+        # Only ever signal processes we started (stored PID / PID file) --
+        # never a random llama-server found via machine-wide pgrep.
+        pid = self._tracked_pid()
         if not pid:
+            logger.info("stop_server: no tracked llama-server process to stop")
             return True
         try:
             os.kill(pid, signal.SIGTERM)
             self._stored_pid = None
+            self._remove_pid_file()
             return True
         except Exception:
             try:
                 os.kill(pid, signal.SIGKILL)
                 self._stored_pid = None
+                self._remove_pid_file()
                 return True
             except Exception:
+                logger.exception("stop_server failed for pid %s", pid)
                 return False
 
     def restart_server(self, command: str) -> bool:

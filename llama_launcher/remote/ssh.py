@@ -1,8 +1,6 @@
 """SSH Server Connection Implementation."""
-import io
 import logging
 import os
-import re
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -37,8 +35,6 @@ class SSHServerConnection(IServerConnection):
         self._client: Optional[paramiko.SSHClient] = None
         self._sftp = None
         self._stored_pid: Optional[int] = None
-        self._log_channel: Optional[paramiko.Channel] = None
-        self._log_transport: Optional[paramiko.Transport] = None
 
     @property
     def config(self) -> ServerConfig:
@@ -101,7 +97,6 @@ class SSHServerConnection(IServerConnection):
             return False
 
     def disconnect(self) -> None:
-        self._stop_live_log()
         if self._sftp:
             try:
                 self._sftp.close()
@@ -232,6 +227,7 @@ class SSHServerConnection(IServerConnection):
             return False
 
     def get_server_pid(self) -> Optional[int]:
+        """PID of the remote llama-server (stored -> PID file -> pgrep)."""
         pid = self._stored_pid
         if pid:
             try:
@@ -242,6 +238,12 @@ class SSHServerConnection(IServerConnection):
                     return pid
             except Exception:
                 self._stored_pid = None
+
+        pid = self._read_pid_file()
+        if pid and self._remote_pid_alive(pid):
+            self._stored_pid = pid
+            return pid
+
         try:
             output = self.execute_and_capture(
                 "pgrep -f 'llama-server'"
@@ -253,6 +255,38 @@ class SSHServerConnection(IServerConnection):
         except Exception:
             logger.debug("Suppressed exception", exc_info=True)
         return None
+
+    def _remote_pid_alive(self, pid: int) -> bool:
+        try:
+            result = self.execute_and_capture(
+                f"kill -0 {pid} 2>/dev/null && echo alive"
+            )
+            return "alive" in result
+        except Exception:
+            return False
+
+    def _pid_file_path(self) -> str:
+        return f"{self._config.working_directory}/.llama_launcher_server.pid"
+
+    def _read_pid_file(self) -> Optional[int]:
+        try:
+            out = self.execute_and_capture(f"cat {self._pid_file_path()} 2>/dev/null")
+            text = out.strip()
+            return int(text) if text else None
+        except Exception:
+            return None
+
+    def _write_pid_file(self, pid: int) -> None:
+        try:
+            self.execute(f"echo {pid} > {self._pid_file_path()}")
+        except Exception:
+            logger.debug("Could not write remote PID file", exc_info=True)
+
+    def _remove_pid_file(self) -> None:
+        try:
+            self.execute(f"rm -f {self._pid_file_path()}")
+        except Exception:
+            logger.debug("Could not remove remote PID file", exc_info=True)
 
     def get_status(self) -> ServerStatus:
         pid = self.get_server_pid()
@@ -316,23 +350,33 @@ class SSHServerConnection(IServerConnection):
             output = self.execute_and_capture(start_cmd)
             if output.strip():
                 self._stored_pid = int(output.strip())
+                self._write_pid_file(self._stored_pid)
                 return True
             return False
         except Exception:
             return False
 
     def stop_server(self) -> bool:
-        pid = self.get_server_pid()
+        # Only signal processes started by the launcher (tracked PID) --
+        # never a random llama-server found via machine-wide pgrep.
+        pid = self._stored_pid if self._stored_pid and self._remote_pid_alive(self._stored_pid) else None
+        if pid is None:
+            pid = self._read_pid_file()
+            if pid and not self._remote_pid_alive(pid):
+                pid = None
         if not pid:
+            logger.info("stop_server: no tracked llama-server process to stop")
             return True
         try:
             self.execute(f"kill {pid}")
             time.sleep(0.5)
-            if self.get_server_pid() == pid:
+            if self._remote_pid_alive(pid):
                 self.execute(f"kill -9 {pid}")
             self._stored_pid = None
+            self._remove_pid_file()
             return True
         except Exception:
+            logger.exception("stop_server failed for remote pid %s", pid)
             return False
 
     def restart_server(self, command: str) -> bool:
@@ -346,81 +390,6 @@ class SSHServerConnection(IServerConnection):
             return self.execute_and_capture(f"tail -n {lines} {log_path}")
         except Exception:
             return ""
-
-    def _stop_live_log(self) -> None:
-        if self._log_channel:
-            try:
-                self._log_channel.close()
-            except Exception:
-                logger.debug("Suppressed exception", exc_info=True)
-            self._log_channel = None
-        if self._log_transport:
-            try:
-                self._log_transport.close()
-            except Exception:
-                logger.debug("Suppressed exception", exc_info=True)
-            self._log_transport = None
-
-    def start_live_log(self, callback) -> bool:
-        """Start streaming the log file to a callback.
-
-        Args:
-            callback: Function called with each new line of output.
-        """
-        self._stop_live_log()
-
-        if paramiko is None:
-            return False
-
-        log_path = f"{self._config.working_directory}/{self._config.log_file}"
-        tail_cmd = f"tail -f {log_path}"
-
-        try:
-            self._log_transport = paramiko.Transport(
-                (self._config.hostname, self._config.port)
-            )
-
-            connect_kwargs = {
-                "username": self._config.username,
-            }
-            if self._config.auth_method == AuthMethod.SSH_KEY:
-                if self._config.private_key_path:
-                    key = paramiko.RSAKey.from_private_key_file(
-                        str(Path(self._config.private_key_path).expanduser())
-                    )
-                    connect_kwargs["pkey"] = key
-            if self._config.password:
-                connect_kwargs["password"] = self._config.password
-
-            self._log_transport.connect(**connect_kwargs)
-            self._log_channel = self._log_transport.open_session()
-            self._log_channel.get_pty()
-            self._log_channel.exec_command(tail_cmd)
-
-            def _reader():
-                try:
-                    while self._log_channel and self._log_channel.recv_exit_status() == -1:
-                        if self._log_channel.recv_ready():
-                            line = self._log_channel.recv(4096).decode(
-                                "utf-8", errors="ignore"
-                            )
-                            if line:
-                                callback(line)
-                        time.sleep(0.1)
-                except Exception:
-                    logger.debug("Suppressed exception", exc_info=True)
-
-            import threading
-            self._log_thread = threading.Thread(target=_reader, daemon=True)
-            self._log_thread.start()
-            return True
-
-        except Exception:
-            self._stop_live_log()
-            return False
-
-    def stop_live_log(self) -> None:
-        self._stop_live_log()
 
     def scan_model_directory(self, directory: str) -> List[ModelInfo]:
         exts = ["*.gguf", "*.bin", "*.safetensors"]

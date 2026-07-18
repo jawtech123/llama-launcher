@@ -52,10 +52,14 @@ class ServerManager:
         return self._connections[name]
 
     def load_saved_servers(self) -> List[str]:
-        """Load all saved server configs and return their names."""
+        """Load all saved server configs and return their names.
+
+        Disabled servers are included (greyed in the UI) so they can be
+        edited/re-enabled; they simply show as disconnected.
+        """
         configs = load_servers()
         for config in configs:
-            if config.friendly_name and config.enabled:
+            if config.friendly_name:
                 if config.friendly_name not in self._connections:
                     self.add_server(config, persist=False)
         return list(self._connections.keys())

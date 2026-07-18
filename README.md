@@ -74,17 +74,38 @@ Legacy `~/.llama_launcher_*.json` files are migrated automatically on first run.
 
 ```
 llama_launcher/
-├── core/          # LlamaConfig schema, validator, command builder, command parser, presets
+├── core/
+│   ├── fields.py     # ★ declarative registry for all ~150 llama-server parameters
+│   ├── config.py     # LlamaConfig schema + legacy preset migration
+│   ├── builder.py    # registry-driven command builder (shell-quoted)
+│   ├── parser.py     # registry-driven command importer
+│   ├── validator.py  # registry-driven validation
+│   └── presets.py    # preset storage (built-in + custom)
+├── gui/
+│   ├── main_window.py       # thin shell: wiring + orchestration
+│   ├── config_controller.py # live widget <-> config binding
+│   ├── theme.py             # enforced dark theme
+│   ├── widgets.py           # shared widgets (BinaryContextSpinBox, info labels)
+│   ├── workers.py           # background QThread workers
+│   ├── tabs/                # basic, advanced, gpu, models, preview, import tabs
+│   ├── dialogs/             # preset manager dialog
+│   ├── advanced_tab.py      # registry-generated advanced editor
+│   ├── server_management.py # local/SSH server management
+│   └── resource_usage_panel.py
 ├── gpu/           # GPU auto-detection (CUDA, Metal, Vulkan)
-├── estimator/     # GGUF metadata reader + VRAM/RAM estimation
+├── estimator/     # GGUF metadata reader (cached) + VRAM/RAM estimation
 ├── models/        # Model filesystem scanner + per-server scan cache
 ├── remote/        # ServerManager: local (subprocess) and SSH (paramiko) connections
-├── gui/           # PySide6 main window, server management, resource usage panel
 ├── cli/           # CLI entry point
 ├── utils/         # Config dir management, logging setup, helpers
 ├── app.py         # GUI bootstrap
 └── __main__.py    # python -m llama_launcher
 ```
+
+The **field registry** (`core/fields.py`) is the single source of truth: the
+command builder, command parser, validator, advanced-tab editor generation,
+and widget bindings are all driven by it. Adding a parameter means adding one
+`Field` entry.
 
 Retired subsystems (benchmarks, quant recommender, VRAM optimizer, legacy profiles)
 are preserved under `_attic/` and are not part of the package.
@@ -92,9 +113,11 @@ are preserved under `_attic/` and are not part of the package.
 ## Configuration Flow
 
 ```
-UI → LlamaConfig → Validator → Builder → Command
+UI ⇄ ConfigController ⇄ LlamaConfig ⇄ Validator ⇄ Builder ⇄ Command
 Command → Parser → LlamaConfig (import)
 ```
 
 All commands are generated via `build_command(config: LlamaConfig) -> str` and
 parsed via `parse_launch_command(command: str) -> (params, unrecognized)`.
+The GUI never blocks on I/O: scanning, GPU detection, estimation, and all
+SSH/SFTP operations run in background workers.
