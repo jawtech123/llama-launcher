@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QObject
 from PySide6.QtGui import QColor, QPalette, QFont
 
 from llama_launcher.estimator.types import ResourceEstimate
+from llama_launcher.gui import theme
 
 
 class _AnimatedValue(QObject):
@@ -104,7 +105,7 @@ class _ResourceRow(QWidget):
         self._label_widget = QLabel(label)
         self._label_widget.setFixedWidth(85)
         self._label_widget.setToolTip(tooltip)
-        self._label_widget.setStyleSheet("font-weight: bold; color: #ccc; font-size: 11px;")
+        self._label_widget.setStyleSheet(f"font-weight: bold; color: {theme.FG_TEXT}; font-size: 11px;")
         layout.addWidget(self._label_widget)
 
         self._bar = _ProgressBar()
@@ -116,7 +117,7 @@ class _ResourceRow(QWidget):
         self._value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._value_label.setMinimumWidth(120)
         self._value_label.setToolTip(tooltip)
-        self._value_label.setStyleSheet("color: #fff; font-family: monospace; font-size: 11px;")
+        self._value_label.setStyleSheet(theme.monospace_style(theme.FG_TEXT, 11))
         layout.addWidget(self._value_label)
 
         self._timer = QTimer(self)
@@ -178,11 +179,11 @@ class _ModelInfoPanel(QWidget):
             cl.setSpacing(2)
 
             lbl = QLabel(f"{label}:")
-            lbl.setStyleSheet("color: #777; font-size: 9px;")
+            lbl.setStyleSheet(f"color: {theme.FG_MUTED}; font-size: 9px;")
             cl.addWidget(lbl)
 
             val = QLabel("--")
-            val.setStyleSheet("color: #bbb; font-family: monospace; font-size: 9px;")
+            val.setStyleSheet(theme.monospace_style(theme.FG_DIM, 9))
             cl.addWidget(val)
             self._labels[key] = val
 
@@ -234,7 +235,7 @@ class ResourceUsagePanel(QWidget):
         self._estimate: Optional[ResourceEstimate] = None
         self._build_ui()
         self.setStyleSheet(
-            "ResourceUsagePanel { background-color: #1e1e1e; border-top: 1px solid #444; }"
+            f"ResourceUsagePanel {{ background-color: {theme.BG_BASE}; border-top: 1px solid {theme.BORDER}; }}"
         )
 
     def _build_ui(self):
@@ -248,7 +249,7 @@ class ResourceUsagePanel(QWidget):
 
         header = QLabel("Resource Usage")
         header.setFont(QFont("sans-serif", 9, QFont.Weight.Bold))
-        header.setStyleSheet("color: #999;")
+        header.setStyleSheet(f"color: {theme.FG_DIM};")
         header_layout.addWidget(header)
 
         header_layout.addStretch()
@@ -289,7 +290,7 @@ class ResourceUsagePanel(QWidget):
         detail_layout.setContentsMargins(8, 0, 4, 0)
 
         self._kv_label = QLabel("KV Cache: --")
-        self._kv_label.setStyleSheet("color: #bbb; font-family: monospace; font-size: 10px;")
+        self._kv_label.setStyleSheet(theme.monospace_style(theme.FG_DIM, 10))
         self._kv_label.setToolTip(
             "KV Cache size = layers * n_kv_heads * head_size * ctx_size * parallel * (type_k + type_v)\n"
             "Depends on context size, parallel streams, cache type, and model architecture."
@@ -297,32 +298,32 @@ class ResourceUsagePanel(QWidget):
         detail_layout.addWidget(self._kv_label)
 
         self._model_label = QLabel("Model: --")
-        self._model_label.setStyleSheet("color: #bbb; font-family: monospace; font-size: 10px;")
+        self._model_label.setStyleSheet(theme.monospace_style(theme.FG_DIM, 10))
         self._model_label.setToolTip("Total model weights size (from GGUF tensor info or file size).")
         detail_layout.addWidget(self._model_label)
 
         self._cpu_label = QLabel("CPU: --")
-        self._cpu_label.setStyleSheet("color: #bbb; font-family: monospace; font-size: 10px;")
+        self._cpu_label.setStyleSheet(theme.monospace_style(theme.FG_DIM, 10))
         self._cpu_label.setToolTip("Estimated CPU memory for offloaded layers and CPU-side buffers.")
         detail_layout.addWidget(self._cpu_label)
 
         self._gpu_label = QLabel("GPU: --")
-        self._gpu_label.setStyleSheet("color: #bbb; font-family: monospace; font-size: 10px;")
+        self._gpu_label.setStyleSheet(theme.monospace_style(theme.FG_DIM, 10))
         self._gpu_label.setToolTip("Estimated GPU memory for offloaded layers and GPU-side buffers.")
         detail_layout.addWidget(self._gpu_label)
 
         self._remaining_label = QLabel("Remaining: --")
-        self._remaining_label.setStyleSheet("color: #888; font-family: monospace; font-size: 10px;")
+        self._remaining_label.setStyleSheet(theme.monospace_style(theme.FG_MUTED, 10))
         self._remaining_label.setToolTip("Estimated VRAM remaining after loading this configuration.")
         detail_layout.addWidget(self._remaining_label)
 
         self._compute_label = QLabel("Buffers: --")
-        self._compute_label.setStyleSheet("color: #888; font-family: monospace; font-size: 10px;")
+        self._compute_label.setStyleSheet(theme.monospace_style(theme.FG_MUTED, 10))
         self._compute_label.setToolTip("Compute buffers for inference (activations, attention workspace).")
         detail_layout.addWidget(self._compute_label)
 
         self._native_ctx_label = QLabel("Native Ctx: --")
-        self._native_ctx_label.setStyleSheet("color: #888; font-family: monospace; font-size: 10px;")
+        self._native_ctx_label.setStyleSheet(theme.monospace_style(theme.FG_MUTED, 10))
         self._native_ctx_label.setToolTip("Model's native training context length from GGUF metadata.")
         detail_layout.addWidget(self._native_ctx_label)
 
@@ -333,8 +334,8 @@ class ResourceUsagePanel(QWidget):
         self._warning_label = QLabel("")
         self._warning_label.setWordWrap(True)
         self._warning_label.setStyleSheet(
-            "color: #ff9800; font-size: 10px; padding: 3px; "
-            "background-color: #3e2723; border-radius: 4px;"
+            f"color: {theme.WARNING}; font-size: 10px; padding: 3px; "
+            f"background-color: {theme.WARNING_BG}; border-radius: 4px;"
         )
         self._warning_label.setVisible(False)
         layout.addWidget(self._warning_label)
@@ -354,7 +355,7 @@ class ResourceUsagePanel(QWidget):
             self._compute_label.setText("Buffers: --")
             self._native_ctx_label.setText("Native Ctx: --")
             self._remaining_label.setStyleSheet(
-                "color: #888; font-family: monospace; font-size: 10px;"
+                theme.monospace_style(theme.FG_MUTED, 10)
             )
             self._warning_label.setVisible(False)
             return
@@ -417,17 +418,17 @@ class ResourceUsagePanel(QWidget):
             if remaining < 0:
                 self._remaining_label.setText(f"Remaining: {remaining_gb:.1f} GB (OVER)")
                 self._remaining_label.setStyleSheet(
-                    "color: #f44336; font-family: monospace; font-size: 10px; font-weight: bold;"
+                    theme.monospace_style(theme.ERROR, 10) + " font-weight: bold;"
                 )
             else:
                 self._remaining_label.setText(f"Remaining: {remaining_gb:.1f} GB")
                 self._remaining_label.setStyleSheet(
-                    "color: #4caf50; font-family: monospace; font-size: 10px;"
+                    theme.monospace_style(theme.SUCCESS, 10)
                 )
         else:
             self._remaining_label.setText("Remaining: N/A")
             self._remaining_label.setStyleSheet(
-                "color: #888; font-family: monospace; font-size: 10px;"
+                theme.monospace_style(theme.FG_MUTED, 10)
             )
 
         # Warnings
@@ -437,13 +438,13 @@ class ResourceUsagePanel(QWidget):
             self._warning_label.setVisible(True)
             if estimate.vram_exceeded:
                 self._warning_label.setStyleSheet(
-                    "color: #f44336; font-size: 10px; padding: 3px; "
-                    "background-color: #3e1010; border-radius: 4px;"
+                    f"color: {theme.ERROR}; font-size: 10px; padding: 3px; "
+                    f"background-color: {theme.ERROR_BG}; border-radius: 4px;"
                 )
             else:
                 self._warning_label.setStyleSheet(
-                    "color: #ff9800; font-size: 10px; padding: 3px; "
-                    "background-color: #3e2723; border-radius: 4px;"
+                    f"color: {theme.WARNING}; font-size: 10px; padding: 3px; "
+                    f"background-color: {theme.WARNING_BG}; border-radius: 4px;"
                 )
         else:
             self._warning_label.setVisible(False)
@@ -464,10 +465,10 @@ class ResourceUsagePanel(QWidget):
         if ctx_length > 0:
             self._native_ctx_label.setText(f"Native Ctx: {self._fmt_ctx(ctx_length)}")
             self._native_ctx_label.setStyleSheet(
-                "color: #4caf50; font-family: monospace; font-size: 10px;"
+                theme.monospace_style(theme.SUCCESS, 10)
             )
         else:
             self._native_ctx_label.setText("Native Ctx: unknown")
             self._native_ctx_label.setStyleSheet(
-                "color: #888; font-family: monospace; font-size: 10px;"
+                theme.monospace_style(theme.FG_MUTED, 10)
             )

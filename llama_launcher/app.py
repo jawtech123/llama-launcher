@@ -17,10 +17,12 @@ def run() -> int:
         return 1
 
     from llama_launcher.gui.main_window import LlamaLauncherGUI
+    from llama_launcher.gui.theme import apply_dark_theme
 
     app = QApplication(sys.argv)
     app.setApplicationName("llama-launcher")
     app.setOrganizationName("llama-launcher")
+    apply_dark_theme(app)
 
     window = LlamaLauncherGUI()
     window.show()
