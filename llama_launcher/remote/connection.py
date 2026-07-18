@@ -111,6 +111,14 @@ class IServerConnection(ABC):
         """Return the PID of the running llama-server process, or None."""
 
     @abstractmethod
+    def tracked_pid_alive(self) -> bool:
+        """True if a launcher-started process (stored/PID-file) is still alive.
+
+        Unlike get_server_pid, this never falls back to system-wide pgrep,
+        so it can't be fooled by unrelated llama-server instances.
+        """
+
+    @abstractmethod
     def scan_model_directory(self, directory: str) -> List[ModelInfo]:
         """Scan a directory on the target host for model files.
 

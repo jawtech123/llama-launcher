@@ -889,10 +889,29 @@ class ServerStatusWidget(QWidget):
 
     def _on_start_done(self, result):
         self.start_btn.setEnabled(True)
-        if result:
-            QMessageBox.information(self, "Started", "Server started.")
-        else:
+        if not result:
             QMessageBox.warning(self, "Failed", "Could not start server.")
+            self._refresh_status()
+            return
+        # Don't declare victory yet: verify the process survives startup
+        # (bad model path/args kill llama-server within the first second).
+        self.state_label.setText("Starting...")
+        QTimer.singleShot(2500, self._verify_started)
+
+    def _verify_started(self):
+        """Confirm the launched process is alive; show the log if it died."""
+        if not self._selected_server:
+            return
+        if self._manager.tracked_pid_alive(self._selected_server):
+            self._refresh_status()
+            return
+        log = (self._manager.tail_log(self._selected_server, 40) or "").strip()
+        detail = log[-1500:] if log else "(no log output)"
+        QMessageBox.warning(
+            self, "Server Failed to Start",
+            f"llama-server exited right after launch on '{self._selected_server}'.\n\n"
+            f"Log output:\n{detail}",
+        )
         self._refresh_status()
 
     def _on_stop(self):

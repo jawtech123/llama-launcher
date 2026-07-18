@@ -404,6 +404,10 @@ class SSHServerConnection(IServerConnection):
             logger.exception("start_server failed")
             return False
 
+    def tracked_pid_alive(self) -> bool:
+        pid = self._stored_pid or self._read_pid_file()
+        return bool(pid) and self._remote_pid_alive(pid)
+
     def stop_server(self) -> bool:
         # Only signal processes started by the launcher (tracked PID) --
         # never a random llama-server found via machine-wide pgrep.

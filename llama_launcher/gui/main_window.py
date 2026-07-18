@@ -128,6 +128,13 @@ class LlamaLauncherGUI(QMainWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(4, 4, 4, 4)
 
+        # Menu bar with a guaranteed way out (Ctrl+Q), independent of
+        # window-manager decorations.
+        file_menu = self.menuBar().addMenu("&File")
+        exit_action = file_menu.addAction("E&xit")
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+
         self.tab_widget = QTabWidget()
 
         # Vertical splitter: tabs on top, resizable resource panel at bottom
@@ -245,6 +252,8 @@ class LlamaLauncherGUI(QMainWindow):
         """Persist state, then clean up timers, workers, and connections."""
         self._closing = True
         self._save_state()
+        # Stop a locally launched llama-server first so it can't hold us open.
+        self.stop_server()
         for timer_name in ("_preset_style_timer", "_gpu_stats_timer"):
             timer = getattr(self, timer_name, None)
             if timer is not None:
@@ -690,9 +699,9 @@ class LlamaLauncherGUI(QMainWindow):
                 )
             self.preview_tab.set_running(True)
         except Exception as e:
+            # Non-modal: show in the log pane so nothing can trap the window.
             logger.exception("Launch failed")
             self.preview_tab.append_log(f"\nLaunch Error: {e}\n")
-            QMessageBox.warning(self, "Launch Failed", str(e))
 
     def on_server_error(self, error):
         """Surface QProcess errors (e.g. binary not found) in the log."""

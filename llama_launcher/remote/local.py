@@ -345,6 +345,9 @@ class LocalServerConnection(IServerConnection):
             return pid
         return None
 
+    def tracked_pid_alive(self) -> bool:
+        return self._tracked_pid() is not None
+
     def stop_server(self) -> bool:
         # Only ever signal processes we started (stored PID / PID file) --
         # never a random llama-server found via machine-wide pgrep.

@@ -2,6 +2,7 @@
 import logging
 
 from PySide6.QtCore import Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication, QGroupBox, QHBoxLayout, QLabel, QPushButton, QTextEdit,
     QVBoxLayout, QWidget,
@@ -87,7 +88,9 @@ class PreviewTab(QWidget):
         self.log_text.clear()
 
     def append_log(self, text: str):
-        self.log_text.moveCursor(self.log_text.textCursor().End)
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.log_text.setTextCursor(cursor)
         self.log_text.insertPlainText(text)
         scrollbar = self.log_text.verticalScrollBar()
         if scrollbar:

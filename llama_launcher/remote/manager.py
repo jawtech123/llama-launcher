@@ -177,6 +177,13 @@ class ServerManager:
             return None
         return conn.get_server_pid()
 
+    def tracked_pid_alive(self, friendly_name: str) -> bool:
+        """True if the launcher-started process for this server is alive."""
+        conn = self._connections.get(friendly_name)
+        if not conn:
+            return False
+        return conn.tracked_pid_alive()
+
     def get_all_names(self) -> List[str]:
         return list(self._connections.keys())
 

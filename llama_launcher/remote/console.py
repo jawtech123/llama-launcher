@@ -21,7 +21,7 @@ class LogStreamWorker(QThread):
     def run(self):
         self._running = True
         log_path = f"{self._connection.config.working_directory}/{self._connection.config.log_file}"
-        tail_cmd = f"tail -f {log_path}"
+        tail_cmd = f"tail -f {log_path} 2>&1"
 
         try:
             if hasattr(self._connection, 'execute_and_capture'):
@@ -81,10 +81,10 @@ class LocalLogWorker(QThread):
             import shlex
             import subprocess
             proc = subprocess.Popen(
-                f"tail -f {shlex.quote(self._log_path)}",
+                f"tail -f {shlex.quote(self._log_path)} 2>&1",
                 shell=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
             )
             while self._running:
