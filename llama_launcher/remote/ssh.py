@@ -52,9 +52,16 @@ class SSHServerConnection(IServerConnection):
         return self._client
 
     def _get_sftp(self):
-        if self._sftp is None or self._sftp.closed:
-            client = self._get_client()
-            self._sftp = client.open_sftp()
+        """Return a live SFTP client, recreating it if the channel died."""
+        if self._sftp is not None:
+            try:
+                chan = self._sftp.get_channel()
+                if chan is None or chan.closed:
+                    self._sftp = None
+            except Exception:
+                self._sftp = None
+        if self._sftp is None:
+            self._sftp = self._get_client().open_sftp()
         return self._sftp
 
     def connect(self) -> bool:
@@ -198,6 +205,12 @@ class SSHServerConnection(IServerConnection):
     def create_directory(self, remote_path: str) -> bool:
         try:
             sftp = self._get_sftp()
+            try:
+                # Idempotent: already-existing directory is success.
+                if sftp.stat(remote_path).st_mode & 0o40000:
+                    return True
+            except FileNotFoundError:
+                pass
             parent = str(Path(remote_path).parent)
             try:
                 sftp.stat(parent)
@@ -206,6 +219,7 @@ class SSHServerConnection(IServerConnection):
             sftp.mkdir(remote_path, 0o755)
             return True
         except Exception:
+            logger.debug("create_directory failed", exc_info=True)
             return False
 
     def delete_file(self, remote_path: str) -> bool:
@@ -245,8 +259,10 @@ class SSHServerConnection(IServerConnection):
             return pid
 
         try:
+            # -x: exact process name only; -f would match any cmdline
+            # containing "llama-server" (shells, editors, pgrep itself).
             output = self.execute_and_capture(
-                "pgrep -f 'llama-server'"
+                "pgrep -x llama-server"
             )
             if output.strip():
                 pids = [int(p.strip()) for p in output.strip().split("\n")]
@@ -339,21 +355,52 @@ class SSHServerConnection(IServerConnection):
 
         return status
 
+    def _exec_quick(self, command: str, timeout: float = 8.0) -> str:
+        """Execute a command and return stdout without waiting for channel EOF.
+
+        ``execute_and_capture`` waits for EOF, which hangs when a backgrounded
+        child (e.g. nohup'd llama-server) inherits channel descriptors. This
+        waits only for the remote shell to exit, then drains and closes.
+        """
+        client = self._get_client()
+        chan = client.get_transport().open_session()
+        try:
+            chan.exec_command(command)
+            end = time.time() + timeout
+            data = b""
+            while time.time() < end:
+                if chan.recv_ready():
+                    data += chan.recv(4096)
+                    continue
+                if chan.exit_status_ready():
+                    break
+                time.sleep(0.05)
+            while chan.recv_ready():
+                data += chan.recv(4096)
+            return data.decode("utf-8", errors="ignore")
+        finally:
+            chan.close()
+
     def start_server(self, command: str) -> bool:
         log_path = f"{self._config.working_directory}/{self._config.log_file}"
+        # < /dev/null detaches the child from the SSH channel's stdin so the
+        # channel can close immediately (otherwise stdout.read() hangs until
+        # the timeout waiting for channel EOF).
         start_cmd = (
             f"cd {self._config.working_directory} && "
-            f"nohup {command} > {log_path} 2>&1 & echo $!"
+            f"nohup {command} > {log_path} 2>&1 < /dev/null & echo $!"
         )
 
         try:
-            output = self.execute_and_capture(start_cmd)
+            output = self._exec_quick(start_cmd)
             if output.strip():
                 self._stored_pid = int(output.strip())
                 self._write_pid_file(self._stored_pid)
                 return True
+            logger.warning("start_server: no PID returned for: %s", command[:80])
             return False
         except Exception:
+            logger.exception("start_server failed")
             return False
 
     def stop_server(self) -> bool:

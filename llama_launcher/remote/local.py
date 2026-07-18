@@ -230,8 +230,10 @@ class LocalServerConnection(IServerConnection):
 
     def _find_llama_pids(self) -> List[int]:
         try:
+            # -x: exact process name only; -f would match any cmdline
+            # containing "llama-server" (shells, editors, this tool).
             result = subprocess.run(
-                "pgrep -f 'llama-server'",
+                "pgrep -x llama-server",
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -307,7 +309,9 @@ class LocalServerConnection(IServerConnection):
 
     def start_server(self, command: str) -> bool:
         log_path = str(Path(self._config.working_directory).expanduser() / self._config.log_file)
-        start_cmd = f"nohup {command} > {shlex.quote(log_path)} 2>&1 & echo $!"
+        # < /dev/null detaches the child so subprocess.run sees pipe EOF
+        # immediately instead of waiting for the background process.
+        start_cmd = f"nohup {command} > {shlex.quote(log_path)} 2>&1 < /dev/null & echo $!"
 
         try:
             result = subprocess.run(
