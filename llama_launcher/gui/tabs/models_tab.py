@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
+from llama_launcher.gui.server_bar import ServerBar
 from llama_launcher.models.types import ModelInfo
 from llama_launcher.utils.paths import config_file
 
@@ -30,15 +31,10 @@ class ModelsTab(QWidget):
         layout = QVBoxLayout(self)
 
         # Server selector
-        server_row = QHBoxLayout()
-        server_row.addWidget(QLabel("Server:"))
-        self.browser_server_combo = QComboBox()
-        self.browser_server_combo.setMinimumWidth(140)
-        self.browser_server_combo.currentTextChanged.connect(
-            self.browser_server_changed.emit)
-        server_row.addWidget(self.browser_server_combo, 1)
-        server_row.addStretch()
-        layout.addLayout(server_row)
+        self.server_bar = ServerBar()
+        self.browser_server_combo = self.server_bar.combo
+        self.server_bar.server_changed.connect(self.browser_server_changed.emit)
+        layout.addWidget(self.server_bar)
 
         # Source folders
         folders_group = QGroupBox("Source Folders")
@@ -133,6 +129,17 @@ class ModelsTab(QWidget):
         """Toggle busy UI while a scan is running."""
         self.scan_btn.setEnabled(not scanning)
         self.busy_bar.setVisible(scanning)
+
+    def show_placeholder(self, message: str):
+        """Replace the list with an explanatory, non-selectable line.
+
+        Used when there is nothing to scan, so the browser never keeps showing
+        another server's models.
+        """
+        self.model_list.clear()
+        item = QListWidgetItem(message)
+        item.setFlags(Qt.NoItemFlags)
+        self.model_list.addItem(item)
 
     def populate(self, models: list):
         """Fill the model list from scan results (ModelInfo objects)."""

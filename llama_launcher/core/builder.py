@@ -52,7 +52,7 @@ def build_command(config: LlamaConfig) -> str:
             if value and value != field.default:
                 args.extend([field.flag, shlex.quote(str(value))])
 
-    # User-provided raw fragments, appended verbatim.
+    # User-provided raw fragments, appended verbatim (already quoted by user).
     for extra in config.extra_flags:
         args.append(str(extra))
 

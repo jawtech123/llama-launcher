@@ -63,6 +63,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
     if args.model:
         config.model_path = args.model
 
+    if args.extra_flags:
+        config.extra_flags.extend(args.extra_flags)
+
     try:
         validate_config(config)
         cmd = build_command(config)
@@ -72,6 +75,9 @@ def cmd_launch(args: argparse.Namespace) -> int:
 
     print("Launch Command:")
     print(cmd)
+
+    if config.extra_flags:
+        print(f"\nExtra flags: {', '.join(config.extra_flags)}")
 
     if not args.dry_run:
         try:
@@ -109,6 +115,7 @@ def main() -> None:
     launch_parser.add_argument("--kv-cache", default="f16")
     launch_parser.add_argument("--batch", type=int, default=2048)
     launch_parser.add_argument("--dry-run", action="store_true", help="Only show command")
+    launch_parser.add_argument("--extra-flags", nargs="+", default=[], help="Extra flags to append to command")
     launch_parser.set_defaults(func=cmd_launch)
 
     args = parser.parse_args()

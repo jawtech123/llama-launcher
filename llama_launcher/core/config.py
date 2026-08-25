@@ -231,9 +231,6 @@ class LlamaConfig:
     backend: str = "auto"
     jinja: bool = False
 
-    # Target server for remote execution
-    target_server: Optional[str] = None
-
     # Metadata for presets/profiles
     name: Optional[str] = None
     description: Optional[str] = None
@@ -265,12 +262,11 @@ def migrate_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     defaults = {f.name: f.default for f in dataclasses.fields(LlamaConfig)}
 
     # Old preset files often contain BOTH the legacy and the new key. Prefer
-    # the new key's value when it was explicitly set; otherwise take legacy.
+    # the new key's value when it exists; otherwise take legacy.
     for old, new in _RENAMED_KEYS.items():
-        if old in migrated:
+        if old in migrated and new not in migrated:
             old_val = migrated.pop(old)
-            new_val = migrated.get(new)
-            if old_val not in (None, "") and (new_val in (None, "") or new_val == defaults.get(new)):
+            if old_val not in (None, ""):
                 migrated[new] = old_val
 
     # kv_cache_type (legacy single combo) maps to both K and V cache types

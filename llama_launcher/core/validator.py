@@ -21,6 +21,12 @@ def validate_config(config: LlamaConfig) -> None:
     if not config.model_path or not isinstance(config.model_path, str):
         raise ValidationError("model_path must be a non-empty string")
 
+    valid_extensions = (".gguf", ".bin", ".safetensors")
+    if not config.model_path.lower().endswith(valid_extensions):
+        raise ValidationError(
+            f"model_path must end with one of {valid_extensions}, got: {config.model_path}"
+        )
+
     if not isinstance(config.host, str) or not config.host:
         raise ValidationError("host must be a non-empty string")
 

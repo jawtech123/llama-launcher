@@ -7,6 +7,7 @@ Legacy ``~/.llama_launcher_*.json`` files are migrated automatically on first us
 import logging
 import os
 import shutil
+import tempfile
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,27 @@ def config_dir(create: bool = True) -> Path:
 def config_file(name: str) -> Path:
     """Return the path of a named file inside the config directory."""
     return config_dir() / name
+
+
+def ssh_control_dir() -> Path:
+    """Return the private directory for SSH control sockets and helper scripts.
+
+    Deliberately *not* under the config directory. A ``ControlPath`` is a unix
+    socket, capped near 104 bytes, and ssh expands ``%C`` to 64 hex characters --
+    a config path under a long home directory silently blows the limit and breaks
+    every ssh invocation. The runtime directory is short and is the correct home
+    for ephemeral sockets; ``/tmp`` is the fallback when it is unset.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(runtime) if runtime else Path(tempfile.gettempdir())
+    suffix = APP_DIR_NAME if runtime else f"{APP_DIR_NAME}-{os.getuid()}"
+    path = base / suffix / "ssh"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        logger.warning("Could not set permissions 700 on %s", path)
+    return path
 
 
 def secure_file(path: Path) -> None:

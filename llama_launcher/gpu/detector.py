@@ -1,5 +1,6 @@
 """GPU Auto-Detection Module."""
 import logging
+from dataclasses import dataclass
 import subprocess
 import sys
 import re
@@ -34,74 +35,90 @@ def detect_gpu() -> GPUInfo:
     return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0, device_name="CPU", supported=True)
 
 
+#: The nvidia-smi query whose output parse_nvidia_smi_gpus() understands. Shared
+#: so the local and remote detectors ask the same question.
+NVIDIA_SMI_QUERY = [
+    'nvidia-smi', '--query-gpu=name,memory.total,memory.free,driver_version',
+    '--format=csv,noheader',
+]
+
+
+def parse_nvidia_smi_gpus(csv_text: str) -> Optional[GPUInfo]:
+    """Parse ``NVIDIA_SMI_QUERY`` output into an aggregate GPUInfo.
+
+    Pure text in, GPUInfo out: the same output parses identically whether it came
+    from this machine or from a remote host over SSH. Returns None when there is
+    nothing usable -- including nvidia-smi's error text, which it prints on
+    stdout on a driver/library mismatch.
+    """
+    text = (csv_text or "").strip()
+    if not text:
+        return None
+
+    gpu_infos = []
+    total_vram = 0
+    total_available = 0
+
+    for i, line in enumerate(text.split('\n')):
+        parts = [p.strip() for p in line.split(',')]
+        # An error line ("Failed to initialize NVML: ...") has no comma-separated
+        # memory figures; skip anything that does not look like a GPU row.
+        if len(parts) < 2:
+            continue
+
+        device_name = parts[0] or f"NVIDIA GPU {i}"
+        vram_mb = 0
+        available_vram_mb = 0
+        driver_version = None
+
+        try:
+            vram_mb = int(parts[1].replace('MiB', '').strip())
+        except ValueError:
+            continue        # not a GPU row after all
+
+        if len(parts) >= 3:
+            try:
+                available_vram_mb = int(parts[2].replace('MiB', '').strip())
+            except ValueError:
+                logger.debug("Unparseable free memory in %r", line)
+
+        if len(parts) >= 4:
+            driver_version = parts[3].strip()
+
+        gpu_infos.append(GPUInfo(
+            backend="cuda",
+            vram_mb=vram_mb,
+            available_vram_mb=available_vram_mb,
+            device_name=device_name,
+            driver_version=driver_version,
+            supported=True,
+        ))
+        total_vram += vram_mb
+        total_available += available_vram_mb
+
+    if not gpu_infos:
+        return None
+
+    first_gpu = gpu_infos[0]
+    return GPUInfo(
+        backend="cuda",
+        vram_mb=total_vram,
+        available_vram_mb=total_available,
+        device_name=first_gpu.device_name,
+        driver_version=first_gpu.driver_version,
+        supported=True,
+        gpu_count=len(gpu_infos),
+        gpu_infos=gpu_infos,
+    )
+
+
 def _detect_cuda() -> Optional[GPUInfo]:
     """Detect NVIDIA CUDA GPU(s) via nvidia-smi."""
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name,memory.total,memory.free,driver_version',
-             '--format=csv,noheader'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            lines = result.stdout.strip().split('\n')
-            gpu_count = len(lines)
-
-            # Parse all GPUs
-            gpu_infos = []
-            total_vram = 0
-            total_available = 0
-
-            for i, line in enumerate(lines):
-                parts = [p.strip() for p in line.split(',')]
-
-                device_name = parts[0] if len(parts) > 0 else f"NVIDIA GPU {i}"
-                vram_mb = 0
-                available_vram_mb = 0
-                driver_version = None
-
-                if len(parts) >= 2:
-                    try:
-                        vram_str = parts[1].replace('MiB', '').strip()
-                        vram_mb = int(vram_str)
-                    except ValueError:
-                        logger.debug("Suppressed exception", exc_info=True)
-
-                if len(parts) >= 3:
-                    try:
-                        free_str = parts[2].replace('MiB', '').strip()
-                        available_vram_mb = int(free_str)
-                    except ValueError:
-                        logger.debug("Suppressed exception", exc_info=True)
-
-                if len(parts) >= 4:
-                    driver_version = parts[3].strip()
-
-                gpu_infos.append(GPUInfo(
-                    backend="cuda",
-                    vram_mb=vram_mb,
-                    available_vram_mb=available_vram_mb,
-                    device_name=device_name,
-                    driver_version=driver_version,
-                    supported=True,
-                ))
-
-                total_vram += vram_mb
-                total_available += available_vram_mb
-
-            # Return aggregate GPUInfo with nested details
-            first_gpu = gpu_infos[0]
-            return GPUInfo(
-                backend="cuda",
-                vram_mb=total_vram,
-                available_vram_mb=total_available,
-                device_name=first_gpu.device_name,
-                driver_version=first_gpu.driver_version,
-                supported=True,
-                gpu_count=gpu_count,
-                gpu_infos=gpu_infos,
-            )
+            NVIDIA_SMI_QUERY, capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            return parse_nvidia_smi_gpus(result.stdout)
     except (subprocess.SubprocessError, FileNotFoundError):
         logger.debug("Suppressed exception", exc_info=True)
     return None
@@ -230,3 +247,77 @@ def _detect_vulkan() -> Optional[GPUInfo]:
         logger.debug("Suppressed exception", exc_info=True)
 
     return None
+
+
+@dataclass
+class VramSample:
+    """A live VRAM reading, unlike the snapshot taken at detection time."""
+
+    total_mb: float = 0.0
+    free_mb: float = 0.0
+    #: VRAM currently held by the launcher's own llama-server instance(s).
+    own_used_mb: float = 0.0
+    valid: bool = False
+
+    @property
+    def available_mb(self) -> float:
+        """VRAM a new configuration could actually use.
+
+        Free memory *plus* whatever our own server already holds: reconfiguring
+        a running server replaces that allocation rather than adding to it, so
+        counting it as unavailable would make the model look like it no longer
+        fits the card it is currently loaded on.
+        """
+        return self.free_mb + self.own_used_mb
+
+
+def sample_vram(own_pids=()) -> VramSample:
+    """Read current GPU memory, attributing what our own processes hold.
+
+    Returns an invalid sample when there is no NVIDIA GPU, so callers can fall
+    back to the totals from detection.
+    """
+    try:
+        totals = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if totals.returncode != 0 or not totals.stdout.strip():
+            return VramSample()
+        total_mb = free_mb = 0.0
+        for line in totals.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            try:
+                total_mb += float(parts[0])
+                free_mb += float(parts[1])
+            except ValueError:
+                continue
+        if total_mb <= 0:
+            return VramSample()
+
+        own_used_mb = 0.0
+        wanted = {int(p) for p in own_pids if p}
+        if wanted:
+            apps = subprocess.run(
+                ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if apps.returncode == 0:
+                for line in apps.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        if int(parts[0]) in wanted:
+                            own_used_mb += float(parts[1])
+                    except ValueError:
+                        continue
+        return VramSample(total_mb=total_mb, free_mb=free_mb,
+                          own_used_mb=own_used_mb, valid=True)
+    except Exception:
+        logger.debug("VRAM sample failed", exc_info=True)
+        return VramSample()

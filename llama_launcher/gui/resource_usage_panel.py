@@ -386,38 +386,64 @@ class ResourceUsagePanel(QWidget):
         live_sep.setStyleSheet(f"color: {theme.BORDER};")
         layout.addWidget(live_sep)
 
-        live_header = QLabel("Live Usage")
-        live_header.setFont(QFont("sans-serif", 9, QFont.Weight.Bold))
-        live_header.setStyleSheet(f"color: {theme.FG_DIM};")
-        layout.addWidget(live_header)
+        self._live_header = QLabel("Live Usage")
+        self._live_header.setFont(QFont("sans-serif", 9, QFont.Weight.Bold))
+        self._live_header.setStyleSheet(f"color: {theme.FG_DIM};")
+        layout.addWidget(self._live_header)
 
         self._cpu_row = _UsageRow(
             "CPU",
-            "Realtime CPU utilization of this machine (all cores, sampled over 0.25s)."
+            "Realtime CPU utilization of the selected server (all cores)."
         )
         layout.addWidget(self._cpu_row)
 
+        self._ram_live_row = _UsageRow(
+            "RAM",
+            "Realtime system memory usage of the selected server."
+        )
+        layout.addWidget(self._ram_live_row)
+
         self._gpu_live_row = _UsageRow(
             "GPU",
-            "Realtime GPU utilization and VRAM usage of this machine (nvidia-smi).\n"
-            "Multi-GPU: shows the highest utilization and summed memory."
+            "Realtime GPU utilization and VRAM usage of the selected server "
+            "(nvidia-smi).\nMulti-GPU: highest utilization and summed memory."
         )
         layout.addWidget(self._gpu_live_row)
 
-    def update_live_usage(self, cpu_pct: float, gpu_pct: float,
-                          gpu_mem_used_mb: float = -1.0,
-                          gpu_mem_total_mb: float = -1.0):
-        """Update the realtime CPU/GPU utilization bars (local machine)."""
-        self._cpu_row.set_usage(cpu_pct)
-        if gpu_pct < 0:
+    def update_live_usage(self, sample, server_name: str = ""):
+        """Show a live reading, labelled with the server it came from."""
+        self._live_header.setText(
+            f"Live Usage — {server_name}" if server_name else "Live Usage")
+
+        self._cpu_row.set_usage(sample.cpu_percent)
+
+        if sample.ram_total_mb > 0:
+            ram_pct = sample.ram_used_mb / sample.ram_total_mb * 100
+            self._ram_live_row.set_usage(
+                ram_pct,
+                f"{ram_pct:.0f}%  |  {sample.ram_used_mb / 1024:.1f}/"
+                f"{sample.ram_total_mb / 1024:.1f} GB")
+        else:
+            self._ram_live_row.set_usage(-1)
+
+        if sample.gpu_percent < 0:
             self._gpu_live_row.set_usage(-1)
             return
-        if gpu_mem_total_mb > 0:
-            text = (f"{gpu_pct:.0f}%  |  "
-                    f"{gpu_mem_used_mb / 1024:.1f}/{gpu_mem_total_mb / 1024:.1f} GB")
+        if sample.gpu_mem_total_mb > 0:
+            text = (f"{sample.gpu_percent:.0f}%  |  "
+                    f"{sample.gpu_mem_used_mb / 1024:.1f}/"
+                    f"{sample.gpu_mem_total_mb / 1024:.1f} GB")
         else:
-            text = f"{gpu_pct:.0f}%"
-        self._gpu_live_row.set_usage(gpu_pct, text)
+            text = f"{sample.gpu_percent:.0f}%"
+        self._gpu_live_row.set_usage(sample.gpu_percent, text)
+
+    def clear_live_usage(self, server_name: str = ""):
+        """Blank the live bars for a server that is not connected."""
+        self._live_header.setText(
+            f"Live Usage — {server_name} (not connected)" if server_name
+            else "Live Usage")
+        for row in (self._cpu_row, self._ram_live_row, self._gpu_live_row):
+            row.set_usage(-1)
 
     def update_estimate(self, estimate: Optional[ResourceEstimate], selected_ctx: int = 0):
         """Update the panel with a new resource estimate."""
@@ -490,10 +516,20 @@ class ResourceUsagePanel(QWidget):
         self._compute_label.setText(f"Buffers: {self._fmt(float(estimate.compute_buffers_mb))}")
         self._set_native_context(int(estimate.training_context_length) if estimate.training_context_length else 0)
 
-        # Remaining VRAM
+        # Remaining VRAM, measured against what this configuration could
+        # actually get (free memory, plus whatever our own server would release
+        # on relaunch) rather than the card's total.
         if float(estimate.gpu_total_vram_mb) > 0:
             remaining = float(estimate.gpu_remaining_vram_mb)
             remaining_gb = remaining / 1024
+            available_gb = float(estimate.gpu_available_vram_mb) / 1024
+            total_gb = float(estimate.gpu_total_vram_mb) / 1024
+            held_gb = total_gb - available_gb
+            tooltip = (f"Free for this config: {available_gb:.1f} GB of "
+                       f"{total_gb:.1f} GB total")
+            if held_gb > 0.5:
+                tooltip += f"\n{held_gb:.1f} GB is held by other processes."
+            self._remaining_label.setToolTip(tooltip)
             if remaining < 0:
                 self._remaining_label.setText(f"Remaining: {remaining_gb:.1f} GB (OVER)")
                 self._remaining_label.setStyleSheet(

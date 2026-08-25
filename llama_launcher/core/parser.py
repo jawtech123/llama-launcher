@@ -53,12 +53,13 @@ def _looks_like_value(token: str) -> bool:
         return False
 
 
-def parse_launch_command(command_str: str) -> Tuple[Dict[str, Any], List[str]]:
+def parse_launch_command(command_str: str) -> Tuple[Dict[str, Any], List[str], List[str]]:
     """Parse a llama-server command line.
 
     Returns:
-        (params, unrecognized_flags): a dict of LlamaConfig field values and a
-        list of tokens that could not be mapped to a known field.
+        (params, unrecognized_flags, duplicate_flags): a dict of LlamaConfig
+        field values, a list of tokens that could not be mapped to a known
+        field, and a list of flags that were specified more than once.
     """
     try:
         args = shlex.split(command_str)
@@ -74,6 +75,8 @@ def parse_launch_command(command_str: str) -> Tuple[Dict[str, Any], List[str]]:
 
     params: Dict[str, Any] = {}
     unrecognized_flags: List[str] = []
+    duplicate_flags: List[str] = []
+    seen_fields: set = set()
     i = 0
 
     while i < len(args):
@@ -84,9 +87,15 @@ def parse_launch_command(command_str: str) -> Tuple[Dict[str, Any], List[str]]:
             key, value = arg.split("=", 1)
             field = FLAG_TO_FIELD.get(key)
             if field:
+                if field.name in seen_fields:
+                    duplicate_flags.append(arg)
+                    logger.warning("Duplicate flag: %s (keeping last value)", arg)
+                else:
+                    seen_fields.add(field.name)
                 params[field.name] = _coerce(field.name, value)
             else:
                 unrecognized_flags.append(arg)
+                logger.warning("Unrecognized flag: %s", arg)
             i += 1
             continue
 
@@ -94,16 +103,27 @@ def parse_launch_command(command_str: str) -> Tuple[Dict[str, Any], List[str]]:
             field = FLAG_TO_FIELD.get(arg)
             if field is None:
                 unrecognized_flags.append(arg)
+                logger.warning("Unrecognized flag: %s", arg)
                 i += 1
                 continue
 
             if _is_bool_field(field.name):
+                if field.name in seen_fields:
+                    duplicate_flags.append(arg)
+                    logger.warning("Duplicate flag: %s (keeping last value)", arg)
+                else:
+                    seen_fields.add(field.name)
                 params[field.name] = not arg.startswith("--no-")
                 i += 1
                 continue
 
             # Value-taking flag: consume the next token if it is a value.
             if i + 1 < len(args) and _looks_like_value(args[i + 1]):
+                if field.name in seen_fields:
+                    duplicate_flags.append(arg)
+                    logger.warning("Duplicate flag: %s (keeping last value)", arg)
+                else:
+                    seen_fields.add(field.name)
                 params[field.name] = _coerce(field.name, args[i + 1])
                 i += 2
             else:
@@ -117,4 +137,4 @@ def parse_launch_command(command_str: str) -> Tuple[Dict[str, Any], List[str]]:
                 params["model_path"] = arg
         i += 1
 
-    return params, unrecognized_flags
+    return params, unrecognized_flags, duplicate_flags

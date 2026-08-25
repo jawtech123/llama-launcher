@@ -1,6 +1,6 @@
 """Server Management GUI Components."""
 import logging
-import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -9,30 +9,38 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
     QGroupBox, QFormLayout, QDialog, QFileDialog,
     QMessageBox, QInputDialog, QSplitter, QListWidget, QListWidgetItem,
-    QTextEdit, QTabWidget, QHeaderView, QAbstractItemView,
-    QTreeWidget, QTreeWidgetItem, QProgressDialog, QFrame,
-    QScrollArea, QTableWidget, QTableWidgetItem, QColumnView,
-    QListView,
+    QTextEdit, QTabWidget, QHeaderView,
+    QTreeWidget, QProgressDialog, QFrame,
 )
 from PySide6.QtCore import Qt, QTimer, Signal, Slot, QThread
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QColor, QTextCursor
+
+from llama_launcher.gui import theme
 
 from llama_launcher.remote.types import (
-    ServerConfig, ServerStatus, FileEntry,
-    ConnectionType, AuthMethod, ConnectionState,
-    ServerProcessState,
+    LOCAL_SERVER_NAME,
+    ServerConfig,
+    ConnectionState,
 )
-from llama_launcher.remote.manager import ServerManager
-from llama_launcher.remote.ssh_key import (
-    generate_key_pair, install_key_to_server,
-    default_key_exists, DEFAULT_KEY_DIR, DEFAULT_KEY_NAME,
+from llama_launcher.remote.manager import ServerManager, create_connection
+from llama_launcher.gui.dialogs.path_picker import (
+    _ACTIVE_WORKERS, IS_DIR_ROLE, PATH_ROLE, SIZE_ROLE, RemotePathDialog,
+    enable_name_sorting, populate_file_tree, posix_join, posix_parent,
 )
+from llama_launcher.gui.workers import TaskWorker, TransferWorker
 
 logger = logging.getLogger(__name__)
 
+#: Scrollback cap for the live console, in lines.
+MAX_LOG_LINES = 5000
+
 
 class _ServerStateWorker(QThread):
-    """Check connection states for all servers in background."""
+    """Check connection states for all servers in background.
+
+    Probes run concurrently: an unreachable host costs a full connect timeout,
+    so probing serially made the list take (hosts x timeout) seconds to appear.
+    """
     done = Signal(list)
 
     def __init__(self, manager):
@@ -40,13 +48,20 @@ class _ServerStateWorker(QThread):
         self.manager = manager
 
     def run(self):
-        results = []
-        for name in self.manager.get_all_names():
+        names = self.manager.get_all_names()
+        if not names:
+            self.done.emit([])
+            return
+
+        def probe(name):
             try:
-                state = self.manager.get_connection_state(name)
+                return (name, self.manager.get_connection_state(name))
             except Exception:
-                state = ConnectionState.DISCONNECTED
-            results.append((name, state))
+                logger.debug("State probe failed for %s", name, exc_info=True)
+                return (name, ConnectionState.DISCONNECTED)
+
+        with ThreadPoolExecutor(max_workers=min(8, len(names))) as pool:
+            results = list(pool.map(probe, names))
         self.done.emit(results)
 
 
@@ -67,106 +82,105 @@ class _ServerStatusWorker(QThread):
             self.done.emit(None, str(e))
 
 
-class _TaskWorker(QThread):
-    """Run an arbitrary callable in a background thread."""
-
-    done = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, fn, parent=None):
-        super().__init__(parent)
-        self._fn = fn
-
-    def run(self):
-        try:
-            self.done.emit(self._fn())
-        except Exception as e:
-            logger.debug("Background task failed: %s", e, exc_info=True)
-            self.failed.emit(str(e))
-
-
-class _TransferWorker(_TaskWorker):
-    """A task worker with a progress signal for file transfers."""
-
-    progress = Signal(int)
-
-
-class _FileTreeItem(QTreeWidgetItem):
-    """Tree item that sorts the Size column numerically (bytes), not as text."""
-
-    def __lt__(self, other):
-        tree = self.treeWidget()
-        column = tree.sortColumn() if tree is not None else 0
-        if column == 1:
-            a = self.data(0, Qt.UserRole + 2) or 0
-            b = other.data(0, Qt.UserRole + 2) or 0
-            try:
-                return a < b
-            except TypeError:
-                return False
-        # The default QTreeWidgetItem comparison is the sort column's text.
-        # Reimplement it directly: calling super().__lt__() from a Python
-        # override re-dispatches virtually back into this method, causing
-        # infinite recursion (RecursionError -> stack exhaustion -> crash).
-        return self.text(column) < other.text(column)
-
-
 class ServerEditDialog(QDialog):
     """Dialog for adding or editing a server configuration."""
 
     def __init__(self, parent=None, config: Optional[ServerConfig] = None):
         super().__init__(parent)
         self.setWindowTitle("Add Server" if not config else "Edit Server")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(480)
         self._config = config or ServerConfig()
+        self._is_local_entry = self._config.friendly_name == LOCAL_SERVER_NAME
+        # Connection used for Test Connection and browsing, rebuilt whenever the
+        # connection fields change. Never registered with the manager, so nothing
+        # is persisted until the user saves.
+        self._probe_conn = None
+        self._probe_signature = None
+        self._probe_worker = None
         self._build_ui()
         self._populate_fields()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        general = QGroupBox("Connection")
-        general_layout = QFormLayout(general)
-        self.name_edit = QLineEdit()
-        self.type_combo = QComboBox()
-        self.type_combo.addItems(["Local", "SSH"])
-        self.host_edit = QLineEdit("localhost")
-        self.port_spin = QSpinBox()
-        self.port_spin.setRange(1, 65535)
-        self.port_spin.setValue(22)
-        self.user_edit = QLineEdit()
-        self.auth_combo = QComboBox()
-        self.auth_combo.addItems(["SSH Key", "Password"])
-        self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
-        self.key_path_edit = QLineEdit()
-        self.key_browse_btn = QPushButton("Browse...")
-        self.key_browse_btn.clicked.connect(self._browse_key)
-        key_layout = QHBoxLayout()
-        key_layout.addWidget(self.key_path_edit)
-        key_layout.addWidget(self.key_browse_btn)
-        general_layout.addRow("Name:", self.name_edit)
-        general_layout.addRow("Type:", self.type_combo)
-        general_layout.addRow("Host:", self.host_edit)
-        general_layout.addRow("Port:", self.port_spin)
-        general_layout.addRow("Username:", self.user_edit)
-        general_layout.addRow("Auth:", self.auth_combo)
-        general_layout.addRow("Password:", self.password_edit)
-        general_layout.addRow("Key Path:", key_layout)
-        layout.addWidget(general)
-
         paths = QGroupBox("Paths")
         paths_layout = QFormLayout(paths)
+        self.name_edit = QLineEdit()
         self.working_dir_edit = QLineEdit("~")
         self.server_path_edit = QLineEdit("llama-server")
         self.log_file_edit = QLineEdit("llama-server.log")
         self.server_port_spin = QSpinBox()
         self.server_port_spin.setRange(1024, 65535)
         self.server_port_spin.setValue(8080)
-        paths_layout.addRow("Working Dir:", self.working_dir_edit)
-        paths_layout.addRow("Server Exec:", self.server_path_edit)
+        paths_layout.addRow("Name:", self.name_edit)
+        paths_layout.addRow("Working Dir:", self._with_browse(
+            self.working_dir_edit, self._browse_working_dir,
+            "Browse for the directory llama-server runs in"))
+        paths_layout.addRow("Server Exec:", self._with_browse(
+            self.server_path_edit, self._browse_server_exec,
+            "Browse for the llama-server binary (needed when it is not on PATH)"))
         paths_layout.addRow("Log File:", self.log_file_edit)
         paths_layout.addRow("Server Port:", self.server_port_spin)
+        layout.addWidget(paths)
+
+        connection = QGroupBox("Connection")
+        conn_layout = QFormLayout(connection)
+        self.conn_type_combo = QComboBox()
+        self.conn_type_combo.addItems(["Local", "Remote (SSH)"])
+        self.hostname_edit = QLineEdit()
+        self.hostname_edit.setPlaceholderText("e.g. 192.168.1.100 or my-server.com")
+        self.ssh_port_spin = QSpinBox()
+        self.ssh_port_spin.setRange(1, 65535)
+        self.ssh_port_spin.setValue(22)
+        self.username_edit = QLineEdit()
+        self.auth_method_combo = QComboBox()
+        self.auth_method_combo.addItems(["SSH Key", "Password"])
+        self.key_path_edit = QLineEdit()
+        self.key_path_edit.setPlaceholderText("~/.ssh/id_rsa")
+        self.key_path_browse_btn = QPushButton("...")
+        self.key_path_browse_btn.setFixedWidth(32)
+        self.key_path_browse_btn.clicked.connect(self._browse_key_path)
+        self.key_path_h = QHBoxLayout()
+        self.key_path_h.addWidget(self.key_path_edit)
+        self.key_path_h.addWidget(self.key_path_browse_btn)
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_edit.setPlaceholderText("Server password")
+        self.remember_password_check = QCheckBox("Save password")
+        self.remember_password_check.setToolTip(
+            "Passwords are saved in plain text in servers.json (readable only by\n"
+            "you). Prefer 'Set Up Key Auth', which removes the need to store one.")
+        self.password_h = QHBoxLayout()
+        self.password_h.addWidget(self.password_edit, 1)
+        self.password_h.addWidget(self.remember_password_check)
+
+        conn_layout.addRow("Type:", self.conn_type_combo)
+        conn_layout.addRow("Host:", self.hostname_edit)
+        conn_layout.addRow("SSH Port:", self.ssh_port_spin)
+        conn_layout.addRow("Username:", self.username_edit)
+        conn_layout.addRow("Auth:", self.auth_method_combo)
+        conn_layout.addRow("Key Path:", self.key_path_h)
+        conn_layout.addRow("Password:", self.password_h)
+
+        test_row = QHBoxLayout()
+        self.test_conn_btn = QPushButton("Test Connection")
+        self.test_conn_btn.clicked.connect(self._on_test_connection)
+        self.setup_key_btn = QPushButton("Set Up Key Auth")
+        self.setup_key_btn.setToolTip(
+            "Install your public key on this host using the password once, then\n"
+            "switch to key authentication so no password has to be stored.")
+        self.setup_key_btn.clicked.connect(self._on_setup_key_auth)
+        test_row.addWidget(self.test_conn_btn)
+        test_row.addWidget(self.setup_key_btn)
+        test_row.addStretch()
+        conn_layout.addRow("", test_row)
+        self.test_result_label = QLabel("")
+        self.test_result_label.setWordWrap(True)
+        conn_layout.addRow("", self.test_result_label)
+        layout.addWidget(connection)
+
+        self.conn_type_combo.currentTextChanged.connect(self._on_conn_type_changed)
+        self.auth_method_combo.currentTextChanged.connect(self._on_auth_changed)
 
         model_dirs_widget = QWidget()
         model_dirs_h = QHBoxLayout(model_dirs_widget)
@@ -185,7 +199,6 @@ class ServerEditDialog(QDialog):
         model_dirs_h.addWidget(self.model_dirs_list, 1)
         model_dirs_h.addLayout(model_dirs_btns)
         paths_layout.addRow("Model Dirs:", model_dirs_widget)
-        layout.addWidget(paths)
 
         self.enabled_check = QCheckBox("Enabled")
         self.enabled_check.setChecked(True)
@@ -201,39 +214,200 @@ class ServerEditDialog(QDialog):
         btn_layout.addWidget(self.cancel_btn)
         layout.addLayout(btn_layout)
 
-        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
-        self.auth_combo.currentIndexChanged.connect(self._on_auth_changed)
+    def _with_browse(self, line_edit: QLineEdit, handler, tooltip: str) -> QWidget:
+        """Wrap a line edit in a row with a browse button."""
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(line_edit, 1)
+        btn = QPushButton("...")
+        btn.setFixedWidth(32)
+        btn.setToolTip(tooltip)
+        btn.clicked.connect(handler)
+        h.addWidget(btn)
+        return row
 
-    def _on_type_changed(self):
-        is_local = self.type_combo.currentIndex() == 0
-        self.host_edit.setEnabled(not is_local)
-        self.port_spin.setEnabled(not is_local)
-        self.user_edit.setEnabled(not is_local)
-        self.auth_combo.setEnabled(not is_local)
-        self.password_edit.setEnabled(not is_local)
-        self.key_path_edit.setEnabled(not is_local)
-        self.key_browse_btn.setEnabled(not is_local)
-
-    def _on_auth_changed(self):
-        is_key = self.auth_combo.currentIndex() == 0
-        self.password_edit.setEnabled(not is_key)
-        self.key_path_edit.setEnabled(is_key)
-        self.key_browse_btn.setEnabled(is_key)
-
-    def _browse_key(self):
+    def _browse_key_path(self):
+        # The key lives on this machine even when the server is remote.
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select SSH Private Key", str(Path.home() / ".ssh")
-        )
+            self, "Select SSH Key File", str(Path.home() / ".ssh"),
+            "SSH Keys (*.pem *.key id_*);;All Files (*)")
         if path:
             self.key_path_edit.setText(path)
 
-    def _browse_model_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Model Directory")
-        if path:
-            self.model_dirs_list.addItem(path)
+    # ------------------------------------------------------------------
+    # Browsing the target machine
+    # ------------------------------------------------------------------
+
+    def _is_remote_selected(self) -> bool:
+        return "Remote" in self.conn_type_combo.currentText()
+
+    def _probe_connection(self):
+        """Connection for the config as currently edited, or None if incomplete.
+
+        Rebuilt only when a connection-relevant field changes so the SSH master
+        socket is reused across browse operations.
+        """
+        config = self.get_config()
+        signature = (
+            config.hostname, config.ssh_port, config.username,
+            config.auth_method, config.key_path, config.password,
+        )
+        if self._is_remote_selected():
+            if not config.hostname or not config.username:
+                QMessageBox.information(
+                    self, "Connection Details Needed",
+                    "Enter the host and username first, then browse the remote "
+                    "filesystem.")
+                return None
+        if self._probe_conn is None or signature != self._probe_signature:
+            self._probe_conn = create_connection(config)
+            self._probe_signature = signature
+        return self._probe_conn
+
+    def _pick_path(self, mode: str, title: str, current: str,
+                   name_filter=None) -> Optional[str]:
+        """Pick a path on the target machine: native dialog local, browser remote."""
+        if not self._is_remote_selected():
+            if mode == "dir":
+                return QFileDialog.getExistingDirectory(self, title, current) or None
+            filters = "All Files (*)"
+            if name_filter:
+                globs = " ".join(name_filter)
+                filters = f"Model Files ({globs});;All Files (*)"
+            path, _ = QFileDialog.getOpenFileName(self, title, current, filters)
+            return path or None
+
+        conn = self._probe_connection()
+        if conn is None:
+            return None
+        return RemotePathDialog.get_path(
+            self, conn, mode=mode, start_path=current, title=title,
+            name_filter=name_filter,
+        )
+
+    def _browse_working_dir(self):
+        chosen = self._pick_path(
+            "dir", "Select Working Directory", self.working_dir_edit.text().strip())
+        if chosen:
+            self.working_dir_edit.setText(chosen)
+
+    def _browse_server_exec(self):
+        current = self.server_path_edit.text().strip()
+        # A bare command name is not a browsable location.
+        start = current if "/" in current else self.working_dir_edit.text().strip()
+        chosen = self._pick_path("file", "Select llama-server Binary", start)
+        if chosen:
+            self.server_path_edit.setText(chosen)
+
+    def _on_test_connection(self):
+        conn = self._probe_connection()
+        if conn is None:
+            return
+        self.test_conn_btn.setEnabled(False)
+        self.test_result_label.setStyleSheet("")
+        self.test_result_label.setText("Testing…")
+
+        self._start_probe(conn.test_connection, self._on_test_done,
+                          lambda msg: self._on_test_done((False, msg)))
+
+    def _on_test_done(self, result):
+        ok, message = result
+        self.test_conn_btn.setEnabled(True)
+        self._show_result(ok, message)
+
+    def _show_result(self, ok: bool, message: str):
+        self.test_result_label.setStyleSheet(
+            "color: #2e7d32;" if ok else "color: #c62828;")
+        self.test_result_label.setText(message)
+
+    def _on_setup_key_auth(self):
+        """Install a key on the host so no password needs to be stored."""
+        config = self.get_config()
+        if not self._is_remote_selected():
+            QMessageBox.information(self, "Key Authentication",
+                                    "Key authentication applies to remote servers.")
+            return
+        if not config.hostname or not config.username:
+            QMessageBox.information(self, "Key Authentication",
+                                    "Enter the host and username first.")
+            return
+
+        password = self.password_edit.text()
+        if not password:
+            password, ok = QInputDialog.getText(
+                self, "Account Password",
+                f"Password for {config.username}@{config.hostname}.\n"
+                "Used once to install the key, then discarded:",
+                QLineEdit.EchoMode.Password)
+            if not ok or not password:
+                return
+
+        self.setup_key_btn.setEnabled(False)
+        self.test_conn_btn.setEnabled(False)
+        self._show_result(True, "Installing key…")
+        key_path = self.key_path_edit.text().strip()
+
+        def run():
+            from llama_launcher.remote.ssh_key import setup_key_auth
+            return setup_key_auth(config, password, key_path or None)
+
+        self._start_probe(run, self._on_setup_key_done,
+                          lambda msg: self._on_setup_key_done((False, msg, "")))
+
+    def _start_probe(self, fn, on_done, on_failed):
+        """Run a connection probe without tying its thread to this dialog.
+
+        A QThread parented to the dialog is destroyed with it, which segfaults
+        when the user closes the dialog before the probe returns -- and
+        accept()/reject() never raise closeEvent, so there is nowhere to wait.
+        """
+        worker = TaskWorker(fn)
+        worker.done.connect(on_done)
+        worker.failed.connect(on_failed)
+        _ACTIVE_WORKERS.add(worker)
+        worker.finished.connect(lambda: _ACTIVE_WORKERS.discard(worker))
+        self._probe_worker = worker
+        worker.start()
+
+    def _on_setup_key_done(self, result):
+        ok, message, key_path = result
+        self.setup_key_btn.setEnabled(True)
+        self.test_conn_btn.setEnabled(True)
+        if key_path:
+            self.key_path_edit.setText(key_path)
+        if ok:
+            # Key auth is proven to work, so the password is no longer needed.
+            self.auth_method_combo.setCurrentText("SSH Key")
+            self.password_edit.clear()
+            self.remember_password_check.setChecked(False)
+            self._probe_conn = None      # rebuild with the new credentials
+        self._show_result(ok, message)
+
+    def _on_conn_type_changed(self, text: str):
+        is_remote = "Remote" in text
+        self.hostname_edit.setEnabled(is_remote)
+        self.ssh_port_spin.setEnabled(is_remote)
+        self.username_edit.setEnabled(is_remote)
+        self.auth_method_combo.setEnabled(is_remote)
+        self.key_path_edit.setEnabled(is_remote)
+        self.key_path_browse_btn.setEnabled(is_remote)
+        self.password_edit.setEnabled(is_remote)
+        self.remember_password_check.setEnabled(is_remote)
+        self.setup_key_btn.setEnabled(is_remote)
+
+    def _on_auth_changed(self, text: str):
+        is_key = "Key" in text
+        self.key_path_edit.setVisible(is_key)
+        self.key_path_browse_btn.setVisible(is_key)
+        self.password_edit.setVisible(not is_key)
+        self.remember_password_check.setVisible(not is_key)
 
     def _add_model_dir(self):
-        path = QFileDialog.getExistingDirectory(self, "Add Model Directory")
+        current = ""
+        if self.model_dirs_list.count():
+            current = self.model_dirs_list.item(self.model_dirs_list.count() - 1).text()
+        path = self._pick_path("dir", "Add Model Directory", current)
         if path:
             existing = {
                 self.model_dirs_list.item(i).text()
@@ -249,17 +423,6 @@ class ServerEditDialog(QDialog):
 
     def _populate_fields(self):
         self.name_edit.setText(self._config.friendly_name)
-        self.type_combo.setCurrentIndex(
-            0 if self._config.connection_type == ConnectionType.LOCAL else 1
-        )
-        self.host_edit.setText(self._config.hostname)
-        self.port_spin.setValue(self._config.port)
-        self.user_edit.setText(self._config.username)
-        self.auth_combo.setCurrentIndex(
-            0 if self._config.auth_method == AuthMethod.SSH_KEY else 1
-        )
-        self.password_edit.setText(self._config.password)
-        self.key_path_edit.setText(self._config.private_key_path)
         self.working_dir_edit.setText(self._config.working_directory)
         self.server_path_edit.setText(self._config.llama_server_path)
         self.log_file_edit.setText(self._config.log_file)
@@ -273,26 +436,43 @@ class ServerEditDialog(QDialog):
         for d in dirs:
             self.model_dirs_list.addItem(d)
 
-        self._on_type_changed()
+        # Connection fields
+        if self._config.hostname:
+            self.conn_type_combo.setCurrentText("Remote (SSH)")
+        else:
+            self.conn_type_combo.setCurrentText("Local")
+        self.hostname_edit.setText(self._config.hostname)
+        self.ssh_port_spin.setValue(self._config.ssh_port)
+        self.username_edit.setText(self._config.username)
+        if self._config.auth_method == "password":
+            self.auth_method_combo.setCurrentText("Password")
+        else:
+            self.auth_method_combo.setCurrentText("SSH Key")
+        self.key_path_edit.setText(self._config.key_path)
+        self.password_edit.setText(self._config.password)
+        self.remember_password_check.setChecked(self._config.remember_password)
+        self._on_conn_type_changed(self.conn_type_combo.currentText())
+        self._on_auth_changed(self.auth_method_combo.currentText())
+
+        if self._is_local_entry:
+            # The local machine entry is permanent: its name is the key for its
+            # own stored config and model cache, and it cannot become remote.
+            self.name_edit.setReadOnly(True)
+            self.name_edit.setToolTip(
+                "The local machine entry is permanent and cannot be renamed.")
+            self.conn_type_combo.setEnabled(False)
+            self.conn_type_combo.setToolTip(
+                "The local machine entry always uses a local connection.")
 
     def get_config(self) -> ServerConfig:
         model_dirs = [
             self.model_dirs_list.item(i).text()
             for i in range(self.model_dirs_list.count())
         ]
+        is_remote = "Remote" in self.conn_type_combo.currentText()
+        auth_key = "Key" in self.auth_method_combo.currentText()
         return ServerConfig(
             friendly_name=self.name_edit.text().strip(),
-            connection_type=ConnectionType.LOCAL
-                if self.type_combo.currentIndex() == 0
-                else ConnectionType.SSH,
-            hostname=self.host_edit.text().strip(),
-            port=self.port_spin.value(),
-            username=self.user_edit.text().strip(),
-            auth_method=AuthMethod.SSH_KEY
-                if self.auth_combo.currentIndex() == 0
-                else AuthMethod.PASSWORD,
-            password=self.password_edit.text(),
-            private_key_path=self.key_path_edit.text().strip(),
             working_directory=self.working_dir_edit.text().strip(),
             llama_server_path=self.server_path_edit.text().strip(),
             model_directory=model_dirs[0] if model_dirs else "",
@@ -300,6 +480,14 @@ class ServerEditDialog(QDialog):
             enabled=self.enabled_check.isChecked(),
             log_file=self.log_file_edit.text().strip(),
             server_port=self.server_port_spin.value(),
+            hostname=self.hostname_edit.text().strip() if is_remote else "",
+            ssh_port=self.ssh_port_spin.value() if is_remote else 22,
+            username=self.username_edit.text().strip() if is_remote else "",
+            auth_method="key" if auth_key else "password" if is_remote else "key",
+            key_path=self.key_path_edit.text().strip() if is_remote else "",
+            password=self.password_edit.text() if is_remote else "",
+            remember_password=(
+                self.remember_password_check.isChecked() and is_remote and not auth_key),
         )
 
 
@@ -348,8 +536,11 @@ class ServerListWidget(QWidget):
 
     def set_manager(self, manager: ServerManager):
         self._manager = manager
-        # Defer refresh to avoid blocking the main thread with subprocess calls
         QTimer.singleShot(10, self._refresh_list)
+
+    def refresh_states(self):
+        """Re-read connection states, e.g. after connecting from another tab."""
+        self._refresh_list()
 
     def _refresh_list(self):
         if not self._manager or getattr(self, '_closing', False):
@@ -383,28 +574,51 @@ class ServerListWidget(QWidget):
         self.list_widget.clear()
         for name, state in results:
             conn = self._manager.get_connection(name)
-            config = conn.config if conn else None
+            if conn is None:
+                continue
+            config = conn.config
             icon = "○ "
+            # Connected is the only state that earns a colour; an idle server
+            # keeps the default so it does not read as a problem.
+            colour = None
             if state == ConnectionState.CONNECTED:
-                icon = "● "
+                icon, colour = "● ", QColor(theme.SUCCESS)
             elif state == ConnectionState.ERROR:
-                icon = "✗ "
-            type_label = "[SSH]" if config and config.connection_type == ConnectionType.SSH else "[Local]"
-            disabled = config is not None and not config.enabled
-            text = f"{icon}{type_label} {name}"
+                icon, colour = "✗ ", QColor(theme.ERROR)
+            disabled = not config.enabled
+            text = f"{icon}{name}"
             if disabled:
                 text += " (disabled)"
             item = QListWidgetItem(text)
-            item.setData(Qt.UserRole, name)  # robust identity; never parse display text
+            item.setData(Qt.UserRole, name)
             if disabled:
                 item.setForeground(Qt.gray)
+            elif colour is not None:
+                item.setForeground(colour)
             self.list_widget.addItem(item)
 
     def _on_selected(self, current, previous):
-        if current:
-            name = current.data(Qt.UserRole)
-            if name:
-                self.server_selected.emit(name)
+        name = current.data(Qt.UserRole) if current else None
+        # The local machine entry is permanent; make that visible rather than
+        # letting the user click Remove and get refused.
+        self.remove_btn.setEnabled(bool(name) and name != LOCAL_SERVER_NAME)
+        if name:
+            self.server_selected.emit(name)
+
+    def _confirm_port_conflicts(self, config: ServerConfig) -> bool:
+        """Warn when another server on the same host already claims this port."""
+        conflicts = self._manager.find_port_conflicts(config)
+        if not conflicts:
+            return True
+        where = "this machine" if not config.hostname else config.hostname
+        return QMessageBox.warning(
+            self, "Port Already Used",
+            f"Port {config.server_port} on {where} is already configured for "
+            f"{', '.join(repr(c) for c in conflicts)}.\n\n"
+            "Several llama-servers can share a host, but each needs its own "
+            "port -- whichever starts second will fail to bind.\n\nSave anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        ) == QMessageBox.Yes
 
     def _on_add(self):
         if not self._manager:
@@ -414,6 +628,13 @@ class ServerListWidget(QWidget):
             config = dialog.get_config()
             if not config.friendly_name:
                 QMessageBox.warning(self, "Validation", "Server name is required.")
+                return
+            if config.friendly_name in self._manager.get_all_names():
+                QMessageBox.warning(
+                    self, "Validation",
+                    f"A server named '{config.friendly_name}' already exists.")
+                return
+            if not self._confirm_port_conflicts(config):
                 return
             self._manager.add_server(config)
             self._refresh_list()
@@ -430,16 +651,46 @@ class ServerListWidget(QWidget):
         dialog = ServerEditDialog(self, conn.config)
         if dialog.exec() == QDialog.Accepted:
             config = dialog.get_config()
-            self._manager.remove_server(name)
+            if not config.friendly_name:
+                QMessageBox.warning(self, "Validation", "Server name is required.")
+                return
+            if not self._confirm_port_conflicts(config):
+                return
+            if config.friendly_name != name:
+                # Entries are keyed by name, so a rename is a remove plus an add.
+                # Carry the cached model list over instead of orphaning it.
+                self._migrate_model_cache(name, config.friendly_name)
+                self._manager.remove_server(name)
             self._manager.add_server(config)
             self._refresh_list()
             self.servers_changed.emit()
+
+    @staticmethod
+    def _migrate_model_cache(old_name: str, new_name: str) -> None:
+        """Move a renamed server's cached model list to its new key."""
+        from llama_launcher.models.storage import (
+            load_models, remove_models, save_models,
+        )
+        try:
+            cached = load_models(old_name)
+            if cached:
+                save_models(new_name, cached)
+            remove_models(old_name)
+        except Exception:
+            logger.debug("Could not migrate model cache %s -> %s",
+                         old_name, new_name, exc_info=True)
 
     def _on_remove(self):
         current = self.list_widget.currentItem()
         if not current or not self._manager:
             return
         name = current.data(Qt.UserRole)
+        if name == LOCAL_SERVER_NAME:
+            QMessageBox.information(
+                self, "Permanent Entry",
+                f"'{LOCAL_SERVER_NAME}' represents the machine the launcher is "
+                "running on and cannot be removed.")
+            return
         reply = QMessageBox.question(
             self, "Remove Server",
             f"Remove server '{name}'?",
@@ -448,26 +699,20 @@ class ServerListWidget(QWidget):
         if reply == QMessageBox.Yes:
             self._manager.remove_server(name)
             self._refresh_list()
+            parent = self.parent()
+            if parent is not None:
+                status_w = getattr(parent, "status_widget", None)
+                if status_w is not None and status_w._selected_server == name:
+                    status_w._selected_server = None
+                    status_w.server_name_label.setText("No server selected")
             self.servers_changed.emit()
-
-    @staticmethod
-    def _extract_name(text: str) -> str:
-        """Legacy display-text parsing; kept for backwards compatibility."""
-        for prefix in ("● ", "✗ ", "○ "):
-            if text.startswith(prefix):
-                text = text[len(prefix):]
-                break
-        if text.startswith("[SSH] "):
-            text = text[6:]
-        if text.startswith("[Local] "):
-            text = text[8:]
-        if text.endswith(" (disabled)"):
-            text = text[:-11]
-        return text
 
 
 class ServerStatusWidget(QWidget):
     """Right panel: status and controls for the selected server."""
+
+    connect_requested = Signal(str)
+    disconnect_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -484,12 +729,7 @@ class ServerStatusWidget(QWidget):
         self._command_provider = provider
 
     def _launch_command(self) -> str:
-        """Command used for Start/Restart: the launcher's current config.
-
-        Falls back to a bare server binary if no provider is wired. The
-        configured server binary replaces argv[0] when it differs from the
-        default "llama-server".
-        """
+        """Command used for Start/Restart."""
         conn = self._manager.get_connection(self._selected_server) if self._manager else None
         binary = conn.config.llama_server_path if conn else "llama-server"
 
@@ -534,6 +774,15 @@ class ServerStatusWidget(QWidget):
         status_layout.addRow("Model:", self.model_label)
         layout.addWidget(status_frame)
 
+        command_group = QGroupBox("Command")
+        command_layout = QVBoxLayout(command_group)
+        self.command_preview_text = QTextEdit()
+        self.command_preview_text.setReadOnly(True)
+        self.command_preview_text.setMaximumHeight(80)
+        self.command_preview_text.setFontFamily("monospace")
+        command_layout.addWidget(self.command_preview_text)
+        layout.addWidget(command_group)
+
         control_layout = QHBoxLayout()
         self.connect_btn = QPushButton("Connect")
         self.connect_btn.clicked.connect(self._on_connect)
@@ -555,21 +804,15 @@ class ServerStatusWidget(QWidget):
         control_layout.addWidget(self.refresh_status_btn)
         layout.addLayout(control_layout)
 
-        ssh_layout = QHBoxLayout()
-        self.install_key_btn = QPushButton("Install SSH Key")
-        self.install_key_btn.clicked.connect(self._on_install_key)
-        self.gen_key_btn = QPushButton("Generate SSH Key")
-        self.gen_key_btn.clicked.connect(self._on_generate_key)
-        ssh_layout.addWidget(self.install_key_btn)
-        ssh_layout.addWidget(self.gen_key_btn)
-        layout.addLayout(ssh_layout)
-
         self.tabs = QTabWidget()
 
         console_tab = QWidget()
         console_layout = QVBoxLayout(console_tab)
         self.console_text = QTextEdit()
         self.console_text.setReadOnly(True)
+        # A server can log indefinitely; keep a bounded scrollback so memory and
+        # redraw cost stay flat over a long session.
+        self.console_text.document().setMaximumBlockCount(MAX_LOG_LINES)
         self.console_text.setFontFamily("monospace")
         console_layout.addWidget(self.console_text)
         console_btn_layout = QHBoxLayout()
@@ -601,31 +844,34 @@ class ServerStatusWidget(QWidget):
         file_layout = QVBoxLayout(file_tab)
         file_toolbar = QHBoxLayout()
         self.file_path_edit = QLineEdit()
-        self.file_path_edit.setPlaceholderText("Remote directory path")
+        self.file_path_edit.setPlaceholderText("Directory path on the selected server")
         self.file_refresh_btn = QPushButton("Refresh")
         self.file_refresh_btn.clicked.connect(self._refresh_file_list)
         self.file_up_btn = QPushButton("Up")
         self.file_up_btn.clicked.connect(self._file_go_up)
         self.file_new_dir_btn = QPushButton("New Dir")
         self.file_new_dir_btn.clicked.connect(self._file_new_dir)
+        self.file_upload_btn = QPushButton("Upload...")
+        self.file_upload_btn.setToolTip(
+            "Copy a file from this machine into the directory shown above")
+        self.file_upload_btn.clicked.connect(self._file_upload)
+        self.file_download_btn = QPushButton("Download...")
+        self.file_download_btn.setToolTip("Copy the selected file to this machine")
+        self.file_download_btn.clicked.connect(self._file_download)
         self.file_delete_btn = QPushButton("Delete")
         self.file_delete_btn.clicked.connect(self._file_delete)
-        self.file_upload_btn = QPushButton("Upload")
-        self.file_upload_btn.clicked.connect(self._file_upload)
-        self.file_download_btn = QPushButton("Download")
-        self.file_download_btn.clicked.connect(self._file_download)
         file_toolbar.addWidget(self.file_path_edit)
         file_toolbar.addWidget(self.file_refresh_btn)
         file_toolbar.addWidget(self.file_up_btn)
         file_toolbar.addWidget(self.file_new_dir_btn)
-        file_toolbar.addWidget(self.file_delete_btn)
         file_toolbar.addWidget(self.file_upload_btn)
         file_toolbar.addWidget(self.file_download_btn)
+        file_toolbar.addWidget(self.file_delete_btn)
         file_layout.addLayout(file_toolbar)
         self.file_tree = QTreeWidget()
         self.file_tree.setHeaderLabels(["Name", "Size", "Modified"])
         self.file_tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.file_tree.setSortingEnabled(True)
+        enable_name_sorting(self.file_tree)
         self.file_tree.itemDoubleClicked.connect(self._on_file_double_clicked)
         file_layout.addWidget(self.file_tree)
         self.tabs.addTab(file_tab, "File Browser")
@@ -639,9 +885,39 @@ class ServerStatusWidget(QWidget):
             self._status_timer.timeout.connect(self._auto_refresh)
             self._status_timer.start(15000)
 
+    def _reset_to_config(self, config: ServerConfig):
+        """Reset status labels to show config-based info for a selected server."""
+        self.state_label.setText("not connected")
+        self.pid_label.setText("-")
+        self.cpu_label.setText("-")
+        self.ram_label.setText("-")
+        self.gpu_util_label.setText("-")
+        self.gpu_mem_label.setText("-")
+        self.port_label.setText(str(config.server_port))
+        self.uptime_label.setText("-")
+        self.model_label.setText("-")
+
+    def _reset_to_placeholder(self):
+        """Reset all status labels to placeholder values."""
+        self.state_label.setText("-")
+        self.pid_label.setText("-")
+        self.cpu_label.setText("-")
+        self.ram_label.setText("-")
+        self.gpu_util_label.setText("-")
+        self.gpu_mem_label.setText("-")
+        self.port_label.setText("-")
+        self.uptime_label.setText("-")
+        self.model_label.setText("-")
+
     def select_server(self, name: str):
         self._selected_server = name
         self.server_name_label.setText(name)
+        conn = self._manager.get_connection(name) if self._manager else None
+        if conn:
+            # Reset labels to show server info immediately
+            self._reset_to_config(conn.config)
+        else:
+            self._reset_to_placeholder()
         self._refresh_status()
 
     def _refresh_status(self):
@@ -649,6 +925,7 @@ class ServerStatusWidget(QWidget):
             return
         if getattr(self, '_closing', False):
             return
+        self.command_preview_text.setPlainText(self._launch_command())
         worker = _ServerStatusWorker(self._manager, self._selected_server)
         worker.setParent(self)
         worker.done.connect(self._on_status_done)
@@ -663,7 +940,7 @@ class ServerStatusWidget(QWidget):
         except ValueError:
             pass
 
-    def _run_task(self, fn, on_done=None, on_failed=None, worker_class=_TaskWorker):
+    def _run_task(self, fn, on_done=None, on_failed=None, worker_class=TaskWorker):
         """Run ``fn`` in a background thread; route result/failure to callbacks."""
         if getattr(self, '_closing', False):
             return None
@@ -692,17 +969,45 @@ class ServerStatusWidget(QWidget):
                 w.wait(1000)
 
     def _on_status_done(self, status, error_msg):
+        if not self._selected_server:
+            return
+        conn = self._manager.get_connection(self._selected_server) if self._manager else None
+        is_connected = False
+        if conn:
+            try:
+                is_connected = conn.connection_state == ConnectionState.CONNECTED
+            except Exception:
+                is_connected = False
+
         if error_msg:
             self.state_label.setText(f"Error: {error_msg}")
             return
+
         if status:
+            if not is_connected:
+                self.state_label.setText("not connected")
+                self.pid_label.setText("-")
+                self.cpu_label.setText("-")
+                self.ram_label.setText("-")
+                self.gpu_util_label.setText("-")
+                self.gpu_mem_label.setText("-")
+                self.port_label.setText("-")
+                self.uptime_label.setText("-")
+                self.model_label.setText("-")
+                return
+
             self.state_label.setText(status.state.value)
             self.pid_label.setText(str(status.pid or "-"))
             self.cpu_label.setText(f"{status.cpu_percent:.1f}%")
             self.ram_label.setText(f"{status.ram_mb:.1f} MB")
             self.gpu_util_label.setText(f"{status.gpu_utilization:.1f}%")
             self.gpu_mem_label.setText(f"{status.gpu_memory_mb:.1f} MB")
-            self.port_label.setText(str(status.listening_port or "-"))
+
+            if status.listening_port:
+                self.port_label.setText(str(status.listening_port))
+            else:
+                self.port_label.setText(str(conn.config.server_port))
+
             self.uptime_label.setText(self._format_uptime(status.uptime_seconds))
             self.model_label.setText(status.loaded_model or "-")
             if status.error_message:
@@ -730,48 +1035,84 @@ class ServerStatusWidget(QWidget):
         return " ".join(parts)
 
     def _on_connect(self):
-        if not self._selected_server:
+        """Hand off to the application's single connect flow.
+
+        Connecting must read the host's GPU, RAM and models and update every
+        server selector, so this cannot call manager.connect() itself -- doing
+        so left this tab and the others disagreeing about what was connected.
+        """
+        if not self._selected_server or not self._ensure_password():
             return
         self.connect_btn.setEnabled(False)
         self.state_label.setText("Connecting...")
-        self._run_task(
-            lambda: self._manager.connect(self._selected_server),
-            on_done=self._on_connect_done,
-        )
+        self.connect_requested.emit(self._selected_server)
 
-    def _on_connect_done(self, result):
+    def on_connection_changed(self, server_name: str):
+        """Called when the app finishes connecting or disconnecting a server."""
         self.connect_btn.setEnabled(True)
-        if result:
-            QMessageBox.information(self, "Connected",
-                                    f"Connected to {self._selected_server}.")
+        if server_name == self._selected_server:
             self._refresh_status()
-        else:
-            QMessageBox.warning(self, "Connection Failed",
-                                f"Could not connect to {self._selected_server}.")
-            self.state_label.setText("Connection failed")
 
     def _on_disconnect(self):
         if not self._selected_server:
             return
-        self._run_task(
-            lambda: self._manager.disconnect(self._selected_server),
-            on_done=lambda _r: self._refresh_status(),
-        )
+        self.disconnect_requested.emit(self._selected_server)
+
+    def _ensure_password(self) -> bool:
+        """Ask for a password-auth server's password if none is held.
+
+        Passwords are no longer written to disk unless the user opts in, so a
+        session may start without one. Kept in memory for this run only.
+        """
+        conn = self._manager.get_connection(self._selected_server) if self._manager else None
+        if conn is None:
+            return False
+        config = conn.config
+        if config.auth_method != "password" or config.password:
+            return True
+        password, ok = QInputDialog.getText(
+            self, "Password Required",
+            f"Password for {config.username}@{config.hostname}.\n"
+            "Used for this session only:",
+            QLineEdit.EchoMode.Password)
+        if not ok or not password:
+            return False
+        config.password = password
+        # The connection caches its ssh options from the config it was built
+        # with, so rebuild it around the now-complete credentials.
+        self._manager.add_server(config, persist=False)
+        return True
 
     def _on_start(self):
-        if not self._selected_server:
+        if not self._selected_server or not self._ensure_password():
             return
         cmd = self._launch_command()
         if QMessageBox.question(
             self, "Start Server",
             f"Start llama-server on {self._selected_server}?\n\n{cmd}",
             QMessageBox.Yes | QMessageBox.No,
-        ) == QMessageBox.Yes:
-            self.start_btn.setEnabled(False)
-            self._run_task(
-                lambda: self._manager.start_server(self._selected_server, cmd),
-                on_done=self._on_start_done,
-            )
+        ) != QMessageBox.Yes:
+            return
+        self.start_btn.setEnabled(False)
+        # Probe the port off the UI thread before starting: llama-server would
+        # otherwise just die at bind time with the reason buried in the log.
+        # cmd is resolved here because it reads GUI widgets.
+        self._run_task(lambda: self._check_port_then_start(cmd),
+                       on_done=self._on_start_done,
+                       on_failed=self._on_start_failed)
+
+    def _check_port_then_start(self, cmd: str):
+        """Refuse to start onto an occupied port; otherwise start the server."""
+        name = self._selected_server
+        conflict = self._manager.check_port_conflict(name)
+        if conflict:
+            raise RuntimeError(conflict)
+        return self._manager.start_server(name, cmd)
+
+    def _on_start_failed(self, message: str):
+        self.start_btn.setEnabled(True)
+        QMessageBox.warning(self, "Cannot Start Server", message)
+        self._refresh_status()
 
     def _on_start_done(self, result):
         self.start_btn.setEnabled(True)
@@ -779,8 +1120,6 @@ class ServerStatusWidget(QWidget):
             QMessageBox.warning(self, "Failed", "Could not start server.")
             self._refresh_status()
             return
-        # Don't declare victory yet: verify the process survives startup
-        # (bad model path/args kill llama-server within the first second).
         self.state_label.setText("Starting...")
         QTimer.singleShot(2500, self._verify_started)
 
@@ -829,136 +1168,13 @@ class ServerStatusWidget(QWidget):
             QMessageBox.information(self, "Restarted", "Server restarted.")
         self._refresh_status()
 
-    def _on_install_key(self):
-        """Install the launcher SSH key on the selected server.
-
-        Uses the server's stored host/username/password, then switches the
-        server configuration to key-based auth and persists it.
-        """
-        if not self._selected_server or not self._manager:
-            return
-        conn = self._manager.get_connection(self._selected_server)
-        if not conn:
-            return
-        config = conn.config
-        if config.connection_type != ConnectionType.SSH:
-            QMessageBox.information(
-                self, "Install SSH Key",
-                "SSH key installation only applies to SSH servers.")
-            return
-        if not config.hostname or not config.username:
-            QMessageBox.warning(
-                self, "Install SSH Key",
-                "The selected server has no hostname/username configured.\n"
-                "Edit the server first.")
-            return
-
-        already_key_auth = (config.auth_method == AuthMethod.SSH_KEY
-                            and bool(config.private_key_path))
-        if already_key_auth:
-            reply = QMessageBox.question(
-                self, "Install SSH Key",
-                f"'{self._selected_server}' already uses key authentication "
-                f"({config.private_key_path}).\n\n"
-                f"Re-install/verify the key on {config.username}@{config.hostname}?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        password = config.password
-        if not password:
-            password, ok = QInputDialog.getText(
-                self, "Server Password",
-                f"Password for {config.username}@{config.hostname}\n"
-                f"(used once to install the key; not stored):",
-                QLineEdit.Password)
-            if not ok or not password:
-                return
-
-        key_path = config.private_key_path or str(DEFAULT_KEY_DIR / DEFAULT_KEY_NAME)
-        key_path = str(Path(key_path).expanduser())
-
-        reply = QMessageBox.question(
-            self, "Install SSH Key",
-            f"This will:\n"
-            f"  1. Use the local key: {key_path}\n"
-            f"     (generated automatically if missing)\n"
-            f"  2. Install it on {config.username}@{config.hostname}:{config.port}\n"
-            f"     using the {'stored' if config.password else 'entered'} password\n"
-            f"  3. Switch '{self._selected_server}' to SSH key authentication\n\n"
-            f"Continue?",
-            QMessageBox.Yes | QMessageBox.No,
-        )
-        if reply != QMessageBox.Yes:
-            return
-
-        self.install_key_btn.setEnabled(False)
-        self.state_label.setText("Installing SSH key...")
-        self._run_task(
-            lambda: self._install_key_task(config, key_path, password),
-            on_done=lambda ok: self._on_key_installed(bool(ok), config, key_path),
-            on_failed=lambda msg: self._on_key_installed(False, config, key_path, msg),
-        )
-
-    @staticmethod
-    def _install_key_task(config: ServerConfig, key_path: str, password: str) -> bool:
-        """Worker: generate the key if needed and install it on the server."""
-        from llama_launcher.remote.ssh_key import read_public_key
-        if not Path(key_path).exists():
-            generate_key_pair(key_path)
-        pub_key = read_public_key(key_path)
-        return install_key_to_server(
-            config.hostname, config.port, config.username,
-            password, pub_key, key_path,
-        )
-
-    def _on_key_installed(self, success: bool, config: ServerConfig,
-                          key_path: str, error: str = ""):
-        self.install_key_btn.setEnabled(True)
-        if not success:
-            self.state_label.setText("Key install failed")
-            QMessageBox.warning(
-                self, "Install SSH Key",
-                f"Could not install the SSH key on "
-                f"{config.username}@{config.hostname}.\n\n"
-                f"{error or 'Check the host, username, and password.'}")
-            return
-
-        # Switch the server to key auth and persist the change.
-        conn = self._manager.get_connection(self._selected_server)
-        if conn is not None:
-            conn.disconnect()
-        config.auth_method = AuthMethod.SSH_KEY
-        config.private_key_path = key_path
-        self._manager.add_server(config)  # persists + recreates the connection
-        self.state_label.setText("Key installed - switched to key auth")
-        QMessageBox.information(
-            self, "Install SSH Key",
-            f"SSH key installed and verified on {config.username}@{config.hostname}.\n\n"
-            f"'{self._selected_server}' now uses key authentication "
-            f"({key_path}).")
-        self._refresh_status()
-
-    def _on_generate_key(self):
-        if default_key_exists():
-            QMessageBox.information(self, "Key Exists",
-                                    "SSH key already exists at ~/.ssh/llama_launcher")
-            return
-        try:
-            priv, pub = generate_key_pair()
-            QMessageBox.information(self, "Key Generated",
-                                    f"SSH key generated at {priv}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Key generation failed: {e}")
-
     def _on_start_console(self):
         if not self._selected_server:
             return
-        from llama_launcher.remote.console import LiveConsole
+        from llama_launcher.remote.console import LogFollowWorker
         if self._live_console:
             self._live_console.stop()
-        self._live_console = LiveConsole(self._manager, self._selected_server)
+        self._live_console = LogFollowWorker(self._manager, self._selected_server)
         self._live_console.line_received.connect(self._append_console_line)
         self._live_console.error_occurred.connect(self._console_error)
         self._live_console.disconnected.connect(self._console_disconnected)
@@ -982,13 +1198,11 @@ class ServerStatusWidget(QWidget):
         sb = self.console_text.verticalScrollBar()
         at_bottom = sb is None or sb.value() >= sb.maximum() - 4
 
-        # Always insert at the document end, not at the user-visible cursor.
         cursor = self.console_text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.console_text.setTextCursor(cursor)
         self.console_text.insertPlainText(line + "\n")
 
-        # Follow only when enabled and the user hasn't scrolled up.
         if self.console_follow_btn.isChecked() and at_bottom and sb is not None:
             sb.setValue(sb.maximum())
 
@@ -1010,42 +1224,28 @@ class ServerStatusWidget(QWidget):
     def _refresh_file_list(self):
         if not self._selected_server:
             return
-        remote_path = self.file_path_edit.text().strip()
-        if not remote_path:
+        target_path = self.file_path_edit.text().strip()
+        if not target_path:
             conn = self._manager.get_connection(self._selected_server)
             if conn:
-                remote_path = conn.config.model_directory or conn.config.working_directory
-        if not remote_path:
+                target_path = conn.config.model_directory or conn.config.working_directory
+        if not target_path:
             return
-        self.file_path_edit.setText(remote_path)
+        self.file_path_edit.setText(target_path)
         self.file_tree.setEnabled(False)
         self._run_task(
-            lambda: self._manager.list_directory(self._selected_server, remote_path),
+            lambda: self._manager.list_directory(self._selected_server, target_path),
             on_done=self._populate_file_tree,
         )
 
     def _populate_file_tree(self, entries):
         self.file_tree.setEnabled(True)
-        self.file_tree.clear()
-        for entry in sorted(entries, key=lambda e: (not e.is_directory, e.name.lower())):
-            item = _FileTreeItem(self.file_tree)
-            item.setText(0, ("[DIR] " if entry.is_directory else "") + entry.name)
-            if entry.is_directory:
-                item.setText(1, "-")
-            else:
-                from llama_launcher.utils.helpers import format_bytes
-                item.setText(1, format_bytes(entry.size_bytes))
-            import datetime
-            item.setText(2, datetime.datetime.fromtimestamp(
-                entry.modified_time).strftime("%Y-%m-%d %H:%M"))
-            item.setData(0, Qt.UserRole, entry.path)
-            item.setData(0, Qt.UserRole + 1, entry.is_directory)
-            item.setData(0, Qt.UserRole + 2, entry.size_bytes)
+        populate_file_tree(self.file_tree, entries)
 
     def _on_file_double_clicked(self, item, _column=0):
         """Navigate into a directory on double-click."""
-        is_dir = item.data(0, Qt.UserRole + 1)
-        path = item.data(0, Qt.UserRole)
+        is_dir = item.data(0, IS_DIR_ROLE)
+        path = item.data(0, PATH_ROLE)
         if is_dir and path:
             self.file_path_edit.setText(path)
             self._refresh_file_list()
@@ -1053,27 +1253,86 @@ class ServerStatusWidget(QWidget):
     def _file_go_up(self):
         path = self.file_path_edit.text().strip()
         if path:
-            parent = str(Path(path).parent)
-            self.file_path_edit.setText(parent)
+            self.file_path_edit.setText(posix_parent(path))
             self._refresh_file_list()
 
     def _file_new_dir(self):
         path = self.file_path_edit.text().strip()
         if not path:
             return
-        name, ok = QInputDialog.getItem(self, "New Directory", "Directory name:", [], 0, False)
+        # getItem with an empty, non-editable list offered nothing to type into.
+        name, ok = QInputDialog.getText(self, "New Directory", "Directory name:")
+        name = (name or "").strip()
         if ok and name:
             self._run_task(
                 lambda: self._manager.create_directory(
-                    self._selected_server, f"{path}/{name}"),
+                    self._selected_server, posix_join(path, name)),
                 on_done=lambda result: self._refresh_file_list() if result else None,
             )
+
+    def _file_upload(self):
+        """Copy a file from this machine into the directory being browsed."""
+        if not self._selected_server:
+            return
+        remote_dir = self.file_path_edit.text().strip()
+        if not remote_dir:
+            QMessageBox.information(self, "Upload",
+                                    "Open the destination directory first.")
+            return
+        local_path, _ = QFileDialog.getOpenFileName(
+            self, "Select File to Upload", str(Path.home()))
+        if not local_path:
+            return
+
+        remote_path = posix_join(remote_dir, Path(local_path).name)
+        if self._manager.path_kind(self._selected_server, remote_path) == "file":
+            if QMessageBox.question(
+                self, "Overwrite?",
+                f"'{Path(local_path).name}' already exists in {remote_dir}.\n\nReplace it?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            ) != QMessageBox.Yes:
+                return
+
+        try:
+            total_bytes = Path(local_path).stat().st_size
+        except OSError:
+            total_bytes = 0
+        self._start_transfer(
+            f"Uploading {Path(local_path).name}…", total_bytes,
+            lambda cb: self._manager.upload_file(
+                self._selected_server, local_path, remote_path, progress_cb=cb),
+        )
+
+    def _file_download(self):
+        """Copy the selected file from the server to this machine."""
+        item = self.file_tree.currentItem()
+        if not item or not self._selected_server:
+            return
+        if item.data(0, IS_DIR_ROLE):
+            QMessageBox.information(self, "Download",
+                                    "Select a file to download, not a directory.")
+            return
+        remote_path = item.data(0, PATH_ROLE)
+        if not remote_path:
+            return
+
+        name = Path(remote_path).name
+        local_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Downloaded File As", str(Path.home() / name))
+        if not local_path:
+            return
+        total_bytes = item.data(0, SIZE_ROLE) or 0
+        self._start_transfer(
+            f"Downloading {name}…", total_bytes,
+            lambda cb: self._manager.download_file(
+                self._selected_server, remote_path, local_path, progress_cb=cb),
+        )
 
     def _file_delete(self):
         item = self.file_tree.currentItem()
         if not item:
             return
-        path = item.data(0, Qt.UserRole)
+        path = item.data(0, PATH_ROLE)
         if not path:
             return
         reply = QMessageBox.question(
@@ -1085,47 +1344,6 @@ class ServerStatusWidget(QWidget):
                 lambda: self._manager.delete_file(self._selected_server, path),
                 on_done=lambda _r: self._refresh_file_list(),
             )
-
-    def _file_upload(self):
-        local, _ = QFileDialog.getOpenFileName(self, "Upload File")
-        if not local:
-            return
-        remote = self.file_path_edit.text().strip()
-        if not remote:
-            conn = self._manager.get_connection(self._selected_server)
-            remote = conn.config.model_directory if conn else "~"
-        remote = f"{remote}/{Path(local).name}"
-        try:
-            total = os.path.getsize(local)
-        except OSError:
-            total = 0
-        self._start_transfer(
-            f"Uploading {Path(local).name}", total,
-            lambda cb: self._manager.upload_file(
-                self._selected_server, local, remote, progress_cb=cb),
-        )
-
-    def _file_download(self):
-        item = self.file_tree.currentItem()
-        if not item:
-            return
-        is_dir = item.data(0, Qt.UserRole + 1)
-        if is_dir:
-            QMessageBox.warning(self, "Error", "Cannot download directories.")
-            return
-        remote = item.data(0, Qt.UserRole)
-        if not remote:
-            return
-        size_bytes = item.data(0, Qt.UserRole + 2) or 0
-        local_dir = QFileDialog.getExistingDirectory(self, "Download to")
-        if not local_dir:
-            return
-        self._start_transfer(
-            f"Downloading {item.text(0)}", size_bytes,
-            lambda cb: self._manager.download_file(
-                self._selected_server, remote, f"{local_dir}/{item.text(0)}",
-                progress_cb=cb),
-        )
 
     def _start_transfer(self, title: str, total_bytes: int, fn):
         """Run a transfer in a worker with a cancellable progress dialog."""
@@ -1145,7 +1363,7 @@ class ServerStatusWidget(QWidget):
                 denom = total or total_bytes or 1
                 worker.progress.emit(int(done * 100 / max(denom, 1)))
 
-        worker = _TransferWorker(lambda: fn(cb), self)
+        worker = TransferWorker(lambda: fn(cb), self)
         holder["worker"] = worker
         worker.progress.connect(progress.setValue)
         worker.done.connect(lambda result: self._on_transfer_done(progress, result))
@@ -1172,10 +1390,25 @@ class ServerStatusWidget(QWidget):
 class ServerManagementWidget(QWidget):
     """Main server management panel: list + details side by side."""
 
+    #: Raised so the application can run its one connect flow; this tab does
+    #: not connect on its own.
+    connect_requested = Signal(str)
+    disconnect_requested = Signal(str)
+    #: Raised on row selection so this tab's choice of server participates in
+    #: the same shared "current server" the other tabs' ServerBars agree on --
+    #: otherwise a server picked (and scanned) here stays invisible elsewhere
+    #: until the user re-selects it in one of the synced bars.
+    server_selected = Signal(str)
+
     def __init__(self, manager: ServerManager, parent=None):
         super().__init__(parent)
         self._manager = manager
         self._build_ui()
+
+    def on_connection_changed(self, server_name: str):
+        """Refresh the list and details after any server connects/disconnects."""
+        self.list_widget.refresh_states()
+        self.status_widget.on_connection_changed(server_name)
 
     def set_command_provider(self, provider) -> None:
         """Wire a callable returning the current llama-server command string."""
@@ -1194,6 +1427,8 @@ class ServerManagementWidget(QWidget):
 
         self.status_widget = ServerStatusWidget(self)
         self.status_widget.set_manager(self._manager)
+        self.status_widget.connect_requested.connect(self.connect_requested.emit)
+        self.status_widget.disconnect_requested.connect(self.disconnect_requested.emit)
         splitter.addWidget(self.status_widget)
 
         splitter.setStretchFactor(0, 0)
@@ -1204,6 +1439,7 @@ class ServerManagementWidget(QWidget):
 
     def _on_server_selected(self, name: str):
         self.status_widget.select_server(name)
+        self.server_selected.emit(name)
 
     def shutdown(self) -> None:
         """Stop child widgets' timers and background workers."""

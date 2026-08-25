@@ -15,17 +15,27 @@ from PySide6.QtWidgets import (
 )
 
 from llama_launcher.benchmark import (
+    BenchmarkRunConfig,
+    ResourceAccumulator,
     SessionStats,
     aggregate,
     append_session,
+    build_session_label,
+    build_session_tooltip,
     clear_sessions,
+    config_snapshot_fields,
+    estimate_summary,
     load_sessions,
     parse_log_line,
     parse_log_text,
     replace_sessions_for_source,
+    run_benchmark,
+    wait_for_server_ready,
 )
 from llama_launcher.gui import theme
-from llama_launcher.remote.types import ConnectionType
+from llama_launcher.gui.dialogs.benchmark_compare_dialog import SessionCompareDialog
+from llama_launcher.models.scanner import infer_model_hints
+
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +57,29 @@ class _LogFetchWorker(QThread):
         try:
             log = self._manager.tail_log(self._server_name, _REMOTE_TAIL_LINES)
             self.done.emit(log or "")
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class _BenchmarkRunWorker(QThread):
+    """Run a controlled benchmark against the currently-launched local server."""
+
+    done = Signal()
+    failed = Signal(str)
+
+    def __init__(self, base_url: str, run_cfg: BenchmarkRunConfig, parent=None):
+        super().__init__(parent)
+        self._base_url = base_url
+        self._run_cfg = run_cfg
+
+    def run(self):
+        try:
+            if not wait_for_server_ready(self._base_url, timeout_s=60.0):
+                self.failed.emit(
+                    f"Server did not respond on {self._base_url}/health within 60s.")
+                return
+            run_benchmark(self._base_url, self._run_cfg)
+            self.done.emit()
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -82,7 +115,14 @@ class BenchmarkTab(QWidget):
         self._line_buffer = ""
         self._session_preset = ""
         self._session_fingerprint = ""
+        self._session_config = None
+        self._session_estimate = None
+        self._resource = ResourceAccumulator()
+        self._current_sessions = []
         self._fetch_worker = None
+        self._bench_worker = None
+        self._bench_snapshot = None
+        self._bench_run_cfg = None
         self._build_ui()
         self._reload_history()
 
@@ -122,9 +162,25 @@ class BenchmarkTab(QWidget):
         grid.addWidget(self._elapsed_label, 3, 2)
         grid.addWidget(self._status_label, 3, 3)
 
+        self._gpu_label = self._value_label("--")
+        self._vram_label = self._value_label("--")
+        for i, text in enumerate(("GPU Util:", "VRAM Used:")):
+            grid.addWidget(self._head_label(text), 4, i)
+        grid.addWidget(self._gpu_label, 5, 0)
+        grid.addWidget(self._vram_label, 5, 1)
+
         layout.addWidget(session_group)
 
         buttons = QHBoxLayout()
+        self.run_bench_btn = QPushButton("Run Benchmark")
+        self.run_bench_btn.setEnabled(False)
+        self.run_bench_btn.setToolTip(
+            "Send a fixed prompt/generation-length request to the running\n"
+            "local server for a controlled, repeatable throughput number\n"
+            "(rather than relying on passive real usage).")
+        self.run_bench_btn.clicked.connect(self._on_run_benchmark)
+        buttons.addWidget(self.run_bench_btn)
+
         self.import_btn = QPushButton("Import Remote Log")
         self.import_btn.setToolTip(
             "Fetch the selected server's llama-server log (via Server Management\n"
@@ -136,6 +192,12 @@ class BenchmarkTab(QWidget):
         self.clear_btn = QPushButton("Clear History")
         self.clear_btn.clicked.connect(self._on_clear_history)
         buttons.addWidget(self.clear_btn)
+
+        self.compare_btn = QPushButton("Compare Selected")
+        self.compare_btn.setEnabled(False)
+        self.compare_btn.setToolTip("Select 2 or more history rows (Ctrl/Shift+click) to compare.")
+        self.compare_btn.clicked.connect(self._on_compare_selected)
+        buttons.addWidget(self.compare_btn)
         buttons.addStretch()
         layout.addLayout(buttons)
 
@@ -148,6 +210,9 @@ class BenchmarkTab(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
+        self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.table)
 
         self._totals_label = QLabel("")
@@ -171,21 +236,48 @@ class BenchmarkTab(QWidget):
     # Live session API (called by the main window)
     # ------------------------------------------------------------------
 
-    def begin_session(self, preset: str = "", fingerprint: str = ""):
+    def begin_session(self, preset: str = "", fingerprint: str = "",
+                      config=None, estimate=None):
         """Start accumulating stats for a freshly launched server.
 
         ``preset``/``fingerprint`` link the session to the preset and the
         exact parameters in use; the preset info button uses them to show
-        (and invalidate) benchmark info.
+        (and invalidate) benchmark info. ``config``/``estimate`` are used
+        to build a descriptive label and detail tooltip once the session
+        is persisted.
         """
         self._stats = SessionStats()
         self._line_buffer = ""
         self._session_preset = preset or ""
         self._session_fingerprint = fingerprint or ""
+        self._session_config = config
+        self._session_estimate = estimate
+        self._resource = ResourceAccumulator()
         self._running = True
         self._started = time.time()
         self._status_label.setText("Running")
+        self._gpu_label.setText("--")
+        self._vram_label.setText("--")
+        self.run_bench_btn.setEnabled(True)
         self._refresh_live_labels()
+
+    def is_recording(self) -> bool:
+        """Whether a live session is currently accumulating stats."""
+        return self._running
+
+    def record_usage_sample(self, sample) -> None:
+        """Feed one live resource sample (GPU%/VRAM/RAM) into the running session.
+
+        Called by the main window's existing usage poller; only accumulates
+        while a session is actually running.
+        """
+        if not self._running or sample is None:
+            return
+        self._resource.add(sample)
+        if sample.gpu_percent >= 0:
+            self._gpu_label.setText(f"{sample.gpu_percent:.0f}%")
+        if sample.gpu_mem_used_mb >= 0:
+            self._vram_label.setText(f"{sample.gpu_mem_used_mb:.0f} MB")
 
     def feed_log(self, text: str):
         """Parse a chunk of server log output (handles split lines)."""
@@ -205,14 +297,21 @@ class BenchmarkTab(QWidget):
             self._line_buffer = ""
         self._running = False
         self._status_label.setText("Idle")
+        self.run_bench_btn.setEnabled(False)
         if self._stats.requests <= 0 and self._stats.gen_tokens <= 0:
             self._refresh_live_labels()
             return
         self._refresh_live_labels()
-        label = self._session_preset or "Local session"
+        model_path = getattr(self._session_config, "model_path", "") or ""
+        context_size = getattr(self._session_config, "context_size", None)
+        label = build_session_label(
+            model_path, self._session_preset, kind="live", source="local",
+            context_size=context_size)
         session = self._session_dict(
             source="local", label=label,
-            started=self._started, duration_s=time.time() - self._started)
+            started=self._started, duration_s=time.time() - self._started,
+            kind="live", model_path=model_path,
+            config=self._session_config, estimate=self._session_estimate)
         session["preset"] = self._session_preset
         session["fingerprint"] = self._session_fingerprint
         append_session(session)
@@ -247,8 +346,14 @@ class BenchmarkTab(QWidget):
 
     def _session_dict(self, source: str, label: str,
                       started: float, duration_s: float,
-                      stats: SessionStats = None) -> dict:
+                      stats: SessionStats = None, kind: str = "live",
+                      model_path: str = "", config=None, estimate=None) -> dict:
         s = stats if stats is not None else self._stats
+        family, quant = infer_model_hints(model_path) if model_path else ("unknown", None)
+        # Resource sampling only accumulates for the live-session path (see
+        # record_usage_sample); an imported/benchmark-delta stats object has
+        # no corresponding sample window, so resource stats are omitted for it.
+        resource = self._resource.summary() if (kind == "live" and self._resource.count) else {}
         return {
             "source": source,
             "label": label,
@@ -259,6 +364,14 @@ class BenchmarkTab(QWidget):
             "prompt_ms": s.prompt_ms,
             "gen_tokens": s.gen_tokens,
             "gen_ms": s.gen_ms,
+            "kind": kind,
+            "model_path": model_path,
+            "model_family": family if family != "unknown" else "",
+            "model_quant": quant or "",
+            "config_snapshot": config_snapshot_fields(config) if config is not None else {},
+            "estimate": estimate_summary(estimate),
+            "resource": resource,
+            **s.percentiles(),
         }
 
     # ------------------------------------------------------------------
@@ -267,8 +380,9 @@ class BenchmarkTab(QWidget):
 
     def _reload_history(self):
         sessions = load_sessions()
+        self._current_sessions = list(reversed(sessions))  # row index -> session, newest on top
         self.table.setRowCount(len(sessions))
-        for row, s in enumerate(reversed(sessions)):  # newest on top
+        for row, s in enumerate(self._current_sessions):
             started = s.get("started", 0)
             started_text = (datetime.fromtimestamp(started).strftime("%Y-%m-%d %H:%M")
                             if started else "--")
@@ -288,12 +402,33 @@ class BenchmarkTab(QWidget):
                 f"{speed_out:.1f}" if gen_ms > 0 else "--",
                 _fmt_duration(float(s.get("duration_s", 0))),
             ]
+            tooltip = build_session_tooltip(s)
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
                 if col >= 2:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                item.setToolTip(tooltip)
                 self.table.setItem(row, col, item)
         self._update_totals(sessions)
+
+    def _on_row_double_clicked(self, row: int, _column: int):
+        if 0 <= row < len(self._current_sessions):
+            session = self._current_sessions[row]
+            QMessageBox.information(
+                self, "Session Detail", build_session_tooltip(session))
+
+    def _on_selection_changed(self):
+        rows = {idx.row() for idx in self.table.selectedIndexes()}
+        self.compare_btn.setEnabled(len(rows) >= 2)
+
+    def _on_compare_selected(self):
+        rows = sorted({idx.row() for idx in self.table.selectedIndexes()})
+        sessions = [self._current_sessions[r] for r in rows
+                   if 0 <= r < len(self._current_sessions)]
+        if len(sessions) < 2:
+            return
+        dialog = SessionCompareDialog(sessions, self)
+        dialog.exec()
 
     def _update_totals(self, sessions):
         total = SessionStats()
@@ -323,21 +458,6 @@ class BenchmarkTab(QWidget):
             QMessageBox.information(self, "Import Remote Log",
                                     "No server selected.")
             return
-        conn = self._manager.get_connection(server_name)
-        if conn is None:
-            QMessageBox.warning(self, "Import Remote Log",
-                                f"No connection for '{server_name}'.")
-            return
-        if (conn.config.connection_type == ConnectionType.SSH
-                and conn.connection_state.value == "disconnected"):
-            reply = QMessageBox.question(
-                self, "Import Remote Log",
-                f"'{server_name}' is not connected. Connect now and fetch the log?",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
         self.import_btn.setEnabled(False)
         self.import_btn.setText("Fetching...")
         self._fetch_worker = _LogFetchWorker(self._manager, server_name, self)
@@ -364,9 +484,11 @@ class BenchmarkTab(QWidget):
             return
         # Build the imported session from the parsed stats directly so an
         # in-progress live session's accumulators are never clobbered.
+        label = build_session_label("", "", kind="remote_import", source=server_name)
         session = self._session_dict(
-            source=server_name, label=f"Remote: {server_name}",
-            started=time.time(), duration_s=stats.busy_seconds, stats=stats)
+            source=server_name, label=label,
+            started=time.time(), duration_s=stats.busy_seconds, stats=stats,
+            kind="remote_import")
         replace_sessions_for_source(server_name, session)
         self._reload_history()
 
@@ -379,3 +501,86 @@ class BenchmarkTab(QWidget):
         if reply == QMessageBox.Yes:
             clear_sessions()
             self._reload_history()
+
+    # ------------------------------------------------------------------
+    # Built-in benchmark runner
+    #
+    # v1 targets only the ad hoc "Launch" flow on this machine (the running
+    # live session already wired to feed_log). The benchmark's completions
+    # flow through that same live log pipeline as any other traffic, so the
+    # live SessionStats keeps counting them as genuine server activity too
+    # -- this just also slices out a separately-labeled "benchmark" session
+    # from the same underlying samples.
+    # ------------------------------------------------------------------
+
+    def _on_run_benchmark(self):
+        if not self._running or self._bench_worker is not None:
+            return
+        host = getattr(self._session_config, "host", "") or "127.0.0.1"
+        if host in ("0.0.0.0", ""):
+            host = "127.0.0.1"
+        port = getattr(self._session_config, "port", None) or 8080
+        base_url = f"http://{host}:{port}"
+
+        self._bench_snapshot = (len(self._stats.prompt_ms_samples),
+                                len(self._stats.gen_tps_samples))
+        self._bench_run_cfg = BenchmarkRunConfig()
+        self.run_bench_btn.setEnabled(False)
+        self.run_bench_btn.setText("Running Benchmark...")
+
+        self._bench_worker = _BenchmarkRunWorker(base_url, self._bench_run_cfg, self)
+        self._bench_worker.done.connect(self._on_benchmark_http_done)
+        self._bench_worker.failed.connect(self._on_benchmark_failed)
+        self._bench_worker.finished.connect(self._on_benchmark_worker_finished)
+        self._bench_worker.start()
+
+    def _on_benchmark_worker_finished(self):
+        if self._bench_worker is not None:
+            self._bench_worker.deleteLater()
+        self._bench_worker = None
+
+    def _on_benchmark_http_done(self):
+        # Give the log stream a brief moment to flush the timing lines for
+        # the just-completed HTTP requests before slicing them out.
+        QTimer.singleShot(500, self._capture_benchmark_result)
+
+    def _capture_benchmark_result(self):
+        self.run_bench_btn.setText("Run Benchmark")
+        self.run_bench_btn.setEnabled(self._running)
+        if self._bench_snapshot is None:
+            return
+        prompt_start, gen_start = self._bench_snapshot
+        self._bench_snapshot = None
+        cfg = self._bench_run_cfg
+
+        sliced = self._stats.slice_from(prompt_start, gen_start)
+        if cfg.warmup:
+            sliced = sliced.slice_from(1, 1) if sliced.requests > 1 else SessionStats()
+
+        if sliced.requests <= 0:
+            QMessageBox.information(
+                self, "Run Benchmark",
+                "No timing data was captured for the benchmark run.")
+            return
+
+        model_path = getattr(self._session_config, "model_path", "") or ""
+        context_size = getattr(self._session_config, "context_size", None)
+        label = build_session_label(
+            model_path, self._session_preset, kind="benchmark", source="local",
+            context_size=context_size)
+        session = self._session_dict(
+            source="local", label=label,
+            started=time.time() - sliced.busy_seconds, duration_s=sliced.busy_seconds,
+            stats=sliced, kind="benchmark", model_path=model_path,
+            config=self._session_config, estimate=self._session_estimate)
+        session["benchmark_params"] = {
+            "n_predict": cfg.n_predict, "iterations": cfg.iterations, "warmup": cfg.warmup,
+        }
+        append_session(session)
+        self._reload_history()
+
+    def _on_benchmark_failed(self, msg: str):
+        self.run_bench_btn.setText("Run Benchmark")
+        self.run_bench_btn.setEnabled(self._running)
+        self._bench_snapshot = None
+        QMessageBox.warning(self, "Run Benchmark", f"Benchmark run failed: {msg}")

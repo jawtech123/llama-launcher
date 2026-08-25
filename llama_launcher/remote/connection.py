@@ -1,7 +1,9 @@
 """Abstract Server Connection Interface."""
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import List, Optional, Tuple
+from llama_launcher.gpu.types import GPUInfo
 from llama_launcher.models.types import ModelInfo
+from .procinfo import ResourceSample
 from .types import (
     ConnectionState,
     ServerConfig,
@@ -33,6 +35,74 @@ class IServerConnection(ABC):
     @abstractmethod
     def disconnect(self) -> None:
         """Close the connection."""
+
+    @abstractmethod
+    def test_connection(self) -> Tuple[bool, str]:
+        """Probe the host and return ``(ok, message)``.
+
+        Unlike :meth:`connect`, the message explains *why* a probe failed
+        (authentication, DNS, no route) so the UI can show something actionable
+        instead of a bare failure.
+        """
+
+    @abstractmethod
+    def home_directory(self) -> str:
+        """Return the login user's home directory on the target host.
+
+        Used as the fallback starting point when browsing the filesystem.
+        """
+
+    @abstractmethod
+    def path_kind(self, path: str) -> str:
+        """Classify ``path`` on the target host as ``dir``, ``file``, or ``missing``."""
+
+    @abstractmethod
+    def resolve_executable(self, path_or_name: str) -> str:
+        """Return the runnable absolute path for a command, or "" if it is not.
+
+        A bare name is looked up on the target's PATH; anything containing a
+        slash is tested directly. Note the launcher's commands run
+        non-interactively, so a name only present via a shell rc file will
+        correctly resolve to "".
+        """
+
+    @abstractmethod
+    def find_server_binary(self) -> str:
+        """Search the usual build locations for llama-server on this host."""
+
+    @abstractmethod
+    def detect_gpu(self) -> "GPUInfo":
+        """Describe the GPU of the machine this connection targets.
+
+        The launcher runs on one machine and the model runs on another, so the
+        GPU that matters for sizing a model is this one, not the local card.
+        """
+
+    @abstractmethod
+    def total_ram_mb(self) -> float:
+        """Total system RAM of the target machine, or -1 if unknown."""
+
+    @abstractmethod
+    def sample_usage(self) -> ResourceSample:
+        """Take a live CPU/RAM/GPU utilization reading from the target machine."""
+
+    @abstractmethod
+    def port_listener_pid(self, port: int) -> Optional[int]:
+        """PID listening on ``port``, or None if the port is free.
+
+        The port is what tells co-hosted llama-server instances apart, so this
+        both identifies a server and detects a conflict before starting one.
+        Returns None for a listener owned by another user, which is
+        indistinguishable from free at this level.
+        """
+
+    @abstractmethod
+    def log_follow_argv(self, lines: int = 0) -> List[str]:
+        """Return an argv that streams this server's log until killed.
+
+        The caller owns the process. Returning an argv rather than a file handle
+        is what lets one worker follow both a local file and a remote one.
+        """
 
     @abstractmethod
     def execute(self, command: str) -> bool:

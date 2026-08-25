@@ -2,14 +2,26 @@
 import logging
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from llama_launcher.models.types import ModelInfo
 from llama_launcher.models.scanner import scan_models as _scan_filesystem
+from llama_launcher.gpu.detector import detect_gpu
+from llama_launcher.gpu.types import GPUInfo
+
 from .connection import IServerConnection
+from .procinfo import (
+    ResourceSample, build_status_probe, build_usage_probe, parse_gpu_stats,
+    parse_listener_pid, parse_meminfo, parse_ps_stats, parse_usage_probe,
+    split_status_probe,
+)
 from .types import (
+    LEGACY_PID_FILE,
+    LLAMA_SERVER_CANDIDATES,
+    pid_file_name,
     ConnectionState,
     ServerConfig,
     ServerStatus,
@@ -36,16 +48,9 @@ class LocalServerConnection(IServerConnection):
     @property
     def connection_state(self) -> ConnectionState:
         if self._state == ConnectionState.DISCONNECTED:
-            try:
-                subprocess.run(
-                    ["which", self._config.llama_server_path.split()[0]],
-                    capture_output=True,
-                    check=True,
-                    timeout=1,
-                )
-                self._state = ConnectionState.CONNECTED
-            except Exception:
-                self._state = ConnectionState.ERROR
+            # Don't auto-detect — let the user explicitly connect.
+            # Return DISCONNECTED so the UI shows placeholder values.
+            return self._state
         return self._state
 
     def connect(self) -> bool:
@@ -62,9 +67,41 @@ class LocalServerConnection(IServerConnection):
             self._state = ConnectionState.ERROR
             return False
 
+    def test_connection(self) -> Tuple[bool, str]:
+        """Check the configured binary is actually runnable on this machine."""
+        binary = (self._config.llama_server_path or "llama-server").split()[0]
+        resolved = shutil.which(binary)
+        if resolved is None and Path(binary).expanduser().is_file():
+            resolved = str(Path(binary).expanduser())
+        if resolved is None:
+            self._state = ConnectionState.ERROR
+            return (False, f"llama-server binary not found: {binary}")
+        self._state = ConnectionState.CONNECTED
+        return (True, f"Local machine — using {resolved}")
+
+    def home_directory(self) -> str:
+        return str(Path.home())
+
+    def log_follow_argv(self, lines: int = 0) -> List[str]:
+        # -F (not -f) keeps following across the truncation/rotation that a
+        # server restart causes, and waits for a log that does not exist yet.
+        return ["tail", "-n", str(int(lines)), "-F", self._log_path()]
+
+    def path_kind(self, path: str) -> str:
+        target = Path(path).expanduser()
+        if target.is_dir():
+            return "dir"
+        if target.exists():
+            return "file"
+        return "missing"
+
     def disconnect(self) -> None:
-        # Don't reset to DISCONNECTED — keep cached CONNECTED/ERROR state
-        # so subsequent connection_state checks don't spawn subprocesses.
+        """Mark this server disconnected and release anything it was holding.
+
+        The state really is cleared: connection_state no longer re-probes, so
+        leaving it CONNECTED would mean Disconnect appeared to do nothing.
+        """
+        self._state = ConnectionState.DISCONNECTED
         if self._log_process:
             self._log_process.terminate()
             self._log_process = None
@@ -140,13 +177,20 @@ class LocalServerConnection(IServerConnection):
         if not target.exists():
             return entries
         for item in target.iterdir():
-            stat = item.stat()
+            # A broken symlink or an unreadable entry must not abort the whole
+            # listing -- report what we can and leave its metadata at zero.
+            try:
+                stat = item.stat()
+                size_bytes, modified_time = stat.st_size, stat.st_mtime
+                is_directory = item.is_dir()
+            except OSError:
+                size_bytes, modified_time, is_directory = 0, 0.0, False
             entries.append(FileEntry(
                 name=item.name,
                 path=str(item),
-                is_directory=item.is_dir(),
-                size_bytes=stat.st_size,
-                modified_time=stat.st_mtime,
+                is_directory=is_directory,
+                size_bytes=size_bytes,
+                modified_time=modified_time,
             ))
         return entries
 
@@ -179,8 +223,13 @@ class LocalServerConnection(IServerConnection):
     def get_server_pid(self) -> Optional[int]:
         """PID of the llama-server process for this connection.
 
-        Resolution order: in-memory stored PID -> PID file (written at start)
-        -> pgrep fallback (status display only; stopping uses tracked PIDs).
+        Resolution order: in-memory PID -> PID file (written at start) -> the
+        process listening on this server's configured port.
+
+        Deliberately no process-name search: any llama-server on the machine
+        would match, so a stopped entry would report an unrelated instance's PID,
+        CPU and RAM as its own. The port is what identifies *this* server, and it
+        still finds one started outside the launcher.
         """
         pid = self._stored_pid
         if pid and self._pid_alive(pid):
@@ -193,9 +242,9 @@ class LocalServerConnection(IServerConnection):
             self._stored_pid = pid
             return pid
 
-        pids = self._find_llama_pids()
-        if pids:
-            return pids[0]
+        pid = self._pid_on_configured_port()
+        if pid and self._pid_alive(pid):
+            return pid
         return None
 
     @staticmethod
@@ -206,15 +255,26 @@ class LocalServerConnection(IServerConnection):
         except OSError:
             return False
 
+    def _working_dir(self) -> Path:
+        return Path(self._config.working_directory).expanduser()
+
+    def _log_path(self) -> str:
+        return str(self._working_dir() / self._config.log_file)
+
     def _pid_file_path(self) -> Path:
-        return Path(self._config.working_directory).expanduser() / ".llama_launcher_server.pid"
+        return self._working_dir() / pid_file_name(self._config.friendly_name)
 
     def _read_pid_file(self) -> Optional[int]:
-        try:
-            text = self._pid_file_path().read_text().strip()
-            return int(text) if text else None
-        except (OSError, ValueError):
-            return None
+        candidates = [self._pid_file_path(),
+                      self._working_dir() / LEGACY_PID_FILE]
+        for path in candidates:
+            try:
+                text = path.read_text().strip()
+                if text:
+                    return int(text)
+            except (OSError, ValueError):
+                continue
+        return None
 
     def _write_pid_file(self, pid: int) -> None:
         try:
@@ -228,92 +288,104 @@ class LocalServerConnection(IServerConnection):
         except OSError:
             logger.debug("Could not remove PID file", exc_info=True)
 
-    def _find_llama_pids(self) -> List[int]:
+    def resolve_executable(self, path_or_name: str) -> str:
+        name = (path_or_name or "").strip()
+        if not name:
+            return ""
+        if "/" in name:
+            candidate = Path(name).expanduser()
+            return str(candidate) if os.access(candidate, os.X_OK) else ""
+        return shutil.which(name) or ""
+
+    def find_server_binary(self) -> str:
+        for candidate in LLAMA_SERVER_CANDIDATES:
+            resolved = self.resolve_executable(candidate)
+            if resolved:
+                return resolved
+        return self.resolve_executable("llama-server")
+
+    def detect_gpu(self) -> GPUInfo:
+        return detect_gpu()
+
+    def total_ram_mb(self) -> float:
         try:
-            # -x: exact process name only; -f would match any cmdline
-            # containing "llama-server" (shells, editors, this tool).
+            with open("/proc/meminfo", "r") as f:
+                _, total_mb = parse_meminfo(f.read())
+            return total_mb
+        except OSError:
+            logger.debug("Could not read /proc/meminfo", exc_info=True)
+            return -1.0
+
+    def sample_usage(self) -> ResourceSample:
+        """Sample this machine through the same probe used for remote hosts.
+
+        Sharing the probe keeps local and remote readings directly comparable
+        rather than subtly different measurements of the same quantities.
+        """
+        try:
             result = subprocess.run(
-                "pgrep -x llama-server",
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
+                ["sh", "-c", build_usage_probe()],
+                capture_output=True, text=True, timeout=20,
             )
-            if result.returncode == 0 and result.stdout.strip():
-                return [int(p) for p in result.stdout.strip().split("\n")]
+            return parse_usage_probe(result.stdout, self._own_pids())
         except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
-        return []
+            logger.debug("usage sample failed", exc_info=True)
+            return ResourceSample()
+
+    def _own_pids(self) -> List[int]:
+        pid = self._tracked_pid()
+        return [pid] if pid else []
+
+    def port_listener_pid(self, port: int) -> Optional[int]:
+        try:
+            result = subprocess.run(
+                ["ss", "-tlnpH", f"sport = :{int(port)}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return parse_listener_pid(result.stdout)
+        except Exception:
+            logger.debug("port -> pid lookup failed", exc_info=True)
+        return None
+
+    def _pid_on_configured_port(self) -> Optional[int]:
+        """PID listening on this server's own port."""
+        return self.port_listener_pid(self._config.server_port or 8080)
 
     def get_status(self) -> ServerStatus:
         pid = self.get_server_pid()
         if not pid:
             return ServerStatus(state=ServerProcessState.STOPPED)
 
-        status = ServerStatus(
-            state=ServerProcessState.RUNNING,
-            pid=pid,
-        )
-
-        try:
-            ps_out = subprocess.run(
-                f"ps -p {pid} -o %cpu,rss,etimes,comm --no-headers",
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if ps_out.returncode == 0 and ps_out.stdout.strip():
-                parts = ps_out.stdout.strip().split()
-                if len(parts) >= 3:
-                    status.cpu_percent = float(parts[0])
-                    status.ram_mb = float(parts[1]) / 1024.0
-                    status.uptime_seconds = float(parts[2])
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
-
+        status = ServerStatus(state=ServerProcessState.RUNNING, pid=pid)
         port = self._config.server_port or 8080
-        try:
-            ss_out = subprocess.run(
-                f"ss -tlnp | grep -E ':{int(port)} '",
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if ss_out.returncode == 0:
-                status.listening_port = port
-        except Exception:
-            logger.debug("ss port check failed", exc_info=True)
 
+        # One probe for every field instead of three separate spawns.
         try:
-            nvidia_out = subprocess.run(
-                "nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader,nounits",
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
+            result = subprocess.run(
+                ["sh", "-c", build_status_probe(pid, port)],
+                capture_output=True, text=True, timeout=15,
             )
-            if nvidia_out.returncode == 0 and nvidia_out.stdout.strip():
-                lines = nvidia_out.stdout.strip().split("\n")
-                for line in lines:
-                    vals = [v.strip() for v in line.split(",")]
-                    if len(vals) >= 2:
-                        status.gpu_utilization = float(vals[0])
-                        status.gpu_memory_mb = float(vals[1])
-                        break
+            ps_out, ss_out, gpu_out = split_status_probe(result.stdout)
         except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
+            logger.debug("status probe failed", exc_info=True)
+            return status
 
+        status.cpu_percent, status.ram_mb, status.uptime_seconds = parse_ps_stats(ps_out)
+        # Only claim the port when *this* process owns it.
+        listener_pid = parse_listener_pid(ss_out)
+        if ss_out and (listener_pid is None or listener_pid == pid):
+            status.listening_port = port
+        status.gpu_utilization, status.gpu_memory_mb = parse_gpu_stats(gpu_out)
         return status
 
     def start_server(self, command: str) -> bool:
-        log_path = str(Path(self._config.working_directory).expanduser() / self._config.log_file)
+        log_path = self._log_path()
         # "(cd ... && exec ...)" makes $! the PID of llama-server itself
         # (otherwise $! tracks a wrapper subshell). < /dev/null detaches it
         # so subprocess.run sees pipe EOF immediately.
         start_cmd = (
-            f"(cd {shlex.quote(str(Path(self._config.working_directory).expanduser()))} && "
+            f"(cd {shlex.quote(str(self._working_dir()))} && "
             f"exec nohup {command} > {shlex.quote(log_path)} 2>&1 < /dev/null) & echo $!"
         )
 
@@ -327,9 +399,16 @@ class LocalServerConnection(IServerConnection):
                 cwd=str(Path(self._config.working_directory).expanduser()),
             )
             if result.returncode == 0 and result.stdout.strip():
-                self._stored_pid = int(result.stdout.strip())
-                self._write_pid_file(self._stored_pid)
-                return True
+                pid = int(result.stdout.strip())
+                # Verify this PID is actually alive and matches what we expect
+                # (in case the shell reused a PID or something went wrong)
+                try:
+                    os.kill(pid, 0)
+                    self._stored_pid = pid
+                    self._write_pid_file(pid)
+                    return True
+                except OSError:
+                    logger.warning("start_server: reported PID %s exited immediately", pid)
             logger.warning("start_server failed (rc=%s): %s", result.returncode, result.stderr.strip())
             return False
         except Exception:
@@ -377,7 +456,7 @@ class LocalServerConnection(IServerConnection):
         return self.start_server(command)
 
     def tail_log(self, lines: int = 100) -> str:
-        log_path = str(Path(self._config.working_directory).expanduser() / self._config.log_file)
+        log_path = self._log_path()
         try:
             result = subprocess.run(
                 f"tail -n {int(lines)} {shlex.quote(log_path)}",

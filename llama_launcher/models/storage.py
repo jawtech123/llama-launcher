@@ -62,6 +62,16 @@ def save_models(server_name: str, models: List[ModelInfo]) -> None:
     _save_cache(cached)
 
 
+def remove_models(server_name: str) -> bool:
+    """Drop a server's cached model list. True if there was one to drop."""
+    cached = _load_cache()
+    if server_name not in cached:
+        return False
+    del cached[server_name]
+    _save_cache(cached)
+    return True
+
+
 def get_cached_server_names() -> List[str]:
     """Return server names that have cached model lists."""
     return list(_load_cache().keys())

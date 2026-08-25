@@ -17,6 +17,16 @@ venv/
 logs/
 *.log
 
+# Build / distribution outputs
+dist/
+build/
+
+# PyInstaller temp files
+*.spec
+
 # OS
 .DS_Store
 Thumbs.db
+
+# Local tool state
+.opencode/

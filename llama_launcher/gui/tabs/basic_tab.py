@@ -8,7 +8,9 @@ from PySide6.QtWidgets import (
 
 from llama_launcher.core.fields import CACHE_TYPES
 from llama_launcher.gui.config_controller import ConfigController
-from llama_launcher.gui.widgets import BinaryContextSpinBox, info_label
+from llama_launcher.gui.dialogs.path_picker import MODEL_PATTERNS, RemotePathDialog
+from llama_launcher.gui.server_bar import ServerBar
+from llama_launcher.gui.widgets import info_label
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +27,8 @@ class BasicTab(QWidget):
     def __init__(self, controller: ConfigController, parent=None):
         super().__init__(parent)
         self.controller = controller
+        self._manager = None
+        self._server_name_provider = None
         self._build_ui()
         self._bind_fields()
 
@@ -55,10 +59,10 @@ class BasicTab(QWidget):
         self.save_preset_btn = QPushButton("Save Preset")
         bar.addWidget(self.save_preset_btn)
 
-        bar.addWidget(QLabel("Server:"))
-        self.server_combo = QComboBox()
-        self.server_combo.setMinimumWidth(140)
-        bar.addWidget(self.server_combo)
+        self.server_bar = ServerBar()
+        # Kept as an alias: plenty of call sites drive the combo directly.
+        self.server_combo = self.server_bar.combo
+        bar.addWidget(self.server_bar)
         bar.addStretch()
 
         self.manage_presets_btn = QPushButton("Manage Presets...")
@@ -91,9 +95,11 @@ class BasicTab(QWidget):
             self._with_browse(self.draft_combo, self._browse_draft),
         )
 
-        self.ctx_spin = BinaryContextSpinBox()
+        self.ctx_spin = QSpinBox()
+        self.ctx_spin.setRange(256, 1048576)
+        self.ctx_spin.setSingleStep(1024)
+        self.ctx_spin.setSpecialValueText("")
         self.ctx_spin.setToolTip("Size of the prompt context in tokens. Default: 4096.")
-        self.ctx_spin.editingFinished.connect(self._on_ctx_editing_finished)
         self.ctx_spin.setMinimumWidth(120)
         form.addRow(info_label("Context Size:", "Size of the prompt context in tokens."),
                     self.ctx_spin)
@@ -205,24 +211,55 @@ class BasicTab(QWidget):
     # Browse handlers + context rounding
     # ------------------------------------------------------------------
 
+    def set_browse_context(self, manager, server_name_provider) -> None:
+        """Supply the server context used to decide where Browse looks.
+
+        Without this the pickers stay local-only, which is what standalone
+        (test) construction of the tab wants.
+        """
+        self._manager = manager
+        self._server_name_provider = server_name_provider
+
+    def _pick_model_file(self, title: str) -> str:
+        """Pick a model file on whichever machine the selected server runs on.
+
+        Browsing the launcher's own filesystem for a remote server would hand
+        llama-server a path that does not exist on that host.
+        """
+        manager = getattr(self, "_manager", None)
+        provider = getattr(self, "_server_name_provider", None)
+        server_name = ""
+        if manager is not None and provider is not None:
+            try:
+                server_name = provider() or ""
+            except Exception:
+                logger.debug("Could not determine the selected server", exc_info=True)
+
+        if server_name and manager is not None and manager.is_remote(server_name):
+            conn = manager.get_connection(server_name)
+            if conn is not None:
+                model_dirs = manager.get_server_model_directories(server_name)
+                return RemotePathDialog.get_path(
+                    self, conn, mode="file",
+                    start_path=model_dirs[0] if model_dirs else "",
+                    title=f"{title} on {server_name}",
+                    name_filter=MODEL_PATTERNS,
+                ) or ""
+
+        path, _ = QFileDialog.getOpenFileName(self, title, "", _MODEL_FILTER)
+        return path or ""
+
     def _browse_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Main Model File", "", _MODEL_FILTER)
+        path = self._pick_model_file("Select Main Model File")
         if path:
             self.model_combo.setEditText(path)
 
     def _browse_mmproj(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select mmproj Model File", "", _MODEL_FILTER)
+        path = self._pick_model_file("Select mmproj Model File")
         if path:
             self.mmproj_combo.setEditText(path)
 
     def _browse_draft(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Select Draft Model File", "", _MODEL_FILTER)
+        path = self._pick_model_file("Select Draft Model File")
         if path:
             self.draft_combo.setEditText(path)
-
-    def _on_ctx_editing_finished(self):
-        """Snap a hand-typed context size to the nearest binary size."""
-        value = self.ctx_spin.value()
-        rounded = self.ctx_spin.round_to_binary_context(value)
-        if rounded != value:
-            self.ctx_spin.setValue(rounded)

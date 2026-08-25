@@ -59,9 +59,9 @@ class ImportTab(QWidget):
             QMessageBox.warning(self, "Error", "Please enter a launch command.")
             return
 
-        params, unrecognized = parse_launch_command(command_str)
+        params, unrecognized, duplicates = parse_launch_command(command_str)
 
-        if not params and not unrecognized:
+        if not params and not unrecognized and not duplicates:
             QMessageBox.warning(self, "Error", "No parameters detected in the command.")
             return
 
@@ -73,6 +73,11 @@ class ImportTab(QWidget):
             result_lines.append("")
             result_lines.append("Skipped (unrecognized) flags:")
             for flag in unrecognized:
+                result_lines.append(f"  {flag}")
+        if duplicates:
+            result_lines.append("")
+            result_lines.append("Duplicate flags (keeping last value):")
+            for flag in duplicates:
                 result_lines.append(f"  {flag}")
         self.import_result_text.setPlainText("\n".join(result_lines))
 
@@ -104,12 +109,16 @@ class ImportTab(QWidget):
         )
         PresetManager.save_custom_preset(name, config)
 
+        warning_parts = []
         if unrecognized:
+            warning_parts.append(f"{len(unrecognized)} unrecognized flag(s) skipped:\n" + "\n".join(unrecognized))
+        if duplicates:
+            warning_parts.append(f"{len(duplicates)} duplicate flag(s) (kept last value):\n" + "\n".join(duplicates))
+        if warning_parts:
             QMessageBox.information(
                 self, "Preset Created",
                 f"Preset '{name}' created.\n\n"
-                f"Note: {len(unrecognized)} unrecognized flag(s) were skipped:\n"
-                + "\n".join(unrecognized),
+                f"Notes:\n" + "\n\n".join(warning_parts),
             )
         else:
             QMessageBox.information(self, "Success", f"Preset '{name}' created successfully.")

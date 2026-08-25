@@ -1,53 +1,323 @@
-"""SSH Server Connection Implementation."""
+"""SSH Server Connection Implementation.
+
+Commands run through the ``ssh`` client rather than an in-process SSH library.
+Two consequences worth knowing:
+
+* A ``ControlMaster`` socket is shared by every command to this host, so only the
+  first call pays for the TCP handshake and authentication. That is what makes
+  interactive directory browsing usable, and it means a password is supplied once
+  per ``ControlPersist`` window instead of once per command.
+* Each command is an independent process, so several GUI worker threads can talk
+  to the same server concurrently without any locking on our side.
+"""
 import logging
 import os
-import threading
+import shlex
+import subprocess
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+from llama_launcher.gpu.detector import NVIDIA_SMI_QUERY, parse_nvidia_smi_gpus
+from llama_launcher.gpu.types import GPUInfo
+from llama_launcher.models.scanner import build_model_info
 from llama_launcher.models.types import ModelInfo
+from llama_launcher.utils.paths import ssh_control_dir
+
+#: Glob patterns for the remote ``find``; mirrors scanner.MODEL_EXTENSIONS.
+MODEL_EXTENSIONS = ("*.gguf", "*.bin", "*.safetensors")
+
 from .connection import IServerConnection
+from .procinfo import (
+    ResourceSample, build_status_probe, build_usage_probe, parse_gpu_stats,
+    parse_listener_pid, parse_meminfo, parse_ps_stats, parse_usage_probe,
+    split_status_probe,
+)
 from .types import (
+    LEGACY_PID_FILE,
+    LLAMA_SERVER_CANDIDATES,
+    pid_file_name,
     ConnectionState,
     ServerConfig,
     ServerStatus,
     ServerProcessState,
     FileEntry,
-    AuthMethod,
 )
-
-try:
-    import paramiko
-except ImportError:
-    paramiko = None
 
 logger = logging.getLogger(__name__)
 
+#: How long the shared master connection lingers after the last command.
+_CONTROL_PERSIST_SECONDS = 120
+
+#: Model files are huge; a transfer gets hours, not the usual command timeout.
+_SCP_TIMEOUT = 6 * 60 * 60
+
+#: How often to re-measure the destination while a transfer runs.
+_PROGRESS_POLL_SECONDS = 0.5
+
+#: A ControlPath is a unix socket. ssh refuses one whose expanded length reaches
+#: ~108 bytes, and expands %C to 64 hex characters.
+_CONTROL_PATH_TOKEN_LEN = 64
+_CONTROL_PATH_MAX = 100
+
+
+def _control_path() -> Optional[str]:
+    """ControlPath template for connection reuse, or None if it would be too long.
+
+    Losing connection reuse only costs speed; an over-long path would make every
+    ssh command fail outright, so we drop the option instead.
+    """
+    template = f"{ssh_control_dir()}/%C"
+    expanded_len = len(template) - len("%C") + _CONTROL_PATH_TOKEN_LEN
+    if expanded_len >= _CONTROL_PATH_MAX:
+        logger.warning(
+            "SSH connection reuse disabled: control path would be %d bytes (%s)",
+            expanded_len, template)
+        return None
+    return template
+
+#: Helper that hands ssh a password from the environment. ``SSH_ASKPASS_REQUIRE``
+#: (OpenSSH 8.4+) makes ssh use it even with a terminal attached.
+_ASKPASS_SCRIPT = '#!/bin/sh\nprintf \'%s\\n\' "$LL_SSH_PASSWORD"\n'
+
 
 class SSHServerConnection(IServerConnection):
-    """Manages a remote llama-server instance via SSH/SFTP.
+    """Manages a remote llama-server instance via SSH."""
 
-    Thread-safety: several GUI worker threads (status polls, file browser,
-    model scans) share one connection. ``_lock`` serializes connect and
-    client reference swaps; SFTP operations hold ``_sftp_lock`` because
-    SFTPClient is not thread-safe (the SSH Transport itself is fine with
-    concurrent channels). ``disconnect()`` swaps the references out under
-    the lock but closes the transport *outside* it, so a thread blocked in
-    a paramiko call errors out immediately instead of deadlocking.
-    """
-
-    SSH_TIMEOUT = 15
-    COMMAND_TIMEOUT = 30
-
-    def __init__(self, config: ServerConfig):
+    def __init__(self, config: ServerConfig, allow_multiplexing: bool = True):
+        """
+        Args:
+            allow_multiplexing: Share one authenticated connection across
+                commands. Turn it off to force a real authentication -- the
+                control socket is keyed on host/port/user but *not* on the
+                credentials, so an existing master would otherwise let a probe
+                succeed without the credentials being exercised at all.
+        """
         self._config = config
         self._state = ConnectionState.DISCONNECTED
-        self._client: Optional[paramiko.SSHClient] = None
-        self._sftp = None
         self._stored_pid: Optional[int] = None
-        self._lock = threading.RLock()
-        self._sftp_lock = threading.Lock()
-        self._closing = False
+        self._last_stderr = ""
+        self._remote_home: Optional[str] = None
+        self._allow_multiplexing = allow_multiplexing
+        self._ssh_base_cmd = self._build_ssh_base()
+
+    # ------------------------------------------------------------------
+    # Command construction
+    # ------------------------------------------------------------------
+
+    def _uses_password(self) -> bool:
+        return bool(self._config.auth_method == "password" and self._config.password)
+
+    def _key_file(self) -> Optional[str]:
+        key = (self._config.key_path or "").strip()
+        if not key:
+            return None
+        key = os.path.expanduser(key)
+        return key if os.path.isfile(key) else None
+
+    def _shared_options(self) -> List[str]:
+        """Options common to ssh and scp: host checking, timeout, auth, reuse."""
+        opts = [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=10",
+        ]
+        control_path = _control_path() if self._allow_multiplexing else None
+        if not self._allow_multiplexing:
+            # Explicitly refuse an existing master, not merely decline to open one.
+            opts += ["-o", "ControlPath=none"]
+        if control_path:
+            # Reuse one authenticated connection for every subsequent command.
+            opts += [
+                "-o", "ControlMaster=auto",
+                "-o", f"ControlPath={control_path}",
+                "-o", f"ControlPersist={_CONTROL_PERSIST_SECONDS}",
+            ]
+        if self._uses_password():
+            # BatchMode would make ssh fail rather than ask; the askpass helper
+            # supplies the password non-interactively instead.
+            opts += [
+                "-o", "BatchMode=no",
+                "-o", "NumberOfPasswordPrompts=1",
+                "-o", "PubkeyAuthentication=no",
+                "-o", "PreferredAuthentications=password,keyboard-interactive",
+            ]
+        else:
+            opts += ["-o", "BatchMode=yes"]
+        key = self._key_file()
+        if key:
+            # Must precede the destination: ssh stops parsing options at user@host.
+            opts += ["-i", key]
+        return opts
+
+    def _build_ssh_base(self) -> List[str]:
+        """Build the ssh argv prefix (everything up to the remote command)."""
+        return [
+            "ssh",
+            *self._shared_options(),
+            "-p", str(self._config.ssh_port),
+            f"{self._config.username}@{self._config.hostname}",
+        ]
+
+    def _askpass_env(self) -> Optional[dict]:
+        """Environment that lets ssh read the password from our helper script.
+
+        The password travels in the child's environment rather than argv, so it
+        is not visible in the process list.
+        """
+        if not self._uses_password():
+            return None
+        helper = ssh_control_dir() / "askpass.sh"
+        try:
+            if not helper.exists() or helper.read_text() != _ASKPASS_SCRIPT:
+                helper.write_text(_ASKPASS_SCRIPT)
+            os.chmod(helper, 0o700)
+        except OSError:
+            logger.warning("Could not create SSH askpass helper at %s", helper)
+            return None
+        env = dict(os.environ)
+        env.update({
+            "SSH_ASKPASS": str(helper),
+            "SSH_ASKPASS_REQUIRE": "force",
+            "LL_SSH_PASSWORD": self._config.password,
+            # Older ssh only consults SSH_ASKPASS when DISPLAY is set.
+            "DISPLAY": env.get("DISPLAY", ":0"),
+        })
+        return env
+
+    def _run_remote(self, cmd: str, capture: bool = False, timeout: int = 30) -> tuple:
+        """Run a command on the remote host. Returns ``(ok, stdout)``.
+
+        Stderr is always captured and kept in ``self._last_stderr`` so callers
+        can report why something failed.
+        """
+        argv = [*self._ssh_base_cmd, cmd]
+        try:
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=self._askpass_env(),
+            )
+            self._last_stderr = (result.stderr or "").strip()
+            return (result.returncode == 0, result.stdout if capture else "")
+        except subprocess.TimeoutExpired:
+            self._last_stderr = f"Timed out after {timeout}s"
+            return (False, "")
+        except (subprocess.SubprocessError, OSError) as e:
+            logger.debug("SSH command failed: %s", e)
+            self._last_stderr = str(e)
+            return (False, "")
+
+    def _scp_remote(self, local_path: str, remote_path: str,
+                    direction: str = "upload", progress_cb=None) -> bool:
+        """Copy a file to (``upload``) or from (``download``) the remote host."""
+        remote_spec = f"{self._config.username}@{self._config.hostname}:{remote_path}"
+        argv = ["scp", *self._shared_options(), "-P", str(self._config.ssh_port)]
+        local_is_dir = os.path.isdir(local_path)
+        if direction == "upload":
+            if local_is_dir:
+                argv.append("-r")
+            argv += [local_path, remote_spec]
+        else:
+            # Recursion is decided by the remote side, which we cannot cheaply
+            # stat here; -r is harmless for a plain file.
+            argv += ["-r", remote_spec, local_path]
+
+        if progress_cb is None:
+            try:
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=_SCP_TIMEOUT,
+                    env=self._askpass_env(),
+                )
+                self._last_stderr = (result.stderr or "").strip()
+                return result.returncode == 0
+            except Exception as e:
+                logger.debug("SCP failed", exc_info=True)
+                self._last_stderr = str(e)
+                return False
+        return self._scp_with_progress(argv, local_path, remote_path,
+                                       direction, progress_cb)
+
+    def _scp_with_progress(self, argv, local_path, remote_path,
+                           direction, progress_cb) -> bool:
+        """Run scp, reporting progress by watching the destination grow.
+
+        scp only draws a progress bar to a terminal, so rather than allocate a
+        pty we poll the size of the file being written. Model files are large
+        enough that a silent transfer is not acceptable.
+        """
+        total = self._transfer_total_bytes(local_path, remote_path, direction)
+        try:
+            process = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=self._askpass_env(),
+            )
+        except Exception as e:
+            logger.debug("SCP failed to start", exc_info=True)
+            self._last_stderr = str(e)
+            return False
+
+        try:
+            while process.poll() is None:
+                time.sleep(_PROGRESS_POLL_SECONDS)
+                done = self._destination_size(remote_path, local_path, direction)
+                # A raising callback is how the UI cancels.
+                progress_cb(done, total)
+            _, stderr = process.communicate(timeout=30)
+            self._last_stderr = (stderr or "").strip()
+            if process.returncode == 0:
+                progress_cb(total, total)
+                return True
+            return False
+        except Exception as e:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+            self._last_stderr = str(e)
+            # A half-copied model is indistinguishable from a real one by name
+            # and size alone, so do not leave it lying around.
+            self._remove_partial(remote_path, local_path, direction)
+            raise
+
+    def _remove_partial(self, remote_path, local_path, direction) -> None:
+        """Delete the incomplete destination file after an aborted transfer."""
+        try:
+            if direction == "download":
+                Path(local_path).unlink(missing_ok=True)
+            else:
+                self._run_remote(f"rm -f {shlex.quote(remote_path)}", timeout=15)
+        except Exception:
+            logger.debug("Could not remove partial transfer", exc_info=True)
+
+    def _transfer_total_bytes(self, local_path, remote_path, direction) -> int:
+        """Size of the source file, for percentage reporting."""
+        try:
+            if direction == "upload":
+                return os.path.getsize(local_path)
+            success, output = self._run_remote(
+                f"stat -c %s {shlex.quote(remote_path)}", capture=True, timeout=15)
+            return int(output.strip()) if success and output.strip() else 0
+        except (OSError, ValueError):
+            return 0
+
+    def _destination_size(self, remote_path, local_path, direction) -> int:
+        """Bytes written so far at the destination."""
+        try:
+            if direction == "download":
+                return os.path.getsize(local_path)
+            success, output = self._run_remote(
+                f"stat -c %s {shlex.quote(remote_path)} 2>/dev/null || echo 0",
+                capture=True, timeout=15)
+            return int(output.strip()) if success and output.strip() else 0
+        except (OSError, ValueError):
+            return 0
+
+    # ------------------------------------------------------------------
+    # Connection lifecycle
+    # ------------------------------------------------------------------
 
     @property
     def config(self) -> ServerConfig:
@@ -55,424 +325,409 @@ class SSHServerConnection(IServerConnection):
 
     @property
     def connection_state(self) -> ConnectionState:
+        """Last known state. Deliberately does not probe.
+
+        Reading a server's state used to open an SSH connection, so merely
+        listing servers reached out over the network and an unreachable host
+        stalled the UI for a full connect timeout. Connecting is an explicit
+        action now.
+        """
         return self._state
 
-    @staticmethod
-    def _transport_active(client) -> bool:
-        if client is None:
-            return False
-        try:
-            transport = client.get_transport()
-        except Exception:
-            return False
-        return bool(transport) and transport.is_active()
-
-    def _get_client(self) -> paramiko.SSHClient:
-        if not self._transport_active(self._client):
-            self.connect()
-        client = self._client
-        if client is None or not self._transport_active(client):
-            raise ConnectionError("Not connected")
-        return client
-
-    def _get_sftp(self):
-        """Return a live SFTP client, recreating it if the channel died."""
-        if self._sftp is not None:
-            try:
-                chan = self._sftp.get_channel()
-                if chan is None or chan.closed:
-                    self._sftp = None
-            except Exception:
-                self._sftp = None
-        if self._sftp is None:
-            self._sftp = self._get_client().open_sftp()
-        return self._sftp
-
     def connect(self) -> bool:
-        if paramiko is None:
-            self._state = ConnectionState.ERROR
-            return False
+        """Test SSH connectivity to the remote host."""
+        ok, _ = self.test_connection()
+        return ok
 
-        with self._lock:
-            if self._closing:
-                return False
-            if self._transport_active(self._client):
-                self._state = ConnectionState.CONNECTED
-                return True
-            self._state = ConnectionState.CONNECTING
-            try:
-                client = paramiko.SSHClient()
-                client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    def test_connection(self) -> Tuple[bool, str]:
+        """Probe the host, returning ``(ok, message)`` with ssh's own diagnosis."""
+        if not self._config.hostname.strip():
+            return (False, "No hostname configured")
+        if not self._config.username.strip():
+            return (False, "No username configured")
+        success, _ = self._run_remote("exit 0", timeout=20)
+        if success:
+            self._state = ConnectionState.CONNECTED
+            return (True, f"Connected to {self._config.username}@{self._config.hostname}")
+        self._state = ConnectionState.ERROR
+        return (False, self._error_message())
 
-                kwargs = {
-                    "hostname": self._config.hostname,
-                    "port": self._config.port,
-                    "username": self._config.username,
-                    "timeout": self.SSH_TIMEOUT,
-                    "allow_agent": False,
-                    "look_for_keys": False,
-                }
-
-                if self._config.auth_method == AuthMethod.SSH_KEY:
-                    if self._config.private_key_path:
-                        kwargs["key_filename"] = str(
-                            Path(self._config.private_key_path).expanduser()
-                        )
-
-                if self._config.password:
-                    kwargs["password"] = self._config.password
-
-                client.connect(**kwargs)
-                self._client = client
-                self._state = ConnectionState.CONNECTED
-                return True
-
-            except Exception:
-                self._state = ConnectionState.ERROR
-                return False
+    def _error_message(self) -> str:
+        """Turn ssh's stderr into a single actionable line."""
+        noise = ("warning: permanently added", "pseudo-terminal")
+        lines = [
+            line.strip() for line in self._last_stderr.splitlines()
+            if line.strip() and not any(n in line.lower() for n in noise)
+        ]
+        return lines[-1] if lines else "Connection failed (no details from ssh)"
 
     def disconnect(self) -> None:
-        with self._lock:
-            client, sftp = self._client, self._sftp
-            self._client = None
-            self._sftp = None
-            self._state = ConnectionState.DISCONNECTED
-        # Close outside the lock: if another thread is blocked inside a
-        # paramiko call on this transport, closing it makes that call raise
-        # right away instead of waiting for the lock to free up.
-        if sftp is not None:
-            try:
-                sftp.close()
-            except Exception:
-                logger.debug("Suppressed exception", exc_info=True)
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                logger.debug("Suppressed exception", exc_info=True)
+        """Mark disconnected and drop the shared SSH master connection.
+
+        Closing the master matters: leaving it open would let later commands
+        keep working against a server the user believes is disconnected.
+        """
+        self._state = ConnectionState.DISCONNECTED
+        self.shutdown()
 
     def shutdown(self) -> None:
-        """Close for application teardown; blocks any further reconnects."""
-        self._closing = True
-        self.disconnect()
+        """Tear down the shared master connection (called on app close)."""
+        try:
+            subprocess.run(
+                [*self._ssh_base_cmd[:-1], "-O", "exit", self._ssh_base_cmd[-1]],
+                capture_output=True, text=True, timeout=5,
+            )
+        except Exception:
+            logger.debug("Could not close SSH master connection", exc_info=True)
 
     def execute(self, command: str) -> bool:
-        try:
-            client = self._get_client()
-            _, stdout, stderr = client.exec_command(
-                command, timeout=self.COMMAND_TIMEOUT
-            )
-            exit_status = stdout.channel.recv_exit_status()
-            return exit_status == 0
-        except Exception:
-            self._state = ConnectionState.ERROR
-            return False
+        success, _ = self._run_remote(command)
+        return success
 
     def execute_and_capture(self, command: str) -> str:
-        try:
-            client = self._get_client()
-            _, stdout, stderr = client.exec_command(
-                command, timeout=self.COMMAND_TIMEOUT
-            )
-            output = stdout.read().decode("utf-8", errors="ignore")
-            exit_status = stdout.channel.recv_exit_status()
-            if exit_status != 0:
-                err = stderr.read().decode("utf-8", errors="ignore")
-                raise RuntimeError(f"Command failed: {err or command}")
-            return output
-        except Exception:
-            self._state = ConnectionState.ERROR
-            raise
+        success, output = self._run_remote(command, capture=True)
+        if not success:
+            raise RuntimeError(f"Command failed: {command}")
+        return output
 
     def upload_file(self, local_path: str, remote_path: str, progress_cb=None) -> bool:
-        with self._sftp_lock:
-            try:
-                sftp = self._get_sftp()
-                remote_dir = str(Path(remote_path).parent)
-                try:
-                    sftp.stat(remote_dir)
-                except FileNotFoundError:
-                    self._mkdirs(sftp, remote_dir)
-                sftp.put(str(Path(local_path).expanduser()), remote_path,
-                         callback=progress_cb)
-                return True
-            except Exception:
-                logger.debug("upload_file failed", exc_info=True)
-                return False
+        parent = remote_path.rsplit("/", 1)[0] if "/" in remote_path else "."
+        self._run_remote(f"mkdir -p {shlex.quote(parent)}")
+        return self._scp_remote(local_path, remote_path, direction="upload",
+                                progress_cb=progress_cb)
 
     def download_file(self, remote_path: str, local_path: str, progress_cb=None) -> bool:
-        with self._sftp_lock:
-            try:
-                sftp = self._get_sftp()
-                local_dir = Path(local_path).parent
-                local_dir.mkdir(parents=True, exist_ok=True)
-                sftp.get(remote_path, str(local_dir / Path(local_path).name),
-                         callback=progress_cb)
-                return True
-            except Exception:
-                logger.debug("download_file failed", exc_info=True)
-                return False
-
-    def _mkdirs(self, sftp, path: str) -> None:
-        parts = Path(path).parts
-        current = ""
-        for part in parts:
-            if not part:
-                current = "/"
-                continue
-            current = current.rstrip("/") + "/" + part
-            try:
-                sftp.stat(current)
-            except FileNotFoundError:
-                sftp.mkdir(current, 0o755)
+        os.makedirs(str(Path(local_path).parent), exist_ok=True)
+        return self._scp_remote(local_path, remote_path, direction="download",
+                                progress_cb=progress_cb)
 
     def list_directory(self, remote_path: str) -> List[FileEntry]:
+        """List a remote directory.
+
+        Uses ``find -printf`` rather than parsing ``ls -l``: the fields are
+        unambiguous, ``%T@`` is a real epoch timestamp, ``%Y`` follows symlinks so
+        a link to a directory is reported as one, and there is no ``total`` header
+        line to mistake for an entry. Falls back to a name-only ``ls`` for hosts
+        without GNU findutils.
+        """
+        quoted = shlex.quote(remote_path)
+        success, output = self._run_remote(
+            f"find {quoted} -mindepth 1 -maxdepth 1 -printf '%Y\\t%s\\t%T@\\t%f\\n'",
+            capture=True,
+        )
+        if not success:
+            return self._list_directory_fallback(remote_path)
+
         entries = []
-        with self._sftp_lock:
+        for line in output.splitlines():
+            parts = line.split("\t", 3)
+            if len(parts) < 4:
+                continue
+            kind, size_str, mtime_str, name = parts
+            if not name:
+                continue
             try:
-                sftp = self._get_sftp()
-                for item in sftp.listdir_attr(remote_path):
-                    entries.append(FileEntry(
-                        name=item.filename,
-                        path=f"{remote_path}/{item.filename}",
-                        is_directory=item.st_mode & 0o40000 != 0,
-                        size_bytes=item.st_size,
-                        modified_time=float(item.st_mtime),
-                    ))
-            except Exception:
-                logger.debug("Suppressed exception", exc_info=True)
+                size_bytes = int(size_str)
+            except ValueError:
+                size_bytes = 0
+            try:
+                modified_time = float(mtime_str)
+            except ValueError:
+                modified_time = 0.0
+            entries.append(FileEntry(
+                name=name,
+                path=self._join(remote_path, name),
+                is_directory=(kind == "d"),
+                size_bytes=size_bytes,
+                modified_time=modified_time,
+            ))
         return entries
 
+    def _list_directory_fallback(self, remote_path: str) -> List[FileEntry]:
+        """Name-only listing for remotes without ``find -printf`` (BSD, macOS)."""
+        success, output = self._run_remote(
+            f"ls -A -p {shlex.quote(remote_path)}", capture=True,
+        )
+        if not success:
+            return []
+        entries = []
+        for name in output.splitlines():
+            name = name.strip()
+            if not name:
+                continue
+            is_dir = name.endswith("/")
+            name = name.rstrip("/")
+            entries.append(FileEntry(
+                name=name,
+                path=self._join(remote_path, name),
+                is_directory=is_dir,
+            ))
+        return entries
+
+    @staticmethod
+    def _join(directory: str, name: str) -> str:
+        """Join remote POSIX path components (never the launcher's local rules)."""
+        return f"{directory.rstrip('/')}/{name}"
+
+    def home_directory(self) -> str:
+        if self._remote_home is None:
+            success, output = self._run_remote(
+                'printf %s "$HOME"', capture=True, timeout=15)
+            home = output.strip() if success else ""
+            if not home:
+                # Do not cache a guess; a later call may reach the host.
+                return f"/home/{self._config.username}"
+            self._remote_home = home
+        return self._remote_home
+
+    # ------------------------------------------------------------------
+    # Remote paths
+    # ------------------------------------------------------------------
+
+    def _remote_working_dir(self) -> str:
+        """Working directory as it exists *on the remote host*.
+
+        ``Path.expanduser()`` would resolve ``~`` against the launcher's own home,
+        which is the wrong user (and possibly the wrong layout) for the remote
+        machine, so a leading ``~`` is resolved from the remote ``$HOME``.
+        """
+        configured = (self._config.working_directory or "~").strip()
+        if configured == "~":
+            return self.home_directory()
+        if configured.startswith("~/"):
+            return f"{self.home_directory().rstrip('/')}/{configured[2:]}"
+        return configured
+
+    def _remote_log_path(self) -> str:
+        return f"{self._remote_working_dir().rstrip('/')}/{self._config.log_file}"
+
+    def _remote_pid_file(self) -> str:
+        return (f"{self._remote_working_dir().rstrip('/')}/"
+                f"{pid_file_name(self._config.friendly_name)}")
+
+    def log_follow_argv(self, lines: int = 0) -> List[str]:
+        return [*self._ssh_base_cmd,
+                f"tail -n {int(lines)} -F {shlex.quote(self._remote_log_path())}"]
+
+    def path_kind(self, path: str) -> str:
+        quoted = shlex.quote(path)
+        success, output = self._run_remote(
+            f'if [ -d {quoted} ]; then echo dir; elif [ -e {quoted} ]; then echo file; '
+            f'else echo missing; fi',
+            capture=True, timeout=15,
+        )
+        kind = output.strip() if success else ""
+        return kind if kind in ("dir", "file", "missing") else "missing"
+
     def create_directory(self, remote_path: str) -> bool:
-        with self._sftp_lock:
-            try:
-                sftp = self._get_sftp()
-                try:
-                    # Idempotent: already-existing directory is success.
-                    if sftp.stat(remote_path).st_mode & 0o40000:
-                        return True
-                except FileNotFoundError:
-                    pass
-                parent = str(Path(remote_path).parent)
-                try:
-                    sftp.stat(parent)
-                except FileNotFoundError:
-                    self._mkdirs(sftp, parent)
-                sftp.mkdir(remote_path, 0o755)
-                return True
-            except Exception:
-                logger.debug("create_directory failed", exc_info=True)
-                return False
+        success, _ = self._run_remote(f"mkdir -p {shlex.quote(remote_path)}")
+        return success
 
     def delete_file(self, remote_path: str) -> bool:
-        with self._sftp_lock:
-            try:
-                sftp = self._get_sftp()
-                sftp.remove(remote_path)
-                return True
-            except FileNotFoundError:
-                return False
-            except Exception:
-                return False
+        success, _ = self._run_remote(f"rm -f {shlex.quote(remote_path)}")
+        return success
 
     def rename_file(self, old_path: str, new_path: str) -> bool:
-        with self._sftp_lock:
-            try:
-                sftp = self._get_sftp()
-                sftp.rename(old_path, new_path)
-                return True
-            except Exception:
-                return False
+        success, _ = self._run_remote(
+            f"mv {shlex.quote(old_path)} {shlex.quote(new_path)}"
+        )
+        return success
 
     def get_server_pid(self) -> Optional[int]:
-        """PID of the remote llama-server (stored -> PID file -> pgrep)."""
+        """PID of this server's llama-server process on the remote host.
+
+        Same resolution order as the local transport: tracked PID -> PID file ->
+        the process listening on this server's configured port. A PID found via
+        the port is reported but never stored as *tracked*, so stop_server can
+        only ever signal a process the launcher itself started.
+
+        No process-name search: besides matching any llama-server on the host,
+        the old `pgrep -f llama-server` also matched the very shell running it
+        ("sh -c pgrep -f llama-server"), reporting a server that was not there.
+        """
         pid = self._stored_pid
+        if pid and self._pid_alive(pid):
+            return pid
         if pid:
-            try:
-                result = self.execute_and_capture(
-                    f"kill -0 {pid} 2>/dev/null && echo alive"
-                )
-                if "alive" in result:
-                    return pid
-            except Exception:
-                self._stored_pid = None
+            self._stored_pid = None
 
         pid = self._read_pid_file()
-        if pid and self._remote_pid_alive(pid):
+        if pid and self._pid_alive(pid):
             self._stored_pid = pid
             return pid
 
-        try:
-            # -x: exact process name only; -f would match any cmdline
-            # containing "llama-server" (shells, editors, pgrep itself).
-            output = self.execute_and_capture(
-                "pgrep -x llama-server"
-            )
-            if output.strip():
-                pids = [int(p.strip()) for p in output.strip().split("\n")]
-                if pids:
-                    return pids[0]
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
-        return None
+        return self._pid_on_configured_port()
 
-    def _remote_pid_alive(self, pid: int) -> bool:
+    def resolve_executable(self, path_or_name: str) -> str:
+        name = (path_or_name or "").strip()
+        if not name:
+            return ""
+        quoted = shlex.quote(name)
+        if "/" in name:
+            # Expand a leading ~ on the remote side, then test executability.
+            probe = f'p=$(eval echo {quoted}); [ -x "$p" ] && printf %s "$p"'
+        else:
+            probe = f"command -v {quoted} 2>/dev/null"
+        _, output = self._run_remote(probe, capture=True, timeout=20)
+        return (output or "").strip()
+
+    def find_server_binary(self) -> str:
+        """Locate llama-server on the remote host in one round trip."""
+        checks = " ".join(
+            f'p=$(eval echo {shlex.quote(c)}); [ -x "$p" ] && {{ printf %s "$p"; exit 0; }};'
+            for c in LLAMA_SERVER_CANDIDATES
+        )
+        _, output = self._run_remote(
+            f"{checks} command -v llama-server 2>/dev/null", capture=True, timeout=30)
+        return (output or "").strip()
+
+    def detect_gpu(self) -> GPUInfo:
+        """Describe the *remote* GPU, parsed exactly like the local one.
+
+        nvidia-smi exits non-zero when the driver and library disagree, so the
+        exit code is ignored in favour of whatever it printed -- that text is the
+        diagnosis, and reporting "no GPU" instead would be actively misleading.
+        """
+        _, output = self._run_remote(
+            " ".join(shlex.quote(part) for part in NVIDIA_SMI_QUERY),
+            capture=True, timeout=20)
+        parsed = parse_nvidia_smi_gpus(output)
+        if parsed is not None:
+            return parsed
+
+        detail = [line.strip() for line in
+                  f"{output}\n{self._last_stderr}".splitlines() if line.strip()]
+        if any("nvidia-smi" in line and "not found" in line.lower() for line in detail):
+            return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0,
+                           device_name="No NVIDIA GPU on this host", supported=True)
+        if detail:
+            # e.g. "Failed to initialize NVML: Driver/library version mismatch"
+            return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0,
+                           device_name=detail[0][:140], supported=False)
+        return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0,
+                       device_name="No NVIDIA GPU on this host", supported=True)
+
+    def total_ram_mb(self) -> float:
+        _, output = self._run_remote("cat /proc/meminfo", capture=True, timeout=20)
+        _, total_mb = parse_meminfo(output)
+        return total_mb
+
+    def sample_usage(self) -> ResourceSample:
+        # The probe's exit status is whatever its last command returned, so a
+        # host without a working nvidia-smi would otherwise throw away its
+        # perfectly good CPU and RAM figures.
+        _, output = self._run_remote(build_usage_probe(), capture=True, timeout=30)
+        return parse_usage_probe(output, self._own_pids())
+
+    def _own_pids(self) -> List[int]:
+        pid = self._stored_pid
+        return [pid] if pid else []
+
+    def port_listener_pid(self, port: int) -> Optional[int]:
+        success, output = self._run_remote(
+            f"ss -tlnpH 'sport = :{int(port)}'", capture=True)
+        return parse_listener_pid(output) if success else None
+
+    def _pid_on_configured_port(self) -> Optional[int]:
+        """PID listening on this server's own port -- the identity that
+        separates several llama-servers sharing one host."""
+        return self.port_listener_pid(self._config.server_port or 8080)
+
+    def _pid_alive(self, pid: int) -> bool:
         try:
-            result = self.execute_and_capture(
-                f"kill -0 {pid} 2>/dev/null && echo alive"
-            )
-            return "alive" in result
+            success, _ = self._run_remote(f"kill -0 {int(pid)}", capture=True, timeout=10)
+            return success
         except Exception:
             return False
 
-    def _pid_file_path(self) -> str:
-        return f"{self._config.working_directory}/.llama_launcher_server.pid"
-
     def _read_pid_file(self) -> Optional[int]:
-        try:
-            out = self.execute_and_capture(f"cat {self._pid_file_path()} 2>/dev/null")
-            text = out.strip()
-            return int(text) if text else None
-        except Exception:
-            return None
-
-    def _write_pid_file(self, pid: int) -> None:
-        try:
-            self.execute(f"echo {pid} > {self._pid_file_path()}")
-        except Exception:
-            logger.debug("Could not write remote PID file", exc_info=True)
-
-    def _remove_pid_file(self) -> None:
-        try:
-            self.execute(f"rm -f {self._pid_file_path()}")
-        except Exception:
-            logger.debug("Could not remove remote PID file", exc_info=True)
+        working = self._remote_working_dir().rstrip("/")
+        current = shlex.quote(self._remote_pid_file())
+        legacy = shlex.quote(f"{working}/{LEGACY_PID_FILE}")
+        success, output = self._run_remote(
+            f"cat {current} 2>/dev/null || cat {legacy} 2>/dev/null", capture=True)
+        if success and output.strip():
+            try:
+                return int(output.strip().splitlines()[0])
+            except (ValueError, IndexError):
+                pass
+        return None
 
     def get_status(self) -> ServerStatus:
         pid = self.get_server_pid()
         if not pid:
             return ServerStatus(state=ServerProcessState.STOPPED)
 
-        status = ServerStatus(
-            state=ServerProcessState.RUNNING,
-            pid=pid,
-        )
-
-        try:
-            ps_out = self.execute_and_capture(
-                f"ps -p {pid} -o %cpu,rss,etimes --no-headers"
-            )
-            if ps_out.strip():
-                parts = ps_out.strip().split()
-                if len(parts) >= 3:
-                    status.cpu_percent = float(parts[0])
-                    status.ram_mb = float(parts[1]) / 1024.0
-                    status.uptime_seconds = float(parts[2])
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
-
+        status = ServerStatus(state=ServerProcessState.RUNNING, pid=pid)
         port = self._config.server_port or 8080
-        try:
-            ss_out = self.execute_and_capture(
-                f"ss -tlnp | grep :{port}"
-            )
-            if ss_out.strip():
-                status.listening_port = port
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
 
-        try:
-            nvidia_out = self.execute_and_capture(
-                "nvidia-smi --query-gpu=utilization.gpu,memory.used "
-                "--format=csv,noheader,nounits 2>/dev/null"
-            )
-            if nvidia_out.strip():
-                lines = nvidia_out.strip().split("\n")
-                for line in lines:
-                    vals = [v.strip() for v in line.split(",")]
-                    if len(vals) >= 2:
-                        status.gpu_utilization = float(vals[0])
-                        status.gpu_memory_mb = float(vals[1])
-                        break
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
+        # One SSH round trip for every field; this runs on a 15s timer and used
+        # to cost three separate connections.
+        success, output = self._run_remote(
+            build_status_probe(pid, port), capture=True)
+        if not success:
+            return status
 
+        ps_out, ss_out, gpu_out = split_status_probe(output)
+        status.cpu_percent, status.ram_mb, status.uptime_seconds = parse_ps_stats(ps_out)
+        listener_pid = parse_listener_pid(ss_out)
+        if ss_out and (listener_pid is None or listener_pid == pid):
+            status.listening_port = port
+        status.gpu_utilization, status.gpu_memory_mb = parse_gpu_stats(gpu_out)
         return status
 
-    def _exec_quick(self, command: str, timeout: float = 8.0) -> str:
-        """Execute a command and return stdout without waiting for channel EOF.
-
-        ``execute_and_capture`` waits for EOF, which hangs when a backgrounded
-        child (e.g. nohup'd llama-server) inherits channel descriptors. This
-        waits only for the remote shell to exit, then drains and closes.
-        """
-        client = self._get_client()
-        chan = client.get_transport().open_session()
-        try:
-            chan.exec_command(command)
-            end = time.time() + timeout
-            data = b""
-            while time.time() < end:
-                if chan.recv_ready():
-                    data += chan.recv(4096)
-                    continue
-                if chan.exit_status_ready():
-                    break
-                time.sleep(0.05)
-            while chan.recv_ready():
-                data += chan.recv(4096)
-            return data.decode("utf-8", errors="ignore")
-        finally:
-            chan.close()
-
     def start_server(self, command: str) -> bool:
-        log_path = f"{self._config.working_directory}/{self._config.log_file}"
-        # "(cd ... && exec ...)" makes $! the PID of llama-server itself --
-        # without exec, the backgrounded AND-list forks a subshell and $!
-        # tracks the wrapper, leaving the real process orphaned on stop.
-        # < /dev/null detaches the child from the SSH channel's stdin.
+        working_dir = shlex.quote(self._remote_working_dir())
+        log_path = shlex.quote(self._remote_log_path())
+        pid_file = shlex.quote(self._remote_pid_file())
+        # Record the PID remotely too, so the launcher can still find and stop
+        # this instance after a restart -- and so co-hosted servers each keep
+        # their own PID file rather than sharing one.
         start_cmd = (
-            f"(cd {self._config.working_directory} && "
-            f"exec nohup {command} > {log_path} 2>&1 < /dev/null) & echo $!"
+            f"(cd {working_dir} && "
+            f"exec nohup {command} > {log_path} 2>&1 < /dev/null) & "
+            f"pid=$!; echo $pid > {pid_file}; echo $pid"
         )
-
-        try:
-            output = self._exec_quick(start_cmd)
-            if output.strip():
-                self._stored_pid = int(output.strip())
-                self._write_pid_file(self._stored_pid)
+        success, output = self._run_remote(start_cmd, capture=True)
+        if success and output.strip():
+            try:
+                pid = int(output.strip().splitlines()[-1])
+            except (ValueError, IndexError):
+                return False
+            if self._pid_alive(pid):
+                self._stored_pid = pid
                 return True
-            logger.warning("start_server: no PID returned for: %s", command[:80])
-            return False
-        except Exception:
-            logger.exception("start_server failed")
-            return False
+            logger.warning("start_server: remote PID %s exited immediately", pid)
+        return False
+
+    def _tracked_pid(self) -> Optional[int]:
+        """PID of a process the launcher started (stored or PID file)."""
+        if self._stored_pid and self._pid_alive(self._stored_pid):
+            return self._stored_pid
+        pid = self._read_pid_file()
+        if pid and self._pid_alive(pid):
+            return pid
+        return None
 
     def tracked_pid_alive(self) -> bool:
-        pid = self._stored_pid or self._read_pid_file()
-        return bool(pid) and self._remote_pid_alive(pid)
+        return self._tracked_pid() is not None
 
     def stop_server(self) -> bool:
-        # Only signal processes started by the launcher (tracked PID) --
-        # never a random llama-server found via machine-wide pgrep.
-        pid = self._stored_pid if self._stored_pid and self._remote_pid_alive(self._stored_pid) else None
-        if pid is None:
-            pid = self._read_pid_file()
-            if pid and not self._remote_pid_alive(pid):
-                pid = None
+        # Only ever signal a process the launcher started, never one merely
+        # discovered by port or pgrep.
+        pid = self._tracked_pid()
         if not pid:
             logger.info("stop_server: no tracked llama-server process to stop")
             return True
         try:
-            self.execute(f"kill {pid}")
-            time.sleep(0.5)
-            if self._remote_pid_alive(pid):
-                self.execute(f"kill -9 {pid}")
+            success, _ = self._run_remote(f"kill {int(pid)}", timeout=10)
+            if not success:
+                self._run_remote(f"kill -9 {int(pid)}", timeout=10)
             self._stored_pid = None
-            self._remove_pid_file()
+            self._run_remote(f"rm -f {shlex.quote(self._remote_pid_file())}", timeout=10)
             return True
         except Exception:
-            logger.exception("stop_server failed for remote pid %s", pid)
+            logger.exception("stop_server failed for pid %s", pid)
             return False
 
     def restart_server(self, command: str) -> bool:
@@ -481,81 +736,31 @@ class SSHServerConnection(IServerConnection):
         return self.start_server(command)
 
     def tail_log(self, lines: int = 100) -> str:
-        log_path = f"{self._config.working_directory}/{self._config.log_file}"
-        try:
-            return self.execute_and_capture(f"tail -n {lines} {log_path}")
-        except Exception:
-            return ""
+        log_path = shlex.quote(self._remote_log_path())
+        success, output = self._run_remote(f"tail -n {int(lines)} {log_path}", capture=True)
+        return output if success else ""
 
     def scan_model_directory(self, directory: str) -> List[ModelInfo]:
-        exts = ["*.gguf", "*.bin", "*.safetensors"]
-        models: List[ModelInfo] = []
-        try:
-            for ext in exts:
-                find_cmd = f"find '{directory}' -type f -name '{ext}' 2>/dev/null"
-                output = self.execute_and_capture(find_cmd)
-                for line in output.strip().split("\n"):
-                    fpath = line.strip()
-                    if not fpath:
-                        continue
-                    info = self._parse_remote_model(fpath)
-                    if info:
-                        models.append(info)
-        except Exception:
-            logger.debug("Suppressed exception", exc_info=True)
+        """Find model files on the remote host.
+
+        Classification is shared with the local scanner so both transports label
+        family and quantization identically.
+        """
+        ext_clauses = " -o ".join(f"-name {ext}" for ext in MODEL_EXTENSIONS)
+        find_cmd = (f"find {shlex.quote(directory)} -type f \\( {ext_clauses} \\) "
+                    f'-printf "%s\\t%p\\n"')
+        success, output = self._run_remote(find_cmd, capture=True, timeout=60)
+        if not success or not output.strip():
+            return []
+
+        models = []
+        for line in output.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) < 2:
+                continue
+            try:
+                size_bytes = int(parts[0])
+            except ValueError:
+                continue
+            models.append(build_model_info(parts[1], size_bytes))
         return models
-
-    def _parse_remote_model(self, file_path: str) -> Optional[ModelInfo]:
-        try:
-            stat_out = self.execute_and_capture(f"stat --format='%s' '{file_path}' 2>/dev/null")
-            size_bytes = int(stat_out.strip())
-            size_mb = round(size_bytes / (1024 * 1024), 2)
-        except Exception:
-            size_mb = 0.0
-
-        file_name = Path(file_path).name
-        suffix = Path(file_path).suffix.lower()
-        if suffix == ".gguf":
-            file_format = "gguf"
-        elif suffix == ".bin":
-            file_format = "bin"
-        elif suffix == ".safetensors":
-            file_format = "safetensors"
-        else:
-            file_format = "unknown"
-
-        name_lower = file_name.lower()
-        family = "unknown"
-        if "llama" in name_lower or "llm" in name_lower:
-            family = "llama"
-        elif "mistral" in name_lower:
-            family = "mistral"
-        elif "qwen" in name_lower or "qwen2" in name_lower or "qwq" in name_lower:
-            family = "qwen"
-        elif "codellama" in name_lower:
-            family = "codellama"
-        elif "phi" in name_lower:
-            family = "phi"
-        elif "gemma" in name_lower:
-            family = "gemma"
-
-        quant_type = None
-        quant_patterns = [
-            ("q8_0", "Q8_0"), ("q6_k", "Q6_K"), ("q5_k_m", "Q5_K_M"),
-            ("q5_0", "Q5_0"), ("q5_1", "Q5_1"), ("q4_k_m", "Q4_K_M"),
-            ("q4_0", "Q4_0"), ("q4_1", "Q4_1"), ("q3_k_m", "Q3_K_M"),
-            ("q3_k_s", "Q3_K_S"), ("q2_k", "Q2_K"),
-        ]
-        for pattern, quant_name in quant_patterns:
-            if pattern in name_lower:
-                quant_type = quant_name
-                break
-
-        return ModelInfo(
-            file_path=file_path,
-            file_name=file_name,
-            file_size_mb=size_mb,
-            format=file_format,
-            family=family,
-            quant_type=quant_type,
-        )

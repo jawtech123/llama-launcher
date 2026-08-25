@@ -124,6 +124,10 @@ def _ggml_type_name(t: int) -> str:
 _METADATA_CACHE: dict = {}
 _METADATA_CACHE_MAX = 64
 
+#: Ignore this much resident VRAM before assuming another model is loaded --
+#: a desktop compositor alone accounts for a few hundred MB.
+_VRAM_IN_USE_FLOOR_MB = 512
+
 
 def _metadata_cache_key(model_path: str):
     """Return a cache key for a model file, or None if it can't be stat'ed."""
@@ -402,8 +406,8 @@ class _GgufReader:
                         value_type, = struct.unpack("<i", f.read(4))
                         _bytes_read += 4
 
-                        value = _GgufReader._read_value(f, value_type, version)
-                        _bytes_read += _GgufReader._value_byte_size(value_type, value)
+                        value, val_bytes = _GgufReader._read_value(f, value_type, version)
+                        _bytes_read += val_bytes
 
                         kv_data[key] = value
                     except (struct.error, OSError, UnicodeDecodeError):
@@ -490,13 +494,9 @@ class _GgufReader:
                         type_name = _ggml_type_name(ggml_type)
                         meta.quant_types[type_name] = meta.quant_types.get(type_name, 0) + 1
 
-                        # Parameter counting from sample
-                        elem_count = 1
-                        for d in shape:
-                            elem_count *= d
-                        type_bits = _GGML_TYPE_BITS.get(ggml_type, 16.0)
-                        if type_bits > 0:
-                            meta.total_params += int(elem_count * (32.0 / type_bits))
+                        # Parameter counting from sample: sum tensor element counts.
+                        # elem_count is the number of parameters in this tensor.
+                        meta.total_params += elem_count
 
                         # DON'T seek past tensor data - it's too slow and unreliable
                         # Weight size will come from file size instead
@@ -535,41 +535,65 @@ class _GgufReader:
 
     @staticmethod
     def _read_value(f, value_type: int, version: int):
-        """Read a single GGUF value."""
+        """Read a single GGUF value and return (value, bytes_consumed)."""
         if value_type == 8:  # STRING
             strlen, = struct.unpack("<Q", f.read(8))
             strlen = min(strlen, 65536)
             # GGUF strings are length-prefixed with no NUL terminator (spec).
-            return f.read(strlen)
+            data = f.read(strlen)
+            return (data, 8 + len(data))
         elif value_type == 9:  # ARRAY
             arr_type, = struct.unpack("<i", f.read(4))
             arr_count, = struct.unpack("<Q", f.read(8))
             # Consume every item to keep the stream in sync; keep the first
             # 500 for inspection (tokenizer arrays can have 100k+ entries).
             items = []
+            item_bytes = _GgufReader._item_byte_size(arr_type)
+            total_bytes = 12 + arr_count * item_bytes  # 12 = 4 (arr_type) + 8 (arr_count)
             for idx in range(arr_count):
-                item = _GgufReader._read_value(f, arr_type, version)
+                item, _ = _GgufReader._read_value(f, arr_type, version)
                 if idx < 500:
                     items.append(item)
-            return items
+            return (items, total_bytes)
         elif value_type in (0, 4, 10):  # UINT8, UINT32, UINT64
             sizes = {0: "<B", 4: "<I", 10: "<Q"}
-            return struct.unpack(sizes[value_type], f.read(struct.calcsize(sizes[value_type])))[0]
+            sz = struct.calcsize(sizes[value_type])
+            return (struct.unpack(sizes[value_type], f.read(sz))[0], sz)
         elif value_type in (1, 3, 5):  # INT8, INT16, INT32
             sizes = {1: "<b", 3: "<h", 5: "<i"}
-            return struct.unpack(sizes[value_type], f.read(struct.calcsize(sizes[value_type])))[0]
+            sz = struct.calcsize(sizes[value_type])
+            return (struct.unpack(sizes[value_type], f.read(sz))[0], sz)
         elif value_type == 2:  # UINT16
-            return struct.unpack("<H", f.read(2))[0]
+            return (struct.unpack("<H", f.read(2))[0], 2)
         elif value_type == 6:  # FLOAT32
-            return struct.unpack("<f", f.read(4))[0]
+            return (struct.unpack("<f", f.read(4))[0], 4)
         elif value_type == 12:  # FLOAT64
-            return struct.unpack("<d", f.read(8))[0]
+            return (struct.unpack("<d", f.read(8))[0], 8)
         elif value_type == 7:  # BOOL
-            return struct.unpack("<?", f.read(1))[0]
+            return (struct.unpack("<?", f.read(1))[0], 1)
         elif value_type == 11:  # INT64
-            return struct.unpack("<q", f.read(8))[0]
+            return (struct.unpack("<q", f.read(8))[0], 8)
         else:
-            return None
+            return (None, 0)
+
+    @staticmethod
+    def _item_byte_size(value_type: int) -> int:
+        """Return byte size of a single GGUF value item (for array byte calculation)."""
+        if value_type in (0, 7):   # UINT8, BOOL
+            return 1
+        elif value_type == 2:     # UINT16
+            return 2
+        elif value_type in (1, 3, 4, 5, 6):  # INT8, INT16, UINT32, INT32, FLOAT32
+            return 4
+        elif value_type in (10, 11):  # UINT64, INT64
+            return 8
+        elif value_type == 12:    # FLOAT64
+            return 8
+        elif value_type == 8:     # STRING
+            return 8  # length prefix only (string data length is unknown without reading)
+        elif value_type == 9:     # ARRAY — shouldn't nest, but assume 4-byte items
+            return 4
+        return 4  # fallback
 
     @staticmethod
     def _value_byte_size(value_type: int, value) -> int:
@@ -578,20 +602,14 @@ class _GgufReader:
             if isinstance(value, bytes):
                 return 8 + len(value)
             return 0
-        elif value_type == 9:  # ARRAY
-            return 0  # Handled recursively
+        elif value_type == 9:  # ARRAY — bytes computed recursively in _read_value
+            return 0
         elif value_type in (0, 2, 4, 6, 7):  # UINT8, UINT16, UINT32, FLOAT32, BOOL
             return {0: 1, 2: 2, 4: 4, 6: 4, 7: 1}[value_type]
         elif value_type in (1, 3):  # INT8, INT16
             return {1: 1, 3: 2}[value_type]
         elif value_type in (5, 10, 11):  # INT32, UINT64, INT64
             return {5: 4, 10: 8, 11: 8}[value_type]
-        elif value_type == 12:  # FLOAT64
-            return 8
-        elif value_type in (5, 11):  # INT32, INT64
-            return {5: 4, 11: 8}[value_type]
-        elif value_type == 10:  # UINT64
-            return 8
         elif value_type == 12:  # FLOAT64
             return 8
         return 0
@@ -770,7 +788,7 @@ class ResourceEstimator:
     """
 
     # Fixed overhead estimates (MB) per GPU
-    CUDA_RUNTIME_MB = 300
+    CUDA_RUNTIME_MB = 1800
     HIP_RUNTIME_MB = 250
     VULKAN_RUNTIME_MB = 200
     METAL_RUNTIME_MB = 100
@@ -784,6 +802,10 @@ class ResourceEstimator:
 
     # Max supported GPUs
     MAX_GPUS = 8
+
+    # Inference buffer headroom multiplier (empirical, from ubatch VRAM measurements)
+    # llama.cpp internal buffers are ~2.3-2.5x larger than the base formula predicts
+    INFERENCE_BUFFER_HEADROOM = 2.5
 
     def __init__(self, safety_margin: float = DEFAULT_SAFETY_MARGIN):
         self._system_ram_mb = _get_system_ram_mb()
@@ -802,13 +824,23 @@ class ResourceEstimator:
         draft_model_size_mb: float = 0.0,
         mmproj_model_size_mb: float = 0.0,
         total_layer_count: int = 0,
+        system_ram_mb: float = -1.0,
     ) -> ResourceEstimate:
-        """Calculate resource estimates for the given configuration."""
+        """Calculate resource estimates for the given configuration.
+
+        Args:
+            system_ram_mb: RAM of the machine the model will run on. Defaults to
+                this machine's, which is wrong once a remote server is selected.
+        """
         est = ResourceEstimate()
+
+        # RAM of the machine that will run this, falling back to ours.
+        effective_ram_mb = (system_ram_mb if system_ram_mb and system_ram_mb > 0
+                            else self._system_ram_mb)
 
         # No model -- return empty estimate
         if model_size_mb <= 0:
-            est.system_total_ram_mb = self._system_ram_mb
+            est.system_total_ram_mb = effective_ram_mb
             if gpu_info:
                 est.gpu_total_vram_mb = float(gpu_info.vram_mb)
                 est.gpu_available_vram_mb = float(
@@ -819,7 +851,7 @@ class ResourceEstimator:
         est.model_file_size_mb = model_size_mb
         est.model_family = str(model_family) if model_family else "unknown"
         est.quant_type = str(quant_type) if quant_type else "unknown"
-        est.system_total_ram_mb = self._system_ram_mb
+        est.system_total_ram_mb = effective_ram_mb
 
         # ---- Read GGUF metadata ----
         meta = _GgufReader.read_full_metadata(model_path) if model_path else ModelMetadata()
@@ -891,6 +923,13 @@ class ResourceEstimator:
         kv_cache_total_mb = kv_cache_total_bytes / (1024 * 1024)
         est.kv_cache_total_mb = kv_cache_total_mb
 
+        # Unified KV cache overhead: when kv_unified=True, llama.cpp allocates
+        # n_parallel sequences upfront. Each additional parallel sequence adds
+        # ~30% of the base KV cache size (shared K buffers, separate V per seq).
+        kv_unified_overhead_mb = 0.0
+        if config.kv_unified and parallel > 1:
+            kv_unified_overhead_mb = kv_cache_total_mb * (parallel - 1) * 0.30
+
         # ---- 3. COMPUTE BUFFER ESTIMATION ----
         ubatch = max(config.ubatch_size, 1)
         batch = max(config.batch_size, ubatch)
@@ -945,13 +984,20 @@ class ResourceEstimator:
         if gpu_info and gpu_info.backend != "cpu" and config.kv_offload and gpu_layers > 0:
             est.kv_cache_gpu_mb = kv_cache_total_mb
             est.kv_cache_cpu_mb = 0.0
+
+            # Quantized cache types require additional internal buffers in llama.cpp
+            # when kv_offload=True (q4_0: -35% underest, q8_0: -48% underest)
+            quant_types = ("q4_0", "q4_k", "q5_0", "q5_k", "q6_k", "q8_0")
+            if config.cache_type_k in quant_types or config.cache_type_v in quant_types:
+                quant_overhead_factor = 1.42
+                est.kv_cache_gpu_mb *= quant_overhead_factor
         else:
             est.kv_cache_gpu_mb = 0.0
             est.kv_cache_cpu_mb = kv_cache_total_mb
 
         # Compute buffer split (proportional to GPU layers)
-        est.compute_buffers_gpu_mb = compute_buffer_mb * gpu_weight_ratio
-        est.compute_buffers_cpu_mb = compute_buffer_mb * cpu_weight_ratio
+        est.compute_buffers_gpu_mb = compute_buffer_mb * gpu_weight_ratio + kv_unified_overhead_mb * gpu_weight_ratio
+        est.compute_buffers_cpu_mb = compute_buffer_mb * cpu_weight_ratio + kv_unified_overhead_mb * cpu_weight_ratio
 
         # ---- 7. MULTI-GPU DISTRIBUTION ----
         if num_gpus > 1 and gpu_layers > 0:
@@ -1059,22 +1105,37 @@ class ResourceEstimator:
             est.gpu_available_vram_mb = sum(gb.available_vram_mb for gb in est.gpu_breakdowns)
 
         if est.gpu_total_vram_mb > 0:
-            # Remaining is measured against total VRAM, matching the usage
-            # bar (used/total). Using "available" (the nvidia-smi free-memory
-            # snapshot from detection time) produced nonsense like
-            # "Remaining: -16.6 GB (OVER)" next to a 26.2/31.8 GB bar whenever
-            # a server was already holding VRAM at detection time.
-            est.gpu_remaining_vram_mb = est.gpu_total_vram_mb - est.total_vram_mb
+            # Measured against VRAM this configuration could actually get, not
+            # the card's total. The caller supplies a live reading in which our
+            # own running server's allocation counts as available, because
+            # relaunching it releases that memory first -- without that, a
+            # loaded model made its own config look impossible to fit.
+            est.gpu_remaining_vram_mb = est.gpu_available_vram_mb - est.total_vram_mb
 
         # ---- 10. WARNINGS ----
         est.warnings = []
+
+        # Held by processes that are not ours; relaunching cannot reclaim it.
+        held_by_others_mb = max(0.0, est.gpu_total_vram_mb - est.gpu_available_vram_mb)
 
         if est.gpu_total_vram_mb > 0 and est.total_vram_mb > est.gpu_total_vram_mb:
             est.vram_exceeded = True
             est.warnings.append(
                 f"Estimated VRAM usage ({self._fmt_mb(est.total_vram_mb)}) exceeds "
-                f"available VRAM ({self._fmt_mb(est.gpu_total_vram_mb)}). "
+                f"total VRAM ({self._fmt_mb(est.gpu_total_vram_mb)}). "
                 f"Consider reducing gpu_layers, context size, or batch size."
+            )
+        elif (est.gpu_available_vram_mb > 0
+                and est.total_vram_mb > est.gpu_available_vram_mb
+                and held_by_others_mb > _VRAM_IN_USE_FLOOR_MB):
+            # Fits an idle card, but not what is free right now -- the usual
+            # case when another llama-server already has a model loaded.
+            est.vram_exceeded = True
+            est.warnings.append(
+                f"Estimated VRAM usage ({self._fmt_mb(est.total_vram_mb)}) exceeds the "
+                f"{self._fmt_mb(est.gpu_available_vram_mb)} currently free "
+                f"({self._fmt_mb(held_by_others_mb)} is held by other processes). "
+                f"Stop the other model, or reduce gpu_layers or context size."
             )
         elif est.gpu_total_vram_mb > 0 and est.vram_percentage > 90:
             est.warnings.append(
@@ -1226,7 +1287,7 @@ class ResourceEstimator:
             attn_workspace = (ubatch * ubatch * 2 * n_layers) / (1024 * 1024)
 
         total_mb = layer_activations + token_embeddings + attn_workspace
-        return total_mb * 1.25  # 25% headroom for temporary allocations
+        return total_mb * self.INFERENCE_BUFFER_HEADROOM
 
     def _calculate_safety_margin(self, total_vram_used_mb: float) -> float:
         """Calculate safety margin as percentage of total estimated VRAM."""
