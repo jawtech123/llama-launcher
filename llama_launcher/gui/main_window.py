@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QMainWindow, QMessageBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from llama_launcher import __version__
 from llama_launcher.core.builder import build_command
 from llama_launcher.utils.helpers import format_age, get_icons_dir
 
@@ -155,7 +156,7 @@ class LlamaLauncherGUI(QMainWindow):
 
     def init_ui(self):
         """Initialize the user interface."""
-        self.setWindowTitle("llama-launcher — Created by Jay Walker")
+        self.setWindowTitle(f"llama-launcher v{__version__} — Created by Jay Walker")
 
         # Guarantee standard title-bar buttons on every platform/WM.
         self.setWindowFlags(
@@ -189,6 +190,10 @@ class LlamaLauncherGUI(QMainWindow):
         exit_action.setShortcut("Ctrl+Q")
         exit_action.triggered.connect(self.close)
 
+        help_menu = self.menuBar().addMenu("&Help")
+        about_action = help_menu.addAction("&About llama-launcher")
+        about_action.triggered.connect(self._show_about)
+
         self.tab_widget = QTabWidget()
 
         # Vertical splitter: tabs on top, resizable resource panel at bottom
@@ -214,6 +219,16 @@ class LlamaLauncherGUI(QMainWindow):
         # Defer blocking init tasks to after the UI is shown
         QTimer.singleShot(200, self._deferred_init)
 
+    def _show_about(self):
+        QMessageBox.about(
+            self, "About llama-launcher",
+            f"<b>llama-launcher</b> v{__version__}<br><br>"
+            "Generates and manages llama-server launch configurations.<br><br>"
+            "Created by Jay Walker.<br><br>"
+            "© 2026 Jay Walker. All rights reserved.<br>"
+            "Built with PySide6 (Qt), licensed under LGPLv3 — "
+            "see THIRD-PARTY-NOTICES.md.")
+
     def _create_tabs(self):
         self.basic_tab = BasicTab(self.controller)
         self.basic_tab.preset_combo.addItems(PresetManager.get_all_presets())
@@ -229,19 +244,9 @@ class LlamaLauncherGUI(QMainWindow):
         )
         self.tab_widget.addTab(self.advanced_tab, "Advanced Config")
 
-        self.gpu_tab = GpuTab()
-        self.tab_widget.addTab(self.gpu_tab, "GPU Info")
-
-        self.models_tab = ModelsTab()
-        self._refresh_browser_server_combo()
-        self.tab_widget.addTab(self.models_tab, "Model Browser")
-
         self.preview_tab = PreviewTab()
         # "&&" escapes the Qt mnemonic marker so a literal '&' is shown.
-        self.tab_widget.addTab(self.preview_tab, "Command Preview && Launch")
-
-        self.benchmark_tab = BenchmarkTab(self.server_manager, self._get_current_server)
-        self.tab_widget.addTab(self.benchmark_tab, "Benchmark")
+        self.tab_widget.addTab(self.preview_tab, "Preview && Launch")
 
         self.server_management_widget = ServerManagementWidget(self.server_manager, self)
         self.server_management_widget.list_widget.servers_changed.connect(
@@ -249,8 +254,24 @@ class LlamaLauncherGUI(QMainWindow):
         self.server_management_widget.set_command_provider(self._build_launch_command)
         self.tab_widget.addTab(self.server_management_widget, "Server Management")
 
+        self.models_tab = ModelsTab()
+        self._refresh_browser_server_combo()
+        self.tab_widget.addTab(self.models_tab, "Model Browser")
+
+        self.gpu_tab = GpuTab()
+        self.tab_widget.addTab(self.gpu_tab, "GPU Info")
+
+        self.benchmark_tab = BenchmarkTab(self.server_manager, self._get_current_server)
+        self.tab_widget.addTab(self.benchmark_tab, "Benchmark")
+
         self.import_tab = ImportTab()
         self.tab_widget.addTab(self.import_tab, "Import Launch Command")
+
+        # preview_tab's ServerBar didn't exist for the earlier refreshes above,
+        # so it never got the server list -- its combo would stay empty,
+        # `current_server()` would stay '', and every live-stats poll would
+        # read that as "selection changed" and tear down Preview's Stop state.
+        self._refresh_server_combo()
 
     def _wire_signals(self):
         # Basic tab
@@ -1203,15 +1224,28 @@ class LlamaLauncherGUI(QMainWindow):
         return cmd
 
     def stop_server(self):
-        """Stop whatever server the Preview tab is currently watching."""
-        target = self._preview_watch_server
+        """Stop the server currently selected on the Preview tab.
+
+        Mirrors Server Management's own Stop button exactly: it acts on
+        whichever server is selected there, not on the internal "watching"
+        state (which can lag a poll cycle behind), so Stop always targets
+        what the user is actually looking at.
+        """
+        target = self.preview_tab.server_bar.current_server() or self._get_current_server()
         if not target:
             return
+        self.preview_tab.stop_btn.setEnabled(False)
         worker = TaskWorker(lambda: self.server_manager.stop_server(target))
-        worker.done.connect(lambda _ok: self._detach_preview_stream())
+        worker.done.connect(lambda _ok: self._on_preview_stop_done(target))
         worker.failed.connect(lambda msg: (
-            logger.error("Stop failed: %s", msg), self._detach_preview_stream()))
+            logger.error("Stop failed: %s", msg), self._on_preview_stop_done(target)))
         self._start_worker(worker)
+
+    def _on_preview_stop_done(self, target: str):
+        if self._preview_watch_server == target:
+            self._detach_preview_stream()
+        else:
+            self.preview_tab.stop_btn.setEnabled(True)
 
     # ------------------------------------------------------------------
     # Preview <-> live server mirroring
