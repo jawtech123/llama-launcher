@@ -10,6 +10,7 @@ benchmarking. For a feature overview see the [README](../README.md).
 | Python 3.10+ | `python3 --version`; on Debian/Ubuntu also install `python3-venv` |
 | `llama-server` binary | from [llama.cpp](https://github.com/ggml-org/llama.cpp), on `PATH` or configured per server |
 | NVIDIA drivers + `nvidia-smi` | optional; enables GPU detection and the live GPU bars |
+| OpenSSH client (`ssh`, `scp`, `ssh-keygen`) | only for remote servers |
 | Qt/X11 or Wayland desktop | the GUI needs a display; the CLI does not |
 
 ## 2. Installation
@@ -26,7 +27,7 @@ The script:
 
 1. locates a suitable `python3` (>= 3.10, errors with an apt hint if venv support is missing),
 2. creates (or reuses) the virtual environment in `./venv`,
-3. installs `llama-launcher` and its dependencies (PySide6, paramiko) into it,
+3. installs `llama-launcher` and its dependency (PySide6) into it,
 4. creates a desktop entry at `~/.local/share/applications/llama-launcher.desktop`,
 5. verifies the installation by importing the package.
 
@@ -80,8 +81,14 @@ venv/bin/llama-launcher       # CLI (detect / scan / launch)
 3. **Select a model**: clicking one in the browser fills *Main Model* on the
    *Basic Config* tab. The *Resource Usage* panel at the bottom immediately
    estimates VRAM/RAM, and the *Live Usage* bars show realtime CPU/GPU load.
-4. **Pick a preset** (or adjust parameters). The *Command Preview & Launch*
-   tab always shows the exact command that will run.
+4. **Pick a preset** (or adjust parameters). The *Preview & Launch* tab shows
+   the exact command that will run. The command box is editable: anything you
+   type there is what Launch runs, until you press *Regenerate*.
+5. **Chat template** (optional, Basic tab): some models ship a template that
+   does not work with a given client (tool calling from coding agents is the
+   usual case). Paste a Jinja template or a built-in name such as `chatml`,
+   or press *Load Model's Template* to start from the one embedded in the
+   model. *Template file* passes a path that exists on the server instead.
 
 Configuration is stored in `~/.config/llama-launcher/` (honors
 `XDG_CONFIG_HOME`). Files containing credentials (`servers.json`,
@@ -98,11 +105,12 @@ Open *Server Management* → **+** to add a server:
 
 ### Switching to key authentication (recommended)
 
-Select the server and click **Install SSH Key**. The launcher uses the stored
-username/password **once** to install its public key
-(`~/.ssh/llama_launcher`, generated automatically if missing) into the remote
-`authorized_keys`, verifies key login works, then switches the server
-configuration to key auth and saves it. No manual `ssh-copy-id` step needed.
+In the server dialog click **Set Up Key Auth**. The launcher uses the
+password **once** to install its public key (an existing `~/.ssh/id_ed25519`
+or `id_rsa`, else `~/.ssh/id_ed25519_llama_launcher` is generated) into the
+remote `authorized_keys`, verifies key login works, then switches the server
+configuration to key auth. No manual `ssh-copy-id` step needed. Unknown hosts
+are trusted on first contact; a host whose key later changes is refused.
 
 Once connected you can start/stop the remote `llama-server`, watch the live
 log, browse/upload/download remote files, and import the remote log into the
@@ -135,4 +143,10 @@ configuration.
 | GUI won't start over SSH | Use X11 forwarding (`ssh -X`) or run the CLI instead |
 | SSH key install fails | Verify username/password and that the remote `~/.ssh` directory is writable; the launcher reports the failing step |
 
+| Estimate says it fits but llama-server runs out of memory | Something else holds VRAM (the live bars show it); the estimate counts only your own server's allocation as reclaimable |
+| A flag in the generated command is rejected | Your llama.cpp build is older than the registry; remove the flag on the Preview tab (the box is editable) and rebuild llama.cpp when convenient |
+
 Application logs rotate in `~/.config/llama-launcher/logs/`.
+
+For how the VRAM/RAM estimate is computed and calibrated see
+[ESTIMATOR.md](ESTIMATOR.md).

@@ -16,7 +16,6 @@ def test_valid_config_with_all_fields():
         threads=8,
         port=8080,
         host="127.0.0.1",
-        backend="auto",
         temp=0.8,
         top_p=0.95,
         cache_type_k="f16",
@@ -171,33 +170,19 @@ def test_range_validation_boundary(field, value):
 
 # ---- choice validation ----
 
-def test_backend_validation():
-    with pytest.raises(ValidationError, match="backend"):
-        validate_config(LlamaConfig(model_path="/m.gguf", backend="tpu"))
+def test_spec_type_validation():
+    with pytest.raises(ValidationError, match="spec_type"):
+        validate_config(LlamaConfig(model_path="/m.gguf", spec_type="ngram"))
 
 
-def test_backend_auto_valid():
-    validate_config(LlamaConfig(model_path="/m.gguf", backend="auto"))
+@pytest.mark.parametrize("value", ["none", "draft-simple", "ngram-simple", "ngram-mod"])
+def test_spec_type_valid_choices(value):
+    validate_config(LlamaConfig(model_path="/m.gguf", spec_type=value))
 
 
-def test_backend_cuda_valid():
-    validate_config(LlamaConfig(model_path="/m.gguf", backend="cuda"))
-
-
-def test_backend_metal_valid():
-    validate_config(LlamaConfig(model_path="/m.gguf", backend="metal"))
-
-
-def test_backend_vulkan_valid():
-    validate_config(LlamaConfig(model_path="/m.gguf", backend="vulkan"))
-
-
-def test_backend_cpu_valid():
-    validate_config(LlamaConfig(model_path="/m.gguf", backend="cpu"))
-
-
-def test_backend_sycl_valid():
-    validate_config(LlamaConfig(model_path="/m.gguf", backend="sycl"))
+def test_numa_validation():
+    with pytest.raises(ValidationError, match="numa"):
+        validate_config(LlamaConfig(model_path="/m.gguf", numa="prefer"))
 
 
 def test_cache_type_validation():
@@ -272,7 +257,7 @@ def test_flash_attn_choice_invalid():
 
 
 def test_log_colors_choice_valid():
-    for choice in ("auto", "enable", "disable"):
+    for choice in ("auto", "on", "off"):
         validate_config(LlamaConfig(model_path="/m.gguf", log_colors=choice))
 
 

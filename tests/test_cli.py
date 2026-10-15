@@ -15,7 +15,6 @@ def _make_args(**overrides):
         "threads": 0,
         "port": 8080,
         "host": "127.0.0.1",
-        "backend": "auto",
         "kv_cache": "f16",
         "batch": 2048,
         "dry_run": True,

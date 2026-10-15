@@ -11,6 +11,9 @@ Emission rules:
 - int/float/choice fields: emit ``flag value`` when the value differs from the
   llama-server default.
 - str fields: emit ``flag value`` when non-empty.
+- fields marked ``always_emit`` are passed explicitly regardless of value,
+  because llama-server's own default for them is unknowable (model-dependent
+  context size) or has changed between builds (``--jinja``).
 """
 import shlex
 from typing import List
@@ -24,6 +27,13 @@ _EMIT_OVERRIDES = {
 }
 
 
+def _format_number(value) -> str:
+    """Render numbers the way a person would type them (``2`` not ``2.0``)."""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
 def build_command(config: LlamaConfig) -> str:
     """Build the llama-server command for the given configuration."""
     args: List[str] = ["llama-server"]
@@ -32,9 +42,9 @@ def build_command(config: LlamaConfig) -> str:
         value = getattr(config, field.name, field.default)
 
         if field.kind == "bool":
-            if field.default is False and value:
+            if value and (field.default is False or field.always_emit):
                 args.append(field.flag)
-            elif field.default is True and not value and field.negates:
+            elif not value and field.negates and (field.default is True or field.always_emit):
                 args.append(field.negates)
             continue
 
@@ -44,8 +54,8 @@ def build_command(config: LlamaConfig) -> str:
             continue
 
         if field.kind in ("int", "float", "choice"):
-            if value != field.default:
-                args.extend([field.flag, shlex.quote(str(value))])
+            if field.always_emit or value != field.default:
+                args.extend([field.flag, shlex.quote(_format_number(value))])
         elif field.kind == "str":
             # Emit when set and different from the llama-server default
             # (defaults are usually "", but host/samplers/sampler_seq differ).

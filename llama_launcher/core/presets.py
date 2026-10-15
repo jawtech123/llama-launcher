@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from llama_launcher.utils.paths import config_file, secure_file
-from .config import LlamaConfig, migrate_config_dict
+from .config import LlamaConfig, config_to_dict, migrate_config_dict
 
 logger = logging.getLogger(__name__)
 
@@ -40,18 +40,24 @@ class PresetManager:
 
     @classmethod
     def get_preset(cls, preset_name: str) -> LlamaConfig:
-        """Get a preset configuration by name."""
-        if preset_name in cls._load_custom_presets():
-            return cls.get_custom_preset(preset_name)
+        """Get a preset configuration by name (custom overrides win)."""
+        custom = cls._load_custom_presets()
+        if preset_name in custom:
+            return cls._from_dict(custom[preset_name])
 
         if preset_name not in cls.BUILTIN_PRESETS:
-            available = list(cls.BUILTIN_PRESETS.keys()) + [
-                p for p in cls._load_custom_presets().keys()
-                if p not in cls.BUILTIN_PRESETS
-            ]
+            available = list(cls.BUILTIN_PRESETS) + [
+                p for p in custom if p not in cls.BUILTIN_PRESETS]
             raise ValueError(f"Preset '{preset_name}' not found. Available: {available}")
 
         return dataclasses.replace(cls.BUILTIN_PRESETS[preset_name])
+
+    @staticmethod
+    def _from_dict(data: dict) -> LlamaConfig:
+        """Build a config from a stored dict, migrating and dropping unknown keys."""
+        config_data = migrate_config_dict(data)
+        valid_fields = {f.name for f in dataclasses.fields(LlamaConfig)}
+        return LlamaConfig(**{k: v for k, v in config_data.items() if k in valid_fields})
 
     @classmethod
     def save_profile(cls, config: LlamaConfig, path: str) -> None:
@@ -59,7 +65,7 @@ class PresetManager:
         profile_data = {
             "name": config.name or "unnamed-profile",
             "description": config.description,
-            "config": {k: v for k, v in dataclasses.asdict(config).items()
+            "config": {k: v for k, v in config_to_dict(config).items()
                        if k not in ("name", "description")},
         }
         with open(path, 'w') as f:
@@ -70,14 +76,10 @@ class PresetManager:
         """Load a configuration from a profile JSON file."""
         with open(path, 'r') as f:
             profile_data = json.load(f)
-        config_data = migrate_config_dict(profile_data.get("config", {}))
-        valid_fields = {f.name for f in dataclasses.fields(LlamaConfig)}
-        filtered = {k: v for k, v in config_data.items() if k in valid_fields}
-        return LlamaConfig(
-            **filtered,
-            name=profile_data.get("name"),
-            description=profile_data.get("description"),
-        )
+        config = cls._from_dict(profile_data.get("config", {}))
+        config.name = profile_data.get("name")
+        config.description = profile_data.get("description")
+        return config
 
     @classmethod
     def _load_custom_presets(cls) -> dict:
@@ -119,18 +121,13 @@ class PresetManager:
         custom_presets = cls._load_custom_presets()
         if preset_name not in custom_presets:
             raise ValueError(f"Custom preset '{preset_name}' not found.")
-        config_data = migrate_config_dict(custom_presets[preset_name])
-        valid_fields = {f.name for f in dataclasses.fields(LlamaConfig)}
-        filtered = {k: v for k, v in config_data.items() if k in valid_fields}
-        return LlamaConfig(**filtered)
+        return cls._from_dict(custom_presets[preset_name])
 
     @classmethod
     def save_custom_preset(cls, preset_name: str, config: LlamaConfig):
         """Save a custom preset configuration."""
         custom_presets = cls._load_custom_presets()
-        custom_presets[preset_name] = {
-            k: v for k, v in dataclasses.asdict(config).items()
-        }
+        custom_presets[preset_name] = config_to_dict(config)
         custom_presets[preset_name]["name"] = config.name or preset_name
         custom_presets[preset_name]["description"] = config.description or f"Custom: {preset_name}"
         cls._save_custom_presets(custom_presets)

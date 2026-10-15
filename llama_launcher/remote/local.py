@@ -5,6 +5,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 from llama_launcher.models.types import ModelInfo
@@ -31,6 +32,9 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+#: How long to wait for llama-server to exit after SIGTERM before SIGKILL.
+_STOP_GRACE_SECONDS = 10
+
 
 class LocalServerConnection(IServerConnection):
     """Manages a local llama-server instance via subprocess."""
@@ -47,25 +51,12 @@ class LocalServerConnection(IServerConnection):
 
     @property
     def connection_state(self) -> ConnectionState:
-        if self._state == ConnectionState.DISCONNECTED:
-            # Don't auto-detect — let the user explicitly connect.
-            # Return DISCONNECTED so the UI shows placeholder values.
-            return self._state
+        """Last known state; connecting is an explicit user action."""
         return self._state
 
     def connect(self) -> bool:
-        try:
-            subprocess.run(
-                ["which", self._config.llama_server_path.split()[0]],
-                capture_output=True,
-                check=True,
-                timeout=1,
-            )
-            self._state = ConnectionState.CONNECTED
-            return True
-        except Exception:
-            self._state = ConnectionState.ERROR
-            return False
+        ok, _ = self.test_connection()
+        return ok
 
     def test_connection(self) -> Tuple[bool, str]:
         """Check the configured binary is actually runnable on this machine."""
@@ -157,8 +148,6 @@ class LocalServerConnection(IServerConnection):
 
     @staticmethod
     def _copy_with_progress(source: str, target: str, progress_cb=None) -> None:
-        import shutil
-
         total = os.path.getsize(source)
         copied = 0
         with open(source, "rb") as src, open(target, "wb") as dst:
@@ -436,23 +425,29 @@ class LocalServerConnection(IServerConnection):
             return True
         try:
             os.kill(pid, signal.SIGTERM)
-            self._stored_pid = None
-            self._remove_pid_file()
-            return True
-        except Exception:
+        except ProcessLookupError:
+            pass
+        except OSError:
+            logger.exception("stop_server: SIGTERM failed for pid %s", pid)
+            return False
+        # llama-server needs a moment to release the GPU and its port; a
+        # Restart issued straight after an unfinished TERM used to fail to bind.
+        deadline = time.monotonic() + _STOP_GRACE_SECONDS
+        while self._pid_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.2)
+        if self._pid_alive(pid):
+            logger.warning("llama-server %s ignored SIGTERM; sending SIGKILL", pid)
             try:
                 os.kill(pid, signal.SIGKILL)
-                self._stored_pid = None
-                self._remove_pid_file()
-                return True
-            except Exception:
-                logger.exception("stop_server failed for pid %s", pid)
+            except OSError:
+                logger.exception("stop_server: SIGKILL failed for pid %s", pid)
                 return False
+        self._stored_pid = None
+        self._remove_pid_file()
+        return True
 
     def restart_server(self, command: str) -> bool:
         self.stop_server()
-        import time
-        time.sleep(1)
         return self.start_server(command)
 
     def tail_log(self, lines: int = 100) -> str:

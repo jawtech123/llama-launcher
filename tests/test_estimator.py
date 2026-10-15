@@ -82,27 +82,22 @@ class TestResourceEstimator:
         )
         return est
 
-    def test_backend_overhead_not_double_counted(self):
+    def test_total_vram_is_sum_of_breakdown(self):
         est = self._cuda_estimate(flash_attn="auto")
-        flash_workspace_mb = (512 * 5120 * 4.0) / (1024 * 1024)
-        expected = (
-            est.gpu_weights_mb
-            + est.kv_cache_gpu_mb
-            + est.compute_buffers_gpu_mb
-            + ResourceEstimator.CUDA_RUNTIME_MB
-            + flash_workspace_mb
-        )
+        bd = est.vram_breakdown
+        expected = (bd.gpu_weights_mb + bd.kv_cache_mb + bd.inference_buffers_mb
+                    + bd.cuda_runtime_mb + bd.temp_allocations_mb + bd.draft_model_mb
+                    + bd.mmproj_model_mb + bd.backend_overhead_mb + bd.safety_margin_mb)
         assert abs(est.total_vram_mb - expected) < 0.01
+        assert bd.cuda_runtime_mb == ResourceEstimator.CUDA_RUNTIME_MB
 
-    def test_no_flash_workspace_when_flash_attn_off(self):
-        est = self._cuda_estimate(flash_attn="off")
-        expected = (
-            est.gpu_weights_mb
-            + est.kv_cache_gpu_mb
-            + est.compute_buffers_gpu_mb
-            + ResourceEstimator.CUDA_RUNTIME_MB
-        )
-        assert abs(est.total_vram_mb - expected) < 0.01
+    def test_flash_attention_off_needs_much_bigger_compute_buffer(self):
+        # Without flash attention the KQ score matrix (ubatch x ctx x heads, f32)
+        # is materialised in the compute buffer.
+        on = self._cuda_estimate(flash_attn="on")
+        off = self._cuda_estimate(flash_attn="off")
+        assert off.compute_buffers_gpu_mb > on.compute_buffers_gpu_mb * 3
+        assert off.gpu_weights_mb == on.gpu_weights_mb
 
     def test_remaining_vram_is_available_minus_used(self):
         # On an idle card available == total, so this is also total - used.

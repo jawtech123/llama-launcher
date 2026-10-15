@@ -99,6 +99,19 @@ class AdvancedConfigTab(QWidget):
             bar.addWidget(self.manage_presets_btn)
             outer.addLayout(bar)
 
+        # With ~170 parameters, finding one by name beats scrolling.
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Find:"))
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText(
+            "Filter parameters by name, flag or description (e.g. 'moe', '--ctx', 'sampling')")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self.filter_edit, 1)
+        self.match_label = QLabel("")
+        filter_row.addWidget(self.match_label)
+        outer.addLayout(filter_row)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         outer.addWidget(scroll)
@@ -107,16 +120,40 @@ class AdvancedConfigTab(QWidget):
         scroll.setWidget(container)
         layout = QVBoxLayout(container)
 
+        #: (group box, [(search text, label widget, editor widget), ...])
+        self._rows = []
         for group in GROUP_ORDER:
             fields = fields_in_group(group)
             if not fields:
                 continue
             box = QGroupBox(group)
             form = QFormLayout(box)
+            rows = []
             for field in fields:
                 widget, getter, setter, signal = create_field_widget(field, container)
                 widget.setToolTip(field.tooltip)
-                form.addRow(info_label(field.label, field.tooltip), widget)
+                label = info_label(field.label, field.tooltip)
+                form.addRow(label, widget)
                 controller.bind(field.name, getter, setter, signal)
+                haystack = " ".join((field.name, field.flag, field.label, field.tooltip,
+                                     group, *field.aliases)).lower()
+                rows.append((haystack, label, widget))
+            self._rows.append((box, rows))
             layout.addWidget(box)
         layout.addStretch()
+
+    def _apply_filter(self, text: str):
+        """Hide rows (and emptied groups) that do not match the search text."""
+        needles = [t for t in text.lower().split() if t]
+        shown = 0
+        for box, rows in self._rows:
+            visible_in_group = 0
+            for haystack, label, widget in rows:
+                match = all(n in haystack for n in needles)
+                label.setVisible(match)
+                widget.setVisible(match)
+                visible_in_group += match
+            box.setVisible(visible_in_group > 0)
+            shown += visible_in_group
+        total = sum(len(rows) for _, rows in self._rows)
+        self.match_label.setText(f"{shown}/{total}" if needles else "")

@@ -31,6 +31,8 @@ class Field:
     step: float = 1
     aliases: Tuple[str, ...] = ()      # extra parse aliases (short flags, legacy names)
     negates: str = ""                  # "--no-x" form for bool fields
+    negate_aliases: Tuple[str, ...] = ()  # short/legacy spellings of ``negates``
+    always_emit: bool = False          # emit even at default (llama-server default differs/varies)
     placeholder: str = ""
     special_text: str = ""             # spinbox text for the minimum value
     secret: bool = False               # password echo for text fields
@@ -38,7 +40,10 @@ class Field:
 
 
 CACHE_TYPES = ("f32", "f16", "bf16", "q8_0", "q4_0", "q4_1", "iq4_nl", "q5_0", "q5_1")
-BACKENDS = ("auto", "cuda", "metal", "vulkan", "cpu", "sycl")
+
+#: ``--spec-type`` values accepted by llama-server (comma-separated list allowed).
+SPEC_TYPES = ("none", "draft-simple", "draft-eagle3", "draft-mtp", "ngram-simple",
+              "ngram-map-k", "ngram-map-k4v", "ngram-mod", "ngram-cache")
 
 GRP_COMMON = "Common Parameters"
 GRP_GPU = "GPU Parameters"
@@ -82,11 +87,15 @@ FIELDS: Tuple[Field, ...] = (
     # ------------------------------------------------------------------
     Field("model_path", "--model", "str", "", aliases=("-m",),
           label="Main Model", tooltip="Path to the main model file (.gguf, .bin, .safetensors)."),
-    Field("mmproj_model_path", "--mmproj", "str", "", aliases=("--mmproj-model",),
+    Field("mmproj_model_path", "--mmproj", "str", "",
           label="mmproj Model", tooltip="Path to the mmproj model for vision-language models."),
-    Field("draft_model_path", "--draft-model", "str", "", aliases=("--draft",),
+    # llama-server spells this --model-draft / -md / --spec-draft-model; the
+    # remaining aliases are accepted on import for commands written by older
+    # launcher versions.
+    Field("draft_model_path", "--model-draft", "str", "",
+          aliases=("-md", "--spec-draft-model", "--draft-model"),
           label="Draft Model", tooltip="Path to a draft model for speculative decoding."),
-    Field("port", "--port", "int", 8080, minimum=1, maximum=65535, aliases=("-p",),
+    Field("port", "--port", "int", 8080, minimum=1, maximum=65535,
           label="Port", tooltip="Port for llama-server to listen on. Default: 8080."),
     Field("host", "--host", "str", "127.0.0.1",
           label="Host", tooltip="Host address for llama-server to bind to. Default: 127.0.0.1."),
@@ -101,8 +110,9 @@ FIELDS: Tuple[Field, ...] = (
           aliases=("-tb",), special_text="same as threads", label="Threads Batch",
           tooltip="Threads for batch/prompt processing. -1 = same as --threads."),
     Field("context_size", "--ctx-size", "int", 4096, group=GRP_COMMON, minimum=256, maximum=1048576,
-          aliases=("-c",), label="Context Size",
-          tooltip="Prompt context size in tokens. Default: 4096."),
+          aliases=("-c",), always_emit=True, label="Context Size",
+          tooltip="Prompt context size in tokens. Always passed explicitly: llama-server's own "
+                  "default is the model's full trained context, which can be huge."),
     Field("predict", "--n-predict", "int", -1, group=GRP_COMMON, minimum=-1, maximum=65536,
           aliases=("-n", "--predict"), special_text="infinite", label="Predict",
           tooltip="Tokens to predict. -1 = generate until stop token or context limit."),
@@ -118,14 +128,15 @@ FIELDS: Tuple[Field, ...] = (
     Field("rope_scaling", "--rope-scaling", "choice", "none", group=GRP_COMMON,
           choices=("none", "linear", "yarn"), label="RoPE Scaling",
           tooltip="RoPE frequency scaling method for extending context."),
-    Field("rope_scale", "--rope-scale", "int", 1, group=GRP_COMMON, minimum=1, maximum=100,
-          label="RoPE Scale", tooltip="RoPE context scaling factor N. Default: 1."),
-    Field("rope_freq_base", "--rope-freq-base", "int", 0, group=GRP_COMMON, minimum=0, maximum=10000000,
-          special_text="from model", label="RoPE Freq Base",
+    Field("rope_scale", "--rope-scale", "float", 1.0, group=GRP_COMMON, minimum=1.0, maximum=100.0,
+          step=0.5, decimals=2, label="RoPE Scale",
+          tooltip="RoPE context scaling factor N (expands context by N). Default: 1."),
+    Field("rope_freq_base", "--rope-freq-base", "float", 0.0, group=GRP_COMMON,
+          minimum=0.0, maximum=100000000.0, step=1000.0, decimals=0, label="RoPE Freq Base",
           tooltip="RoPE base frequency (NTK-aware scaling). 0 = load from model."),
-    Field("rope_freq_scale", "--rope-freq-scale", "int", 0, group=GRP_COMMON, minimum=0, maximum=100,
-          special_text="from model", label="RoPE Freq Scale",
-          tooltip="RoPE frequency scaling factor. 0 = load from model."),
+    Field("rope_freq_scale", "--rope-freq-scale", "float", 0.0, group=GRP_COMMON,
+          minimum=0.0, maximum=100.0, step=0.05, decimals=3, label="RoPE Freq Scale",
+          tooltip="RoPE frequency scaling factor (expands context by 1/N). 0 = load from model."),
     Field("cache_type_k", "--cache-type-k", "choice", "f16", group=GRP_COMMON,
           choices=CACHE_TYPES, aliases=("-ctk",), label="Cache Type K",
           tooltip="KV cache data type for K. Default: f16."),
@@ -135,7 +146,7 @@ FIELDS: Tuple[Field, ...] = (
     Field("use_mmap", "--mmap", "bool", True, group=GRP_COMMON, negates="--no-mmap",
           label="Memory-map model (--mmap)",
           tooltip="Memory-map the model file. Disable for slower load but fewer pageouts."),
-    Field("mlock", "--mlock", "bool", False, group=GRP_COMMON, negates="--no-mlock",
+    Field("mlock", "--mlock", "bool", False, group=GRP_COMMON,
           label="Lock model in RAM (--mlock)",
           tooltip="Keep the model in RAM rather than swapping. Default: disabled."),
 
@@ -143,8 +154,9 @@ FIELDS: Tuple[Field, ...] = (
     # GPU Parameters
     # ------------------------------------------------------------------
     Field("gpu_layers", "--gpu-layers", "int", -1, group=GRP_GPU, minimum=-1, maximum=999,
-          aliases=("-ngl", "--n-gpu-layers"), special_text="all", label="GPU Layers",
-          tooltip="Max layers to store in VRAM. -1 = all layers to GPU."),
+          aliases=("-ngl", "--n-gpu-layers"), special_text="auto", label="GPU Layers",
+          tooltip="Max layers to store in VRAM. -1 = let llama-server decide (all layers, "
+                  "trimmed to fit when --fit is on)."),
     Field("split_mode", "--split-mode", "choice", "layer", group=GRP_GPU,
           choices=("none", "layer", "row", "tensor"), aliases=("-sm",), label="Split Mode",
           tooltip="How to split the model across multiple GPUs. Default: layer."),
@@ -180,10 +192,10 @@ FIELDS: Tuple[Field, ...] = (
     Field("frequency_penalty", "--frequency-penalty", "float", 0.0, group=GRP_SAMPLING,
           minimum=-2.0, maximum=2.0, step=0.05, label="Frequency Penalty",
           tooltip="Penalize tokens by their frequency in the text. Default: 0.0."),
-    Field("ignore_eos", "--ignore-eos", "bool", False, group=GRP_SAMPLING, negates="--no-ignore-eos",
+    Field("ignore_eos", "--ignore-eos", "bool", False, group=GRP_SAMPLING,
           label="Ignore EOS token", tooltip="Allow generation beyond the end-of-sequence token."),
     Field("backend_sampling", "--backend-sampling", "bool", False, group=GRP_SAMPLING,
-          negates="--no-backend-sampling", label="Backend Sampling",
+          aliases=("-bs",), label="Backend Sampling",
           tooltip="Use backend (GPU) sampling for faster generation."),
 
     # ------------------------------------------------------------------
@@ -198,10 +210,10 @@ FIELDS: Tuple[Field, ...] = (
     Field("seed", "--seed", "int", -1, group=GRP_EXTRA_SAMPLING, minimum=-1, maximum=2147483647,
           special_text="random", label="Seed", tooltip="RNG seed. -1 = random."),
     Field("top_n_sigma", "--top-n-sigma", "float", -1.0, group=GRP_EXTRA_SAMPLING,
-          minimum=-1.0, maximum=10.0, step=0.1, label="Top N Sigma",
+          minimum=-1.0, maximum=10.0, step=0.1, aliases=("--top-nsigma",), label="Top N Sigma",
           tooltip="Top-N-Sigma sampling. -1 = disabled."),
     Field("typical_p", "--typical-p", "float", 1.0, group=GRP_EXTRA_SAMPLING,
-          minimum=0.0, maximum=1.0, step=0.01, label="Typical P",
+          minimum=0.0, maximum=1.0, step=0.01, aliases=("--typical",), label="Typical P",
           tooltip="Locally typical sampling. 1.0 = disabled."),
     Field("xtc_probability", "--xtc-probability", "float", 0.0, group=GRP_EXTRA_SAMPLING,
           minimum=0.0, maximum=1.0, step=0.01, label="XTC Probability",
@@ -244,8 +256,8 @@ FIELDS: Tuple[Field, ...] = (
     # ------------------------------------------------------------------
     # DRY
     # ------------------------------------------------------------------
-    Field("dry_multiplier", "--dry-mul", "float", 0.0, group=GRP_DRY,
-          minimum=0.0, maximum=10.0, step=0.05, aliases=("--dry-multiplier",),
+    Field("dry_multiplier", "--dry-multiplier", "float", 0.0, group=GRP_DRY,
+          minimum=0.0, maximum=10.0, step=0.05,
           label="DRY Multiplier", tooltip="DRY penalty multiplier. 0 = disabled."),
     Field("dry_base", "--dry-base", "float", 1.75, group=GRP_DRY,
           minimum=0.0, maximum=10.0, step=0.05, label="DRY Base",
@@ -264,22 +276,22 @@ FIELDS: Tuple[Field, ...] = (
     # Speculative Decoding
     # ------------------------------------------------------------------
     Field("spec_type", "--spec-type", "choice", "none", group=GRP_SPEC,
-          choices=("none", "ngram", "mod", "simple", "map_k", "map_k4v"),
-          label="Spec Type", tooltip="Speculative decoding type. Default: none."),
-    Field("spec_draft_model", "--spec-draft-model", "str", "", group=GRP_SPEC,
-          label="Spec Draft Model", placeholder="/path/to/draft-model.gguf",
-          tooltip="Path to the speculative draft model."),
+          choices=SPEC_TYPES, label="Spec Type",
+          tooltip="Speculative decoding type. 'draft-*' types need a draft model "
+                  "(Basic tab); 'ngram-*' types need none. Default: none."),
     Field("spec_draft_n_max", "--spec-draft-n-max", "int", 3, group=GRP_SPEC,
-          minimum=1, maximum=32, label="Draft N Max",
+          minimum=1, maximum=32, aliases=("--draft-max", "--draft", "--draft-n"), label="Draft N Max",
           tooltip="Max tokens to draft per iteration. Default: 3."),
     Field("spec_draft_n_min", "--spec-draft-n-min", "int", 0, group=GRP_SPEC,
-          minimum=0, maximum=32, label="Draft N Min",
+          minimum=0, maximum=32, aliases=("--draft-min", "--draft-n-min"), label="Draft N Min",
           tooltip="Min draft tokens to use. 0 = no minimum."),
     Field("spec_draft_threads", "--spec-draft-threads", "int", 0, group=GRP_SPEC,
-          minimum=0, maximum=256, special_text="auto", label="Spec Draft Threads",
+          minimum=0, maximum=256, special_text="auto", aliases=("-td", "--threads-draft"),
+          label="Spec Draft Threads",
           tooltip="Threads for the draft model. 0 = auto."),
     Field("spec_draft_threads_batch", "--spec-draft-threads-batch", "int", -1, group=GRP_SPEC,
-          minimum=-1, maximum=256, special_text="same as draft", label="Spec Draft Threads Batch",
+          minimum=-1, maximum=256, special_text="same as draft",
+          aliases=("-tbd", "--threads-batch-draft"), label="Spec Draft Threads Batch",
           tooltip="Threads for draft batch processing. -1 = same as draft threads."),
     Field("spec_draft_hf", "--spec-draft-hf", "str", "", group=GRP_SPEC,
           label="Spec Draft HF Repo", placeholder="org/model-name",
@@ -291,27 +303,28 @@ FIELDS: Tuple[Field, ...] = (
           label="Spec Draft Device", placeholder="cuda:0,cpu",
           tooltip="Device for the draft model."),
     Field("spec_draft_p_split", "--spec-draft-p-split", "float", 0.1, group=GRP_SPEC,
-          minimum=0.0, maximum=1.0, step=0.05, label="Spec Draft P Split",
+          minimum=0.0, maximum=1.0, step=0.05, aliases=("--draft-p-split",), label="Spec Draft P Split",
           tooltip="Spec draft p-split threshold. Default: 0.1."),
     Field("spec_draft_p_min", "--spec-draft-p-min", "float", 0.0, group=GRP_SPEC,
-          minimum=0.0, maximum=1.0, step=0.05, label="Spec Draft P Min",
+          minimum=0.0, maximum=1.0, step=0.05, aliases=("--draft-p-min",), label="Spec Draft P Min",
           tooltip="Spec draft p-min threshold. Default: 0.0."),
     Field("spec_draft_backend_sampling", "--spec-draft-backend-sampling", "bool", True,
           group=GRP_SPEC, negates="--no-spec-draft-backend-sampling",
           label="Spec Draft Backend Sampling",
           tooltip="Use backend sampling for the spec draft. Default: enabled."),
     Field("spec_draft_ngl", "--spec-draft-ngl", "int", -1, group=GRP_SPEC,
-          minimum=-1, maximum=999, special_text="all", label="Spec Draft NGL",
-          tooltip="GPU layers for the draft model. -1 = all."),
+          minimum=-1, maximum=999, special_text="auto",
+          aliases=("-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft"), label="Spec Draft NGL",
+          tooltip="GPU layers for the draft model. -1 = auto."),
 
     # ------------------------------------------------------------------
     # Spec Draft Cache Types
     # ------------------------------------------------------------------
     Field("spec_draft_type_k", "--spec-draft-type-k", "choice", "f16", group=GRP_SPEC_CACHE,
-          choices=CACHE_TYPES, label="Spec Draft Type K",
+          choices=CACHE_TYPES, aliases=("-ctkd", "--cache-type-k-draft"), label="Spec Draft Type K",
           tooltip="KV cache type for K in spec draft. Default: f16."),
     Field("spec_draft_type_v", "--spec-draft-type-v", "choice", "f16", group=GRP_SPEC_CACHE,
-          choices=CACHE_TYPES, label="Spec Draft Type V",
+          choices=CACHE_TYPES, aliases=("-ctvd", "--cache-type-v-draft"), label="Spec Draft Type V",
           tooltip="KV cache type for V in spec draft. Default: f16."),
 
     # ------------------------------------------------------------------
@@ -340,11 +353,12 @@ FIELDS: Tuple[Field, ...] = (
           minimum=0, maximum=1000, label="Poll Batch",
           tooltip="Polling interval (ms) for spec draft batch."),
     Field("spec_draft_cpu_moe", "--spec-draft-cpu-moe", "bool", False, group=GRP_SPEC_CPU,
-          negates="--no-spec-draft-cpu-moe", label="CPU MoE",
+          aliases=("-cmoed", "--cpu-moe-draft"), label="CPU MoE",
           tooltip="Offload spec draft MoE layers to CPU."),
     Field("spec_draft_n_cpu_moe", "--spec-draft-n-cpu-moe", "int", 0, group=GRP_SPEC_CPU,
-          minimum=0, maximum=256, special_text="auto", label="N CPU MoE",
-          tooltip="CPU threads for spec draft MoE. 0 = auto."),
+          minimum=0, maximum=256, special_text="none",
+          aliases=("--spec-draft-ncmoe", "-ncmoed", "--n-cpu-moe-draft"), label="N CPU MoE",
+          tooltip="Keep the MoE weights of the first N draft-model layers on the CPU."),
 
     # ------------------------------------------------------------------
     # Speculative N-Gram / Mod
@@ -415,14 +429,14 @@ FIELDS: Tuple[Field, ...] = (
     # ------------------------------------------------------------------
     # Context & Predict extras
     # ------------------------------------------------------------------
-    Field("swa_full", "--swa-full", "bool", False, group=GRP_CONTEXT, negates="--no-swa-full",
+    Field("swa_full", "--swa-full", "bool", False, group=GRP_CONTEXT,
           label="Full Sliding Window Attention", tooltip="Enable full SWA. Default: disabled."),
     Field("flash_attn", "--flash-attn", "choice", "auto", group=GRP_CONTEXT,
           choices=("auto", "on", "off"), aliases=("-fa",), label="Flash Attention",
           tooltip="Flash attention mode. Default: auto."),
     Field("perf", "--perf", "bool", False, group=GRP_CONTEXT, negates="--no-perf",
           label="Print Performance Info", tooltip="Print performance information on exit."),
-    Field("escape", "--escape", "bool", True, group=GRP_CONTEXT, negates="--no-escape",
+    Field("escape", "--escape", "bool", True, group=GRP_CONTEXT, negates="--no-escape", aliases=("-e",),
           label="Process Escape Sequences", tooltip="Process escape sequences in input. Default: enabled."),
 
     # ------------------------------------------------------------------
@@ -448,29 +462,31 @@ FIELDS: Tuple[Field, ...] = (
     # Cache & Memory
     # ------------------------------------------------------------------
     Field("kv_offload", "--kv-offload", "bool", True, group=GRP_CACHE, negates="--no-kv-offload",
-          label="KV Offload", tooltip="Offload KV cache to system RAM if VRAM is full. Default: enabled."),
+          aliases=("-kvo",), negate_aliases=("-nkvo",),
+          label="KV Offload", tooltip="Keep the KV cache on the GPU. Disable to hold it in "
+                                      "system RAM (slower, saves VRAM). Default: enabled."),
     Field("repack", "--repack", "bool", True, group=GRP_CACHE, negates="--no-repack",
-          label="Repack", tooltip="Repack KV cache for memory efficiency. Default: enabled."),
+          negate_aliases=("-nr",),
+          label="Repack", tooltip="Repack weights into the CPU backend's optimal layout. Default: enabled."),
     Field("no_host", "--no-host", "bool", False, group=GRP_CACHE,
-          label="No Host RAM", tooltip="Do not keep the model in host RAM. Default: disabled."),
-    Field("defrag_thold", "--defrag-thold", "int", 0, group=GRP_CACHE, minimum=0, maximum=100,
-          special_text="disabled", label="Defrag Threshold",
-          tooltip="KV cache defragmentation threshold. 0 = disabled."),
+          label="No Host Buffer", tooltip="Bypass the host buffer so extra device buffers can be used."),
     Field("direct_io", "--direct-io", "bool", False, group=GRP_CACHE, negates="--no-direct-io",
+          aliases=("-dio",), negate_aliases=("-ndio",),
           label="Direct I/O", tooltip="Use direct I/O for model loading. Default: disabled."),
 
     # ------------------------------------------------------------------
     # Extra Cache & Context
     # ------------------------------------------------------------------
     Field("ctx_checkpoints", "--ctx-checkpoints", "int", 32, group=GRP_EXTRA_CACHE,
-          minimum=0, maximum=1024, label="Context Checkpoints",
-          tooltip="Number of context checkpoints. Default: 32."),
+          minimum=0, maximum=1024, aliases=("-ctxcp", "--swa-checkpoints"), label="Context Checkpoints",
+          tooltip="Max context checkpoints per slot. Default: 32."),
     Field("checkpoint_min_step", "--checkpoint-min-step", "int", 256, group=GRP_EXTRA_CACHE,
-          minimum=0, maximum=4096, label="Checkpoint Min Step",
-          tooltip="Minimum checkpoint step size. Default: 256."),
+          minimum=0, maximum=4096, aliases=("-cms",), label="Checkpoint Min Step",
+          tooltip="Minimum spacing between context checkpoints in tokens. Default: 256."),
     Field("cache_ram", "--cache-ram", "int", 8192, group=GRP_EXTRA_CACHE,
-          minimum=0, maximum=65536, label="Cache RAM (MB)",
-          tooltip="Cache RAM size in MB. Default: 8192."),
+          minimum=-1, maximum=1048576, aliases=("-cram",), special_text="unlimited",
+          label="Prompt Cache RAM (MiB)",
+          tooltip="Maximum size of the prompt cache in host RAM. -1 = no limit, 0 = disabled. Default: 8192."),
     Field("cache_idle_slots", "--cache-idle-slots", "bool", True, group=GRP_EXTRA_CACHE,
           negates="--no-cache-idle-slots", label="Cache Idle Slots",
           tooltip="Enable idle slot caching. Default: enabled."),
@@ -481,28 +497,33 @@ FIELDS: Tuple[Field, ...] = (
     # ------------------------------------------------------------------
     # GPU & NUMA
     # ------------------------------------------------------------------
-    Field("numa", "--numa", "str", "", group=GRP_NUMA, label="NUMA",
-          placeholder="0,1 or prefer-numa-node", tooltip="NUMA allocation policy."),
+    Field("numa", "--numa", "choice", "", group=GRP_NUMA,
+          choices=("", "distribute", "isolate", "numactl"), label="NUMA",
+          tooltip="NUMA optimisation: distribute (spread over all nodes), isolate (one node), "
+                  "numactl (use the CPU map from numactl)."),
     Field("device", "--device", "str", "", group=GRP_NUMA, label="Device",
           placeholder="cuda:0,cpu", tooltip="Device to use. Empty = auto-detect."),
-    Field("override_tensor", "--override-tensor", "str", "", group=GRP_NUMA,
-          label="Override Tensor", placeholder="KQV=1,O=1",
-          tooltip="Force specific tensors to GPU/CPU."),
-    Field("cpu_moe", "--cpu-moe", "bool", False, group=GRP_NUMA, negates="--no-cpu-moe",
-          label="CPU MoE", tooltip="Offload MoE layers to CPU."),
+    Field("override_tensor", "--override-tensor", "str", "", group=GRP_NUMA, aliases=("-ot",),
+          label="Override Tensor", placeholder="exps=CPU",
+          tooltip="Override the buffer type of tensors matching a regex, e.g. 'exps=CPU' "
+                  "keeps MoE expert weights in system RAM."),
+    Field("cpu_moe", "--cpu-moe", "bool", False, group=GRP_NUMA, aliases=("-cmoe",),
+          label="CPU MoE", tooltip="Keep all Mixture-of-Experts weights in the CPU."),
     Field("n_cpu_moe", "--n-cpu-moe", "int", 0, group=GRP_NUMA, minimum=0, maximum=256,
-          special_text="auto", label="N CPU MoE", tooltip="CPU threads for MoE layers. 0 = auto."),
-    Field("fit", "--fit", "choice", "on", group=GRP_NUMA, choices=("on", "off"),
-          label="Fit", tooltip="Fit model to VRAM. Default: on."),
-    Field("fit_target", "--fit-target", "str", "", group=GRP_NUMA, label="Fit Target",
-          placeholder="80%", tooltip="Target VRAM usage for fit mode."),
-    Field("fit_ctx", "--fit-ctx", "int", 4096, group=GRP_NUMA, minimum=512, maximum=131072,
-          label="Fit Context", tooltip="Context size for fit mode calculation. Default: 4096."),
+          aliases=("-ncmoe",), special_text="none", label="N CPU MoE",
+          tooltip="Keep the MoE weights of the first N layers in the CPU."),
+    Field("fit", "--fit", "choice", "on", group=GRP_NUMA, choices=("on", "off"), aliases=("-fit",),
+          label="Fit", tooltip="Adjust unset arguments (gpu layers, context) to fit device memory. Default: on."),
+    Field("fit_target", "--fit-target", "str", "", group=GRP_NUMA, aliases=("-fitt",), label="Fit Target",
+          placeholder="MiB0,MiB1,...", tooltip="Target amount of free device memory (MiB per device) for --fit."),
+    Field("fit_ctx", "--fit-ctx", "int", 4096, group=GRP_NUMA, minimum=256, maximum=1048576,
+          aliases=("-fitc",), label="Fit Context",
+          tooltip="Minimum context size --fit may reduce the context to. Default: 4096."),
     Field("check_tensors", "--check-tensors", "bool", False, group=GRP_NUMA,
-          negates="--no-check-tensors", label="Check Tensors",
-          tooltip="Check tensor sizes and types. Default: disabled."),
+          label="Check Tensors", tooltip="Check model tensor data for invalid values. Default: disabled."),
     Field("override_kv", "--override-kv", "str", "", group=GRP_NUMA, label="Override KV",
-          placeholder="k_scale=0.5,v_scale=0.5", tooltip="Override KV scale factors."),
+          placeholder="tokenizer.ggml.add_bos_token=bool:false",
+          tooltip="Override model metadata by key (KEY=TYPE:VALUE)."),
     Field("op_offload", "--op-offload", "bool", True, group=GRP_NUMA, negates="--no-op-offload",
           label="Op Offload", tooltip="Offload operations to GPU. Default: enabled."),
 
@@ -548,52 +569,93 @@ FIELDS: Tuple[Field, ...] = (
     Field("log_file", "--log-file", "str", "", group=GRP_LOGGING, label="Log File",
           placeholder="/path/to/log.txt", tooltip="Log file path. Empty = stdout."),
     Field("log_colors", "--log-colors", "choice", "auto", group=GRP_LOGGING,
-          choices=("auto", "enable", "disable"), label="Log Colors",
+          choices=("auto", "on", "off"), label="Log Colors",
           tooltip="Colored log output. Default: auto."),
-    Field("verbose", "--verbose", "bool", False, group=GRP_LOGGING, label="Verbose",
-          tooltip="Enable verbose logging."),
+    Field("verbose", "--verbose", "bool", False, group=GRP_LOGGING, aliases=("-v", "--log-verbose"),
+          label="Verbose", tooltip="Log everything (verbosity = infinity)."),
     Field("offline", "--offline", "bool", False, group=GRP_LOGGING, label="Offline Mode",
           tooltip="Disable network access."),
     Field("verbosity", "--verbosity", "int", 3, group=GRP_LOGGING, minimum=0, maximum=5,
+          aliases=("-lv", "--log-verbosity"),
           label="Verbosity", tooltip="0=off 1=error 2=warn 3=info 4=debug 5=trace. Default: 3."),
-    Field("log_prefix", "--log-prefix", "bool", True, group=GRP_LOGGING, negates="--no-log-prefix",
-          label="Log Prefix", tooltip="Include timestamp/level prefix in logs. Default: enabled."),
-    Field("log_timestamps", "--log-timestamps", "bool", True, group=GRP_LOGGING,
+    # Both default to off in llama-server; the --no-* forms exist for imports.
+    Field("log_prefix", "--log-prefix", "bool", False, group=GRP_LOGGING, negates="--no-log-prefix",
+          label="Log Prefix", tooltip="Prefix log lines with level markers. Default: disabled."),
+    Field("log_timestamps", "--log-timestamps", "bool", False, group=GRP_LOGGING,
           negates="--no-log-timestamps", label="Log Timestamps",
-          tooltip="Include timestamps in logs. Default: enabled."),
+          tooltip="Include timestamps in log lines. Default: disabled."),
 
     # ------------------------------------------------------------------
     # Server Options
     # ------------------------------------------------------------------
     Field("parallel", "--parallel", "int", -1, group=GRP_SERVER, minimum=-1, maximum=128,
-          special_text="auto", label="Parallel Slots",
-          tooltip="Number of parallel request streams. -1 = auto."),
-    Field("backend", "--backend", "choice", "auto", group=GRP_SERVER, choices=BACKENDS,
-          label="Backend", tooltip="Compute backend. Default: auto."),
-    Field("jinja", "--jinja", "bool", False, group=GRP_SERVER, negates="--no-jinja",
-          label="Jinja Templates", tooltip="Use Jinja template for prompt formatting."),
+          aliases=("-np",), special_text="auto", label="Parallel Slots",
+          tooltip="Number of server slots (concurrent requests). -1 = auto."),
+    # llama-server's default for --jinja changed from off to on in 2026, so the
+    # choice is always passed explicitly and means the same thing on any build.
+    Field("jinja", "--jinja", "bool", True, group=GRP_SERVER, negates="--no-jinja", always_emit=True,
+          label="Jinja Templates",
+          tooltip="Use the Jinja chat-template engine (needed for tool calling and most "
+                  "modern chat templates). Default: enabled."),
+    Field("chat_template", "--chat-template", "str", "", group=GRP_SERVER, label="Chat Template",
+          placeholder="chatml, llama3, ... or a Jinja template",
+          tooltip="Built-in chat template name, or a custom Jinja template. Default: from the model."),
+    Field("chat_template_file", "--chat-template-file", "str", "", group=GRP_SERVER,
+          label="Chat Template File", placeholder="/path/to/template.jinja",
+          tooltip="Path to a custom Jinja chat template file."),
+    Field("reasoning", "--reasoning", "choice", "auto", group=GRP_SERVER, choices=("auto", "on", "off"),
+          aliases=("-rea",), label="Reasoning",
+          tooltip="Enable thinking/reasoning in chat. auto = detect from the template."),
+    Field("reasoning_format", "--reasoning-format", "choice", "auto", group=GRP_SERVER,
+          choices=("auto", "none", "deepseek", "deepseek-legacy"), label="Reasoning Format",
+          tooltip="How thought tags are returned: none = left in content, deepseek = moved to "
+                  "reasoning_content, deepseek-legacy = both."),
+    Field("reasoning_budget", "--reasoning-budget", "int", -1, group=GRP_SERVER,
+          minimum=-1, maximum=1048576, special_text="unlimited", label="Reasoning Budget",
+          tooltip="Token budget for thinking: -1 = unrestricted, 0 = none, N = limit."),
     Field("warmup", "--warmup", "bool", True, group=GRP_SERVER, negates="--no-warmup",
           label="Warmup", tooltip="Warm up the model on startup. Default: enabled."),
-    Field("embeddings", "--embeddings", "bool", False, group=GRP_SERVER, negates="--no-embeddings",
-          label="Embeddings", tooltip="Return embeddings for prompts."),
-    Field("reranking", "--reranking", "bool", False, group=GRP_SERVER, negates="--no-reranking",
-          label="Reranking", tooltip="Enable reranking mode."),
+    Field("embeddings", "--embeddings", "bool", False, group=GRP_SERVER, aliases=("--embedding",),
+          label="Embeddings", tooltip="Restrict the server to the embedding use case."),
+    Field("reranking", "--reranking", "bool", False, group=GRP_SERVER, aliases=("--rerank",),
+          label="Reranking", tooltip="Enable the reranking endpoint."),
     Field("ui", "--ui", "bool", True, group=GRP_SERVER, negates="--no-ui",
+          aliases=("--webui",), negate_aliases=("--no-webui",),
           label="Web UI", tooltip="Enable the built-in web UI. Default: enabled."),
     Field("agent", "--agent", "bool", False, group=GRP_SERVER, negates="--no-agent",
-          label="Agent Mode", tooltip="Enable agent mode."),
+          aliases=("-ag",), negate_aliases=("-no-ag",),
+          label="Agent Mode", tooltip="Enable the CORS proxy and all built-in tools "
+                                      "(do not enable on a public server)."),
     Field("cont_batching", "--cont-batching", "bool", True, group=GRP_SERVER,
-          negates="--no-cont-batching", label="Continuous Batching",
-          tooltip="Enable continuous batching. Default: enabled."),
+          negates="--no-cont-batching", aliases=("-cb",), negate_aliases=("-nocb",),
+          label="Continuous Batching", tooltip="Enable continuous batching. Default: enabled."),
+    Field("cache_prompt", "--cache-prompt", "bool", True, group=GRP_SERVER, negates="--no-cache-prompt",
+          label="Prompt Cache", tooltip="Reuse the KV cache for prompts sharing a prefix. Default: enabled."),
+    Field("cache_reuse", "--cache-reuse", "int", 0, group=GRP_SERVER, minimum=0, maximum=65536,
+          special_text="disabled", label="Cache Reuse",
+          tooltip="Min chunk size to reuse from the prompt cache via KV shifting. 0 = disabled."),
+    Field("threads_http", "--threads-http", "int", -1, group=GRP_SERVER, minimum=-1, maximum=256,
+          special_text="auto", label="HTTP Threads",
+          tooltip="Threads used to process HTTP requests. -1 = auto."),
+    Field("timeout", "--timeout", "int", 3600, group=GRP_SERVER, minimum=1, maximum=86400,
+          aliases=("-to",), label="Timeout (s)", tooltip="Server read/write timeout in seconds. Default: 3600."),
+    Field("api_key", "--api-key", "str", "", group=GRP_SERVER, secret=True, label="API Key",
+          placeholder="sk-...", tooltip="API key clients must present (comma-separate several)."),
     Field("api_prefix", "--api-prefix", "str", "", group=GRP_SERVER, label="API Prefix",
           placeholder="/v1", tooltip="API endpoint prefix."),
-    Field("ui_config", "--ui-config", "str", "", group=GRP_SERVER, label="UI Config",
-          placeholder='{"theme": "dark"}', tooltip="UI configuration JSON string."),
+    Field("metrics", "--metrics", "bool", False, group=GRP_SERVER, label="Prometheus Metrics",
+          tooltip="Enable the Prometheus-compatible /metrics endpoint."),
+    Field("slots", "--slots", "bool", True, group=GRP_SERVER, negates="--no-slots",
+          label="Slots Endpoint", tooltip="Expose the /slots monitoring endpoint. Default: enabled."),
+    Field("props", "--props", "bool", False, group=GRP_SERVER, label="Props Endpoint",
+          tooltip="Allow changing global properties via POST /props."),
+    Field("ui_config", "--ui-config", "str", "", group=GRP_SERVER, aliases=("--webui-config",),
+          label="UI Config", placeholder='{"theme": "dark"}', tooltip="UI configuration JSON string."),
     Field("ui_config_file", "--ui-config-file", "str", "", group=GRP_SERVER,
-          label="UI Config File", placeholder="/path/to/ui-config.json",
-          tooltip="Path to a UI configuration file."),
+          aliases=("--webui-config-file",), label="UI Config File",
+          placeholder="/path/to/ui-config.json", tooltip="Path to a UI configuration file."),
     Field("tools", "--tools", "str", "", group=GRP_SERVER, label="Tools",
-          placeholder="tool1,tool2", tooltip="Comma-separated list of available tools."),
+          placeholder="tool1,tool2", tooltip="Comma-separated list of built-in tools to enable (experimental)."),
 
     # ------------------------------------------------------------------
     # Generation & Cache Options
@@ -601,19 +663,21 @@ FIELDS: Tuple[Field, ...] = (
     Field("reverse_prompt", "--reverse-prompt", "str", "", group=GRP_GEN, label="Reverse Prompt",
           placeholder="User:", tooltip="Reverse prompt to stop generation."),
     Field("pooling", "--pooling", "choice", "none", group=GRP_GEN,
-          choices=("none", "mean", "cls", "last"), label="Pooling",
+          choices=("none", "mean", "cls", "last", "rank"), label="Pooling",
           tooltip="Pooling method for embeddings. Default: none."),
     Field("kv_unified", "--kv-unified", "bool", True, group=GRP_GEN, negates="--no-kv-unified",
-          label="Unified KV Cache", tooltip="Use a unified KV cache. Default: enabled."),
+          aliases=("-kvu",), negate_aliases=("-no-kvu",),
+          label="Unified KV Cache",
+          tooltip="Use one KV buffer shared across all sequences. Default: enabled when slots are auto."),
     Field("lookup_cache_static", "--lookup-cache-static", "str", "", group=GRP_GEN,
           label="Lookup Cache Static", placeholder="/path/to/static-cache",
           tooltip="Static lookup cache path."),
     Field("lookup_cache_dynamic", "--lookup-cache-dynamic", "str", "", group=GRP_GEN,
           label="Lookup Cache Dynamic", placeholder="/path/to/dynamic-cache",
           tooltip="Dynamic lookup cache path."),
-    Field("special", "--special", "bool", False, group=GRP_GEN, negates="--no-special",
+    Field("special", "--special", "bool", False, group=GRP_GEN, aliases=("-sp",),
           label="Special Tokens", tooltip="Render special tokens in output."),
-    Field("spm_infill", "--spm-infill", "bool", False, group=GRP_GEN, negates="--no-spm-infill",
+    Field("spm_infill", "--spm-infill", "bool", False, group=GRP_GEN,
           label="SPM Infill", tooltip="Enable SPM fill-in-the-middle mode."),
 
     # ------------------------------------------------------------------
@@ -622,6 +686,7 @@ FIELDS: Tuple[Field, ...] = (
     Field("mmproj_url", "--mmproj-url", "str", "", group=GRP_MM, label="MMProj URL",
           placeholder="https://example.com/mmproj.gguf", tooltip="URL to download the mmproj."),
     Field("mmproj_auto", "--mmproj-auto", "bool", True, group=GRP_MM, negates="--no-mmproj-auto",
+          negate_aliases=("--no-mmproj",),
           label="MMProj Auto", tooltip="Auto-detect the multimodal projector. Default: enabled."),
     Field("mmproj_offload", "--mmproj-offload", "bool", True, group=GRP_MM,
           negates="--no-mmproj-offload", label="MMProj Offload",
@@ -649,9 +714,11 @@ FIELDS: Tuple[Field, ...] = (
     Field("path", "--path", "str", "", group=GRP_SERVER_EXTRA, label="Path",
           placeholder="/api", tooltip="Custom API path."),
     Field("reuse_port", "--reuse-port", "bool", False, group=GRP_SERVER_EXTRA,
-          negates="--no-reuse-port", label="Reuse Port", tooltip="Allow port reuse."),
+          label="Reuse Port", tooltip="Allow multiple sockets to bind to the same port."),
     Field("ui_mcp_proxy", "--ui-mcp-proxy", "bool", False, group=GRP_SERVER_EXTRA,
-          negates="--no-ui-mcp-proxy", label="UI MCP Proxy", tooltip="Enable UI MCP proxy."),
+          negates="--no-ui-mcp-proxy", aliases=("--webui-mcp-proxy",),
+          negate_aliases=("--no-webui-mcp-proxy",),
+          label="UI MCP Proxy", tooltip="Enable the Web UI's MCP proxy (experimental)."),
 )
 
 FIELDS_BY_NAME: Dict[str, Field] = {f.name: f for f in FIELDS}
@@ -661,12 +728,21 @@ CLI_FIELDS: Tuple[Field, ...] = tuple(f for f in FIELDS if f.flag)
 
 #: flag/alias/negation -> Field, for the parser.
 FLAG_TO_FIELD: Dict[str, Field] = {}
+#: Every spelling that means "turn this bool off" (``--no-x`` and short forms).
+NEGATION_FLAGS: frozenset
+_negations = set()
 for _f in CLI_FIELDS:
     FLAG_TO_FIELD[_f.flag] = _f
     for _a in _f.aliases:
         FLAG_TO_FIELD[_a] = _f
     if _f.negates:
         FLAG_TO_FIELD[_f.negates] = _f
+        _negations.add(_f.negates)
+    for _a in _f.negate_aliases:
+        FLAG_TO_FIELD[_a] = _f
+        _negations.add(_a)
+NEGATION_FLAGS = frozenset(_negations)
+del _negations
 
 
 def fields_in_group(group: str) -> List[Field]:

@@ -212,7 +212,8 @@ class _ModelInfoPanel(QWidget):
 
         self._labels = {}
         for key, label in [("arch", "Arch"), ("params", "Params"), ("quant", "Quant"),
-                           ("layers", "Layers"), ("native_ctx", "Native Ctx")]:
+                           ("layers", "Layers"), ("offload", "On GPU"),
+                           ("native_ctx", "Native Ctx")]:
             container = QWidget()
             cl = QHBoxLayout(container)
             cl.setContentsMargins(0, 0, 0, 0)
@@ -244,19 +245,21 @@ class _ModelInfoPanel(QWidget):
             params_str = str(params_str)
         self._labels["params"].setText(params_str)
 
-        # Determine dominant quant type
-        if meta.quant_types:
-            dominant = max(meta.quant_types, key=meta.quant_types.get)
-            self._labels["quant"].setText(str(dominant))
-        elif estimate.quant_type and estimate.quant_type != "unknown":
-            self._labels["quant"].setText(str(estimate.quant_type))
-        else:
-            self._labels["quant"].setText("--")
+        self._labels["quant"].setText(estimate.quant_display or "--")
 
         if isinstance(meta.layers, int) and meta.layers > 0:
             self._labels["layers"].setText(str(meta.layers))
         else:
             self._labels["layers"].setText("--")
+
+        if estimate.offloadable_layers > 0:
+            self._labels["offload"].setText(
+                f"{estimate.offloaded_layers}/{estimate.offloadable_layers}")
+            self._labels["offload"].setToolTip(
+                "Layers (plus the output layer) the estimate places on the GPU, "
+                "the way llama-server counts them.")
+        else:
+            self._labels["offload"].setText("--")
 
         if isinstance(meta.context_length, int) and meta.context_length > 0:
             self._labels["native_ctx"].setText(f"{meta.context_length:,}")
@@ -305,11 +308,12 @@ class ResourceUsagePanel(QWidget):
         self._vram_row = _ResourceRow(
             "VRAM",
             "VRAM consists of:\n"
-            "- Model Weights (GPU offloaded layers)\n"
-            "- KV Cache (context * batch * layers)\n"
-            "- Inference Buffers (layer activations)\n"
-            "- Backend Overhead (CUDA/Metal/Vulkan runtime)\n"
-            "- Safety Margin"
+            "- Model weights of the offloaded layers (per-tensor sizes from the GGUF)\n"
+            "- KV cache for the offloaded attention layers\n"
+            "- Compute buffers (grow with ubatch, and with context without flash attention)\n"
+            "- CUDA/Metal/Vulkan runtime (~0.5 GB)\n"
+            "- Draft model / vision projector when configured\n"
+            "Calibrated against llama-server's own allocations; typically within 1-2%."
         )
         layout.addWidget(self._vram_row)
 
@@ -332,8 +336,9 @@ class ResourceUsagePanel(QWidget):
         self._kv_label = QLabel("KV Cache: --")
         self._kv_label.setStyleSheet(theme.monospace_style(theme.FG_DIM, 10))
         self._kv_label.setToolTip(
-            "KV Cache size = layers * n_kv_heads * head_size * ctx_size * parallel * (type_k + type_v)\n"
-            "Depends on context size, parallel streams, cache type, and model architecture."
+            "KV cache = attention layers x KV heads x (K dim + V dim) x context x bytes per element.\n"
+            "The context is shared by all server slots; hybrid/SSM models only cache "
+            "their attention layers and keep a small per-slot recurrent state instead."
         )
         detail_layout.addWidget(self._kv_label)
 

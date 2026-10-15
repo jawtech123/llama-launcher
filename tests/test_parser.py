@@ -546,28 +546,33 @@ def test_missing_value_after_flag():
 def test_all_negation_forms():
     """All --no-* negation forms are parsed correctly."""
     params, unrec, dups = parse_launch_command(
-        "llama-server -m /m.gguf --no-mmap --no-ignore-eos --no-backend-sampling "
-        "--no-cont-batching --no-mlock --no-perf --no-escape --no-kv-offload "
+        "llama-server -m /m.gguf --no-mmap "
+        "--no-cont-batching --no-perf --no-escape --no-kv-offload "
         "--no-repack --no-direct-io --no-cache-idle-slots --no-context-shift "
-        "--no-jinja --no-embeddings --no-reranking --no-agent --no-ui "
-        "--no-log-prefix --no-log-timestamps --no-kv-unified --no-special "
-        "--no-spm-infill --no-mmproj-auto --no-mmproj-offload --no-warmup "
-        "--no-spec-draft-backend-sampling --no-cpu-moe --no-op-offload "
-        "--no-reuse-port --no-ui-mcp-proxy --no-swa-full --no-check-tensors"
+        "--no-jinja --no-agent --no-ui "
+        "--no-log-prefix --no-log-timestamps --no-kv-unified "
+        "--no-mmproj-auto --no-mmproj-offload --no-warmup "
+        "--no-spec-draft-backend-sampling --no-op-offload "
+        "--no-ui-mcp-proxy"
     )
     assert params["use_mmap"] is False
-    assert params["ignore_eos"] is False
-    assert params["backend_sampling"] is False
     assert params["cont_batching"] is False
-    assert params["mlock"] is False
     assert params["kv_offload"] is False
     assert params["repack"] is False
     assert params["use_mmap"] is False
     assert params["cache_idle_slots"] is False
     assert params["kv_unified"] is False
-    assert params["embeddings"] is False
-    assert params["reranking"] is False
     assert params["agent"] is False
+    assert not unrec
+
+
+def test_short_negation_aliases():
+    params, unrec, _ = parse_launch_command("llama-server -m /m.gguf -nkvo -nocb -no-kvu --no-webui")
+    assert params["kv_offload"] is False
+    assert params["cont_batching"] is False
+    assert params["kv_unified"] is False
+    assert params["ui"] is False
+    assert not unrec
 
 
 def test_bare_executable_prefix_variants():

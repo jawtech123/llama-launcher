@@ -53,8 +53,6 @@ def cmd_launch(args: argparse.Namespace) -> int:
             threads=args.threads,
             port=args.port,
             host=args.host,
-            backend=args.backend,
-            use_mmap=True,
             cache_type_k=args.kv_cache,
             cache_type_v=args.kv_cache,
             batch_size=args.batch,
@@ -111,11 +109,13 @@ def main() -> None:
     launch_parser.add_argument("--threads", type=int, default=0)
     launch_parser.add_argument("--port", type=int, default=8080)
     launch_parser.add_argument("--host", default="127.0.0.1")
-    launch_parser.add_argument("--backend", default="auto")
     launch_parser.add_argument("--kv-cache", default="f16")
     launch_parser.add_argument("--batch", type=int, default=2048)
     launch_parser.add_argument("--dry-run", action="store_true", help="Only show command")
-    launch_parser.add_argument("--extra-flags", nargs="+", default=[], help="Extra flags to append to command")
+    launch_parser.add_argument(
+        "--extra-flags", nargs="+", default=[], metavar="FLAG",
+        help="Raw llama-server flags appended verbatim; write them as "
+             "--extra-flags='--flag value' so they are not parsed here")
     launch_parser.set_defaults(func=cmd_launch)
 
     args = parser.parse_args()

@@ -30,3 +30,6 @@ Thumbs.db
 
 # Local tool state
 .opencode/
+
+# Local assistant/tool state
+.claude/

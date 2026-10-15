@@ -76,9 +76,9 @@ class TestIntFieldValidation:
 class TestChoiceFieldValidation:
     """Choice field validation."""
 
-    def test_validator_invalid_choice_backend(self):
-        """Invalid backend raises ValidationError."""
-        config = LlamaConfig(model_path="/m.gguf", backend="invalid", host="127.0.0.1")
+    def test_validator_invalid_choice_reasoning_format(self):
+        """Invalid reasoning format raises ValidationError."""
+        config = LlamaConfig(model_path="/m.gguf", reasoning_format="invalid", host="127.0.0.1")
         with pytest.raises(ValidationError):
             validate_config(config)
 

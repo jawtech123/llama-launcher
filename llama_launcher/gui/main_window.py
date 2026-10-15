@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, QThread, QTimer
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QInputDialog, QMainWindow, QMessageBox, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -20,6 +20,7 @@ from llama_launcher.core.presets import PresetManager
 from llama_launcher.core.validator import validate_config
 from llama_launcher.benchmark import config_fingerprint, latest_session_for_preset
 from llama_launcher.estimator import ResourceEstimator
+from llama_launcher.estimator.estimator import _GgufReader
 from llama_launcher.gpu.types import GPUInfo
 from llama_launcher.gui.advanced_tab import AdvancedConfigTab
 from llama_launcher.gui.config_controller import ConfigController
@@ -41,8 +42,7 @@ from llama_launcher.remote.host_info import (
     load_profile as load_host_profile, save_profile as save_host_profile,
 )
 from llama_launcher.gui.workers import (
-    EstimateWorker, HostConnectWorker, ModelScanWorker, PresetStyleWorker,
-    TaskWorker, UsageSampleWorker,
+    EstimateWorker, HostConnectWorker, ModelScanWorker, TaskWorker, UsageSampleWorker,
 )
 from llama_launcher.models.scanner import is_mmproj_file
 from llama_launcher.models.storage import (
@@ -50,6 +50,7 @@ from llama_launcher.models.storage import (
     save_models as save_cached_models,
 )
 from llama_launcher.remote.console import LogFollowWorker
+from llama_launcher.remote.local import LocalServerConnection
 from llama_launcher.remote.manager import ServerManager
 from llama_launcher.remote.types import (
     LOCAL_SERVER_NAME, ConnectionState, ServerConfig, ServerProcessState,
@@ -88,7 +89,6 @@ class LlamaLauncherGUI(QMainWindow):
         #: startup-failure check (not the generic reconciliation poll) owns
         #: reporting an immediate crash -- avoids both racing to detach first.
         self._preview_launch_started_at = 0.0
-        self._ctx_auto_set = True  # Allow auto-set on first model load
         self._active_workers = []
         self._closing = False
         #: Last connection failure per server, shown on the server bars.
@@ -141,18 +141,9 @@ class LlamaLauncherGUI(QMainWindow):
 
     @staticmethod
     def _find_local_llama_server() -> str:
-        """Locate a llama-server binary: PATH first, then common build locations."""
-        found = shutil.which("llama-server")
-        if found:
-            return found
-        for candidate in (
-            "/workspace/llama.cpp/build/bin/llama-server",
-            "/usr/local/bin/llama-server",
-            str(Path.home() / "llama.cpp/build/bin/llama-server"),
-        ):
-            if Path(candidate).is_file():
-                return candidate
-        return "llama-server"
+        """Locate a llama-server binary: PATH first, then the usual build locations."""
+        found = LocalServerConnection(ServerConfig()).find_server_binary()
+        return found or "llama-server"
 
     def init_ui(self):
         """Initialize the user interface."""
@@ -193,6 +184,10 @@ class LlamaLauncherGUI(QMainWindow):
         help_menu = self.menuBar().addMenu("&Help")
         about_action = help_menu.addAction("&About llama-launcher")
         about_action.triggered.connect(self._show_about)
+
+        # Transient confirmations ("preset saved") go here instead of modal
+        # dialogs that have to be dismissed.
+        self.statusBar().showMessage("Ready", 3000)
 
         self.tab_widget = QTabWidget()
 
@@ -299,8 +294,7 @@ class LlamaLauncherGUI(QMainWindow):
         # user re-selects it elsewhere.
         self.server_management_widget.server_selected.connect(
             self.on_server_changed)
-        self.basic_tab.ctx_spin.valueChanged.connect(
-            lambda *_: setattr(self, "_ctx_auto_set", False))
+        self.basic_tab.load_template_btn.clicked.connect(self._load_model_chat_template)
 
         # Models tab
         self.models_tab.scan_requested.connect(self.scan_models)
@@ -314,6 +308,8 @@ class LlamaLauncherGUI(QMainWindow):
         # Preview tab
         self.preview_tab.launch_requested.connect(self.launch_server)
         self.preview_tab.stop_requested.connect(self.stop_server)
+        self.preview_tab.regenerate_requested.connect(
+            lambda: self.update_command_preview(force=True))
 
         # Import tab
         self.import_tab.preset_created.connect(self.refresh_preset_list_if_needed)
@@ -359,10 +355,9 @@ class LlamaLauncherGUI(QMainWindow):
         # deliver the worker's completion signal isn't guaranteed to keep
         # pumping during shutdown.
         self._shutdown_preview_server()
-        for timer_name in ("_preset_style_timer", "_live_stats_timer"):
-            timer = getattr(self, timer_name, None)
-            if timer is not None:
-                timer.stop()
+        timer = getattr(self, "_live_stats_timer", None)
+        if timer is not None:
+            timer.stop()
         # Close connections BEFORE waiting on workers so threads that are
         # blocked in I/O calls error out and can be cleaned up.
         self.server_manager.disconnect_all()
@@ -395,9 +390,6 @@ class LlamaLauncherGUI(QMainWindow):
         """Run blocking init tasks after UI is shown."""
         if self._closing:
             return
-        self._preset_style_timer = QTimer(self)
-        self._preset_style_timer.timeout.connect(self._refresh_preset_combo_styles)
-        self._preset_style_timer.start(15000)
         self._live_stats_timer = QTimer(self)
         self._live_stats_timer.timeout.connect(self._poll_live_stats)
         self._live_stats_timer.start(LOCAL_STATS_INTERVAL_MS)
@@ -425,7 +417,10 @@ class LlamaLauncherGUI(QMainWindow):
             self.controller.set_config(preset_config)
 
             self._settings.setValue("last_preset", preset_name)
-            self.update_command_preview()
+            # Loading a preset is an explicit "start from this", so it replaces
+            # any hand-edited command too.
+            self.update_command_preview(force=True)
+            self.statusBar().showMessage(f"Loaded preset '{preset_name}'", 3000)
         except Exception as e:
             logger.exception("Failed to load preset '%s'", preset_name)
             QMessageBox.critical(
@@ -459,7 +454,7 @@ class LlamaLauncherGUI(QMainWindow):
             combo.setCurrentText(name)
             combo.blockSignals(False)
         self._settings.setValue("last_preset", name)
-        QMessageBox.information(self, "Success", f"Preset '{name}' saved successfully.")
+        self.statusBar().showMessage(f"Preset '{name}' saved", 4000)
 
     def open_preset_manager(self):
         """Open preset manager dialog for CRUD operations."""
@@ -479,32 +474,6 @@ class LlamaLauncherGUI(QMainWindow):
             if current in presets:
                 combo.setCurrentText(current)
             combo.blockSignals(False)
-
-    def _refresh_preset_combo_styles(self):
-        if self._closing:
-            return
-        preset_names = [
-            self.basic_tab.preset_combo.itemText(i)
-            for i in range(self.basic_tab.preset_combo.count())
-        ]
-        worker = PresetStyleWorker(preset_names, self.server_manager.get_all_names(),
-                                   self.server_manager)
-        worker.style_done.connect(self._on_preset_style_done)
-        self._start_worker(worker)
-
-    def _on_preset_style_done(self, results):
-        offline_set = {name for name, offline in results if offline}
-        for combo in (self.basic_tab.preset_combo, self.advanced_tab.preset_combo):
-            for i in range(combo.count()):
-                name = combo.itemText(i)
-                offline = name in offline_set
-                font = QFont()
-                if offline:
-                    font.setItalic(True)
-                    combo.setItemData(i, theme.FG_MUTED, Qt.ItemDataRole.ForegroundRole)
-                else:
-                    combo.setItemData(i, None, Qt.ItemDataRole.ForegroundRole)
-                combo.setFont(font)
 
     # ------------------------------------------------------------------
     # Preset benchmark info
@@ -664,7 +633,6 @@ class LlamaLauncherGUI(QMainWindow):
 
     def _on_servers_changed(self):
         self._refresh_server_combo()
-        self._refresh_preset_combo_styles()
 
     # ------------------------------------------------------------------
     # Connecting: the moment we learn about a host
@@ -1041,17 +1009,45 @@ class LlamaLauncherGUI(QMainWindow):
         if hasattr(self, "_preview_debounce"):
             self._preview_debounce.start()
 
-    def update_command_preview(self):
-        """Rebuild and display the command from the live config."""
+    def update_command_preview(self, force: bool = False):
+        """Rebuild and display the command from the live config.
+
+        A hand-edited command on the Preview tab is kept unless ``force``.
+        """
         try:
             validate_config(self.config)
-            self.preview_tab.set_command(build_command(self.config))
+            self.preview_tab.set_command(build_command(self.config), force=force)
             self._mark_model_invalid(False)
         except Exception as e:
-            self.preview_tab.set_command(f"Validation Error: {e}")
+            self.preview_tab.set_command(f"Validation Error: {e}", force=force)
             self._mark_model_invalid("model_path" in str(e))
 
         self._update_resource_estimate()
+
+    def _load_model_chat_template(self):
+        """Copy the selected model's embedded chat template into the editor.
+
+        The template lives in the GGUF header, so this only works for a model
+        file this machine can read; for a remote model the server's own copy
+        is used by llama-server anyway.
+        """
+        path = self.config.model_path
+        if not path or not Path(path).is_file():
+            QMessageBox.information(
+                self, "Chat Template",
+                "The selected model is not a local file, so its template cannot be read "
+                "here. llama-server on that host uses the model's built-in template "
+                "unless you paste one.")
+            return
+        meta = _GgufReader.read_full_metadata(path)
+        if not meta.chat_template:
+            QMessageBox.information(
+                self, "Chat Template",
+                "This model has no chat template in its metadata.")
+            return
+        self.controller.set("chat_template", meta.chat_template)
+        self.statusBar().showMessage(
+            f"Loaded the chat template embedded in {Path(path).name}", 4000)
 
     def _mark_model_invalid(self, invalid: bool):
         """Toggle error styling on the model path combo."""
@@ -1134,14 +1130,6 @@ class LlamaLauncherGUI(QMainWindow):
         self.resource_panel.update_estimate(estimate,
                                             selected_ctx=self.config.context_size)
 
-        # Auto-set context default from training context on first model load
-        if (estimate is not None
-                and self._ctx_auto_set
-                and estimate.training_context_length > 0
-                and self.config.context_size < estimate.training_context_length):
-            self.controller.set("context_size", estimate.training_context_length)
-            self._ctx_auto_set = False
-
         if getattr(self, "_estimate_rerun", False):
             self._estimate_rerun = False
             self._update_resource_estimate()
@@ -1153,15 +1141,27 @@ class LlamaLauncherGUI(QMainWindow):
     # ------------------------------------------------------------------
 
     def launch_server(self):
-        """Launch llama-server on the Preview tab's selected server."""
+        """Launch llama-server on the Preview tab's selected server.
+
+        Runs the Preview tab's command text, so a hand-edited command is
+        honoured; otherwise it is the freshly generated one.
+        """
         try:
             validate_config(self.config)
-            cmd = self._resolve_server_binary(build_command(self.config))
         except Exception as e:
-            self._mark_model_invalid("model_path" in str(e))
-            QMessageBox.warning(self, "Cannot Launch", str(e))
-            return
+            if not self.preview_tab.is_edited():
+                self._mark_model_invalid("model_path" in str(e))
+                QMessageBox.warning(self, "Cannot Launch", str(e))
+                return
         self._mark_model_invalid(False)
+        if self.preview_tab.is_edited():
+            cmd = self.preview_tab.command()
+        else:
+            cmd = build_command(self.config)
+        if not cmd or cmd.startswith("Validation Error"):
+            QMessageBox.warning(self, "Cannot Launch", "The launch command is empty or invalid.")
+            return
+        cmd = self._resolve_server_binary(cmd)
 
         target = self.preview_tab.server_bar.current_server() or self._get_current_server()
         if not target:
@@ -1377,21 +1377,3 @@ class LlamaLauncherGUI(QMainWindow):
         command shown in the Command Preview.
         """
         return build_command(self.config)
-
-
-def run_gui():
-    """Run the GUI application (convenience for ``python -m`` style launches)."""
-    import sys
-    from PySide6.QtWidgets import QApplication
-
-    from llama_launcher.gui.theme import apply_dark_theme
-
-    app = QApplication(sys.argv)
-    apply_dark_theme(app)
-    window = LlamaLauncherGUI()
-    window.show()
-    sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    run_gui()

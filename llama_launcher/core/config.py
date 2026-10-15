@@ -41,9 +41,9 @@ class LlamaConfig:
 
     # RoPE and YaRN
     rope_scaling: str = "none"
-    rope_scale: int = 1
-    rope_freq_base: int = 0
-    rope_freq_scale: int = 0
+    rope_scale: float = 1.0
+    rope_freq_base: float = 0.0
+    rope_freq_scale: float = 0.0
     yarn_orig_ctx: int = 0
     yarn_ext_factor: float = -1.0
     yarn_attn_factor: float = -1.0
@@ -56,7 +56,6 @@ class LlamaConfig:
     no_host: bool = False
     cache_type_k: str = "f16"
     cache_type_v: str = "f16"
-    defrag_thold: int = 0
     mlock: bool = False
     use_mmap: bool = True
     direct_io: bool = False
@@ -101,8 +100,8 @@ class LlamaConfig:
     verbose: bool = False
     offline: bool = False
     verbosity: int = 3
-    log_prefix: bool = True
-    log_timestamps: bool = True
+    log_prefix: bool = False
+    log_timestamps: bool = False
 
     # Spec draft cache types
     spec_draft_type_k: str = "f16"
@@ -167,7 +166,6 @@ class LlamaConfig:
     spec_draft_backend_sampling: bool = True
     spec_draft_device: str = ""
     spec_draft_ngl: int = -1
-    spec_draft_model: str = ""
     spec_type: str = "none"
     spec_ngram_mod_n_min: int = 48
     spec_ngram_mod_n_max: int = 64
@@ -227,9 +225,21 @@ class LlamaConfig:
     embeddings: bool = False
     reranking: bool = False
 
-    # Backend and jinja
-    backend: str = "auto"
-    jinja: bool = False
+    # Chat template / reasoning / HTTP server extras
+    jinja: bool = True
+    chat_template: str = ""
+    chat_template_file: str = ""
+    reasoning: str = "auto"
+    reasoning_format: str = "auto"
+    reasoning_budget: int = -1
+    cache_prompt: bool = True
+    cache_reuse: int = 0
+    threads_http: int = -1
+    timeout: int = 3600
+    api_key: str = ""
+    metrics: bool = False
+    slots: bool = True
+    props: bool = False
 
     # Metadata for presets/profiles
     name: Optional[str] = None
@@ -237,17 +247,30 @@ class LlamaConfig:
     extra_flags: List[str] = field(default_factory=list)
 
 
+#: Current schema version, written into saved presets as ``_schema``. Files
+#: without it were written by 2.0.x and get the v1 -> v2 migrations below.
+SCHEMA_VERSION = 2
+
 #: Legacy config-dict key -> migration applied by :func:`migrate_config_dict`.
 _RENAMED_KEYS = {
     "mmproj": "mmproj_model_path",
     "draft_n_max": "spec_draft_n_max",
     "draft_n_min": "spec_draft_n_min",
+    # 2.0.x had two fields for the one llama-server flag.
+    "spec_draft_model": "draft_model_path",
 }
 
 #: Keys removed from the schema entirely.
-_DROPPED_KEYS = {"logical_batch_size", "kv_cache_type"}
+_DROPPED_KEYS = {"logical_batch_size", "kv_cache_type", "backend", "defrag_thold"}
 
 _FLASH_ATTN_LEGACY = {"enable": "on", "true": "on", "disable": "off", "false": "off"}
+_LOG_COLORS_LEGACY = {"enable": "on", "disable": "off"}
+#: 2.0.x used made-up --spec-type values; map them to what llama-server accepts.
+_SPEC_TYPE_LEGACY = {
+    "ngram": "ngram-simple", "simple": "ngram-simple", "mod": "ngram-mod",
+    "map_k": "ngram-map-k", "map_k4v": "ngram-map-k4v",
+}
+_NUMA_CHOICES = ("", "distribute", "isolate", "numactl")
 
 
 def migrate_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -256,10 +279,7 @@ def migrate_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     Handles renamed fields, dropped fields, and legacy enum values. Unknown
     keys are passed through; callers filter against dataclass fields.
     """
-    import dataclasses
-
     migrated = dict(data)
-    defaults = {f.name: f.default for f in dataclasses.fields(LlamaConfig)}
 
     # Old preset files often contain BOTH the legacy and the new key. Prefer
     # the new key's value when it exists; otherwise take legacy.
@@ -283,9 +303,43 @@ def migrate_config_dict(data: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(fa, str) and fa.lower() in _FLASH_ATTN_LEGACY:
         migrated["flash_attn"] = _FLASH_ATTN_LEGACY[fa.lower()]
 
+    lc = migrated.get("log_colors")
+    if isinstance(lc, str) and lc.lower() in _LOG_COLORS_LEGACY:
+        migrated["log_colors"] = _LOG_COLORS_LEGACY[lc.lower()]
+
+    st = migrated.get("spec_type")
+    if isinstance(st, str) and st in _SPEC_TYPE_LEGACY:
+        migrated["spec_type"] = _SPEC_TYPE_LEGACY[st]
+
+    numa = migrated.get("numa")
+    if isinstance(numa, str) and numa not in _NUMA_CHOICES:
+        logger.debug("Dropping unsupported numa value %r during migration", numa)
+        migrated["numa"] = ""
+
+    schema = migrated.pop("_schema", 1)
+    if not isinstance(schema, int) or schema < 2:
+        # v1 presets stored jinja=False as "untouched default"; llama-server's
+        # own default is now on, so keep what the user was actually getting.
+        if migrated.get("jinja") is False:
+            migrated["jinja"] = True
+        # v1 claimed these defaulted to on, but never emitted anything for
+        # True, so the effective value was always off.
+        for key in ("log_prefix", "log_timestamps"):
+            if migrated.get(key) is True:
+                migrated[key] = False
+
     # Optional[str] fields became plain str; normalize None -> ""
     for key in ("mmproj_model_path", "draft_model_path", "tensor_split"):
         if migrated.get(key) is None:
             migrated[key] = ""
 
     return migrated
+
+
+def config_to_dict(config: "LlamaConfig") -> Dict[str, Any]:
+    """Serialize a config for storage, tagged with the current schema version."""
+    import dataclasses
+
+    data = dataclasses.asdict(config)
+    data["_schema"] = SCHEMA_VERSION
+    return data

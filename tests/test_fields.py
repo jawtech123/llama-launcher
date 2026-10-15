@@ -5,7 +5,7 @@ from llama_launcher.core.config import LlamaConfig, migrate_config_dict
 from llama_launcher.core.fields import (
     Field,
     CLI_FIELDS, FIELDS, FIELDS_BY_NAME, FLAG_TO_FIELD, GROUP_ORDER,
-    CACHE_TYPES, BACKENDS, fields_in_group,
+    CACHE_TYPES, SPEC_TYPES, fields_in_group,
     GRP_COMMON, GRP_GPU, GRP_SAMPLING, GRP_THREADS, GRP_CONTEXT,
     GRP_YARN, GRP_CACHE, GRP_NUMA, GRP_LORA, GRP_SOURCES, GRP_LOGGING,
     GRP_SERVER, GRP_GEN, GRP_MM, GRP_SERVER_EXTRA,
@@ -177,12 +177,10 @@ def test_cache_types_is_tuple():
     assert "q4_0" in CACHE_TYPES
 
 
-def test_backends_is_tuple():
-    assert isinstance(BACKENDS, tuple)
-    assert "auto" in BACKENDS
-    assert "cuda" in BACKENDS
-    assert "metal" in BACKENDS
-    assert "cpu" in BACKENDS
+def test_spec_types_match_llama_server():
+    assert isinstance(SPEC_TYPES, tuple)
+    assert SPEC_TYPES[0] == "none"
+    assert "ngram-simple" in SPEC_TYPES and "draft-simple" in SPEC_TYPES
 
 
 def test_all_groups_have_name_constants():
@@ -277,3 +275,37 @@ def test_field_dataclass_is_frozen():
     assert dataclasses.is_dataclass(Field)
     assert dataclasses.fields(Field)  # verify it has fields
     assert Field.__dataclass_params__.frozen is True
+
+
+# ---- schema migration from 2.0.x presets ----
+
+def test_migrate_v1_spec_draft_model_merges_into_draft_model_path():
+    from llama_launcher.core.config import migrate_config_dict
+    m = migrate_config_dict({"spec_draft_model": "/d.gguf"})
+    assert m["draft_model_path"] == "/d.gguf" and "spec_draft_model" not in m
+
+
+def test_migrate_v1_legacy_choice_values():
+    from llama_launcher.core.config import migrate_config_dict
+    m = migrate_config_dict({"log_colors": "enable", "spec_type": "map_k", "numa": "prefer",
+                             "backend": "cuda", "defrag_thold": 5})
+    assert m["log_colors"] == "on"
+    assert m["spec_type"] == "ngram-map-k"
+    assert m["numa"] == ""
+    assert "backend" not in m and "defrag_thold" not in m
+
+
+def test_migrate_v1_jinja_false_means_untouched_default():
+    from llama_launcher.core.config import migrate_config_dict
+    assert migrate_config_dict({"jinja": False})["jinja"] is True
+    assert migrate_config_dict({"jinja": False, "_schema": 2})["jinja"] is False
+    assert migrate_config_dict({"log_prefix": True})["log_prefix"] is False
+
+
+def test_config_to_dict_tags_schema_and_roundtrips():
+    from llama_launcher.core.config import LlamaConfig, config_to_dict, migrate_config_dict, SCHEMA_VERSION
+    cfg = LlamaConfig(model_path="/m.gguf", jinja=False, log_prefix=True)
+    data = config_to_dict(cfg)
+    assert data["_schema"] == SCHEMA_VERSION
+    back = migrate_config_dict(data)
+    assert back["jinja"] is False and back["log_prefix"] is True and "_schema" not in back

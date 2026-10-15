@@ -1,4 +1,9 @@
-"""Command Preview & Launch tab."""
+"""Command Preview & Launch tab.
+
+The command box is editable: a hand-tweaked command is what gets launched,
+and it is left alone until Regenerate is pressed (or a preset is loaded), so
+a config change elsewhere never silently discards an edit.
+"""
 import logging
 
 from PySide6.QtCore import Signal
@@ -8,6 +13,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from llama_launcher.gui import theme
 from llama_launcher.gui.server_bar import ServerBar
 
 logger = logging.getLogger(__name__)
@@ -21,12 +27,14 @@ class PreviewTab(QWidget):
 
     launch_requested = Signal()
     stop_requested = Signal()
+    #: The user pressed Regenerate: the owner should push a fresh command.
+    regenerate_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._edited = False
-        self._command_builder = None
-        self.config = None
+        self._generated = ""
+        self._stale = False
         self._build_ui()
 
     def _build_ui(self):
@@ -38,26 +46,33 @@ class PreviewTab(QWidget):
         server_row.addWidget(self.server_bar)
         layout.addLayout(server_row)
 
-        # Generated command
-        cmd_group = QGroupBox("Generated Command")
+        cmd_group = QGroupBox("Launch Command (editable)")
         cmd_layout = QVBoxLayout(cmd_group)
         self.command_text = QTextEdit()
         self.command_text.setReadOnly(False)
+        self.command_text.setAcceptRichText(False)
         self.command_text.setMaximumHeight(110)
+        self.command_text.setFontFamily("monospace")
+        self.command_text.setToolTip(
+            "Edit freely; the edited command is what Launch runs.\n"
+            "Regenerate rebuilds it from the current configuration.")
         self.command_text.textChanged.connect(self._on_command_changed)
         cmd_layout.addWidget(self.command_text)
-        self._regenerate_hint_label = QLabel()
-        self._regenerate_hint_label.setStyleSheet("color: #FF9800; font-style: italic;")
-        cmd_layout.addWidget(self._regenerate_hint_label)
+        self._hint_label = QLabel()
+        self._hint_label.setStyleSheet(f"color: {theme.WARNING}; font-style: italic;")
+        self._hint_label.setVisible(False)
+        cmd_layout.addWidget(self._hint_label)
+        cmd_group.setSizePolicy(cmd_group.sizePolicy().horizontalPolicy(),
+                                cmd_group.sizePolicy().verticalPolicy().Maximum)
         layout.addWidget(cmd_group)
 
-        # Controls
         controls = QHBoxLayout()
         self.copy_btn = QPushButton("Copy Command")
         self.copy_btn.clicked.connect(self._copy_command)
         controls.addWidget(self.copy_btn)
 
         self.regenerate_btn = QPushButton("Regenerate")
+        self.regenerate_btn.setToolTip("Rebuild the command from the current configuration")
         self.regenerate_btn.clicked.connect(self._regenerate_command)
         controls.addWidget(self.regenerate_btn)
 
@@ -78,7 +93,6 @@ class PreviewTab(QWidget):
         controls.addWidget(self.stop_btn)
         layout.addLayout(controls)
 
-        # Log output
         log_group = QGroupBox("Server Log")
         log_layout = QVBoxLayout(log_group)
         self.log_text = QTextEdit()
@@ -87,43 +101,70 @@ class PreviewTab(QWidget):
         self.log_text.document().setMaximumBlockCount(MAX_LOG_LINES)
         self.log_text.setFontFamily("monospace")
         log_layout.addWidget(self.log_text)
-        layout.addWidget(log_group)
+        layout.addWidget(log_group, 1)
 
     # ------------------------------------------------------------------
+    # Command text
+    # ------------------------------------------------------------------
 
-    def set_command(self, cmd: str):
+    def set_command(self, cmd: str, force: bool = False):
+        """Show a freshly generated command.
+
+        While the user has edits in the box the new command is held back
+        (and a hint shown) unless ``force`` is set, e.g. after Regenerate or
+        loading a preset.
+        """
+        self._generated = cmd
+        if self._edited and not force:
+            self._stale = True
+            self._update_hint()
+            return
+        self.command_text.blockSignals(True)
         self.command_text.setPlainText(cmd)
+        self.command_text.blockSignals(False)
+        self._edited = False
+        self._stale = False
+        self._update_hint()
+
+    def command(self) -> str:
+        """The command Launch will run: the box's content, edited or not."""
+        return self.command_text.toPlainText().strip()
+
+    def is_edited(self) -> bool:
+        return self._edited
 
     def _copy_command(self):
-        QApplication.clipboard().setText(self.command_text.toPlainText())
+        QApplication.clipboard().setText(self.command())
 
     def _regenerate_command(self):
-        if self._command_builder:
-            cmd = self._command_builder(self.config)
-            self.command_text.setPlainText(cmd)
-            self._regenerate_hint_label.setText("Command regenerated.")
-            self._regenerate_hint_label.setStyleSheet("color: #4CAF50;")
-            self._edited = False
-            self._update_hint()
-
-    def _update_hint(self):
-        if self._edited:
-            self._regenerate_hint_label.setText("✎ Edited command — click Regenerate to restore")
-            self._regenerate_hint_label.setStyleSheet("color: #FF9800;")
-        else:
-            self._regenerate_hint_label.setText("")
-
-    def set_command(self, cmd: str, config=None, command_builder=None):
-        self.config = config if config else self.config
-        if command_builder:
-            self._command_builder = command_builder
-        self.command_text.setPlainText(cmd)
         self._edited = False
+        self._stale = False
+        self.regenerate_requested.emit()
+        # If no owner is wired (tests), fall back to the last generated text.
+        if self.command_text.toPlainText() != self._generated and self._generated:
+            self.set_command(self._generated, force=True)
         self._update_hint()
 
     def _on_command_changed(self):
-        self._edited = True
+        self._edited = self.command_text.toPlainText() != self._generated
+        if not self._edited:
+            self._stale = False
         self._update_hint()
+
+    def _update_hint(self):
+        if self._edited and self._stale:
+            text = ("✎ Edited command; the configuration has changed since. "
+                    "Regenerate to rebuild from the configuration.")
+        elif self._edited:
+            text = "✎ Edited command: Launch runs this text as-is. Regenerate to restore."
+        else:
+            text = ""
+        self._hint_label.setText(text)
+        self._hint_label.setVisible(bool(text))
+
+    # ------------------------------------------------------------------
+    # Run state + log
+    # ------------------------------------------------------------------
 
     def set_running(self, running: bool):
         """Reflect the launch process state in the controls."""
@@ -132,10 +173,10 @@ class PreviewTab(QWidget):
         self.server_bar.setEnabled(not running)
         if running:
             self.status_label.setText("● Running")
-            self.status_label.setStyleSheet("color: #4CAF50; font-weight: bold;")
+            self.status_label.setStyleSheet(f"color: {theme.SUCCESS}; font-weight: bold;")
         else:
             self.status_label.setText("● Stopped")
-            self.status_label.setStyleSheet("color: #9d9d9d;")
+            self.status_label.setStyleSheet(f"color: {theme.FG_DIM};")
 
     def clear_log(self):
         self.log_text.clear()

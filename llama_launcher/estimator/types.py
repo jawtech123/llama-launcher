@@ -1,6 +1,6 @@
 """Resource Estimation Types."""
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 
 @dataclass
@@ -13,20 +13,65 @@ class ResourceBreakdown:
 
 @dataclass
 class ModelMetadata:
-    """Architecture metadata extracted from GGUF header."""
+    """Architecture metadata and tensor sizes read from a GGUF header."""
     arch: str = "unknown"
     layers: int = 0
     heads: int = 0
     kv_heads: int = 0
     embedding_length: int = 0
     head_dim: int = 0
+    #: K and V head dimensions; equal to head_dim unless the model says otherwise.
+    key_length: int = 0
+    value_length: int = 0
     ff_dim: int = 0
-    kv_dim: int = 0  # Gemma uses ff_dim for V cache dimension
+    kv_dim: int = 0  # kept for callers that read it; equals value_length
     context_length: int = 0
+    vocab_size: int = 0
     total_params: int = 0
-    quant_types: dict[str, int] = field(default_factory=dict)
+    quant_types: dict = field(default_factory=dict)
+    #: Quantization label from general.file_type (e.g. "Q4_K_M"), "" if absent.
+    file_type: str = ""
     tensor_count: int = 0
-    attn_interval: int = 1  # >1 for hybrid SSM/attention archs (e.g. qwen35)
+    #: >1 for hybrid SSM/attention archs where only every Nth layer has a KV cache.
+    attn_interval: int = 1
+    #: Per-layer KV head counts when the model varies them (else empty).
+    kv_heads_per_layer: List[int] = field(default_factory=list)
+    #: Sliding-window size for SWA layers (0 = none) and the pattern period
+    #: (every Nth layer is a full-attention layer; 0 = unknown).
+    swa_window: int = 0
+    swa_pattern: int = 0
+    #: Recurrent-state geometry for SSM / linear-attention layers.
+    ssm_conv_kernel: int = 0
+    ssm_inner_size: int = 0
+    ssm_state_size: int = 0
+    ssm_group_count: int = 0
+    #: Mixture-of-experts geometry (0 for dense models).
+    n_expert: int = 0
+    n_expert_used: int = 0
+    expert_ff_dim: int = 0
+    shared_expert_ff_dim: int = 0
+    #: The chat template embedded in the model ("" if none).
+    chat_template: str = ""
+
+    # ---- tensor sizes, in bytes ----
+    #: Bytes of each repeating layer (``blk.N.*``), index = layer.
+    layer_bytes: List[int] = field(default_factory=list)
+    #: Bytes of the MoE expert tensors inside each layer (subset of layer_bytes).
+    expert_bytes: List[int] = field(default_factory=list)
+    #: Token embedding, output head (0 when tied to the embedding), and
+    #: everything else that is not a repeating layer.
+    embd_bytes: int = 0
+    output_bytes: int = 0
+    other_bytes: int = 0
+    total_bytes: int = 0
+
+    @property
+    def has_tensor_sizes(self) -> bool:
+        return self.total_bytes > 0 and bool(self.layer_bytes)
+
+    @property
+    def is_moe(self) -> bool:
+        return self.n_expert > 1
 
 
 @dataclass
@@ -80,33 +125,33 @@ class VramBreakdown:
                 self.cuda_runtime_mb + self.temp_allocations_mb + self.draft_model_mb +
                 self.mmproj_model_mb + self.backend_overhead_mb + self.safety_margin_mb)
 
-    def as_breakdown_list(self) -> list[ResourceBreakdown]:
+    def as_breakdown_list(self) -> list:
         items = [
             ResourceBreakdown("Model Weights (GPU)", self.gpu_weights_mb,
-                "Weights for layers offloaded to GPU. Depends on gpu_layers setting and model quantization."),
+                "Weights of the layers offloaded to the GPU (per-tensor sizes from the GGUF)."),
             ResourceBreakdown("KV Cache (GPU)", self.kv_cache_mb,
-                "Key/Value cache for attention on GPU. Depends on context size, batch size, number of sequences, and cache type."),
-            ResourceBreakdown("Inference Buffers", self.inference_buffers_mb,
-                "Temporary buffers for forward pass computation (layer activations, intermediate results)."),
+                "Key/Value cache for the offloaded attention layers: context size x KV heads x head size x cache type."),
+            ResourceBreakdown("Compute Buffers", self.inference_buffers_mb,
+                "Scratch space for the forward pass; grows with ubatch size and, without flash attention, with context."),
         ]
         if self.cuda_runtime_mb > 0:
             items.append(ResourceBreakdown("CUDA Runtime", self.cuda_runtime_mb,
-                "CUDA context and driver overhead. Typically ~200-400 MB per GPU."))
+                "CUDA context and driver overhead, roughly 0.5 GB per GPU."))
         if self.temp_allocations_mb > 0:
-            items.append(ResourceBreakdown("Temp Allocations", self.temp_allocations_mb,
-                "Temporary allocations during inference (softmax buffers, gemm scratch space)."))
+            items.append(ResourceBreakdown("Recurrent State", self.temp_allocations_mb,
+                "State buffers for SSM / linear-attention layers, one per server slot."))
         if self.backend_overhead_mb > 0:
             items.append(ResourceBreakdown("Backend Overhead", self.backend_overhead_mb,
-                "Estimated backend overhead (Vulkan/Metal/CUDA workspace)."))
+                "Estimated backend overhead (Vulkan/Metal/HIP runtime)."))
         if self.safety_margin_mb > 0:
             items.append(ResourceBreakdown("Safety Margin", self.safety_margin_mb,
-                "Configurable safety margin to account for estimation uncertainty."))
+                "Margin for estimation uncertainty."))
         if self.draft_model_mb > 0:
             items.append(ResourceBreakdown("Draft Model", self.draft_model_mb,
-                "Draft model weights for speculative decoding."))
+                "Draft model weights and KV cache for speculative decoding."))
         if self.mmproj_model_mb > 0:
             items.append(ResourceBreakdown("mmproj Model", self.mmproj_model_mb,
-                "Multimodal projector model for vision-language models."))
+                "Multimodal projector weights plus its image-encoding buffers."))
         return items
 
 
@@ -127,22 +172,23 @@ class RamBreakdown:
                 self.mmap_overhead_mb + self.runtime_overhead_mb + self.draft_model_mb +
                 self.mmproj_model_mb)
 
-    def as_breakdown_list(self) -> list[ResourceBreakdown]:
+    def as_breakdown_list(self) -> list:
         return [
             ResourceBreakdown("Model Weights (CPU)", self.cpu_weights_mb,
-                "Weights for layers running on CPU. If mmap is enabled, this is mostly page cache, not physical RAM."),
+                "Weights that stay in system RAM: the token embedding plus any layer not offloaded. "
+                "With mmap this is page cache, released under memory pressure."),
             ResourceBreakdown("KV Cache (CPU)", self.kv_cache_mb,
-                "Key/Value cache for attention on CPU. Used when kv_offload is disabled or GPU KV cache is full."),
-            ResourceBreakdown("Inference Buffers", self.inference_buffers_mb,
-                "CPU-side temporary buffers for computation."),
+                "Key/Value cache of the layers that run on the CPU, or all of it when KV offload is off."),
+            ResourceBreakdown("Compute Buffers", self.inference_buffers_mb,
+                "Host-side scratch buffers (input staging, CPU layers' activations)."),
             ResourceBreakdown("mmap Overhead", self.mmap_overhead_mb,
-                "Memory-mapped file overhead when mmap is enabled."),
+                "Page-table and read-ahead overhead of memory-mapping the model file."),
             ResourceBreakdown("Runtime Overhead", self.runtime_overhead_mb,
-                "llama-server process overhead, thread stacks, internal data structures."),
+                "llama-server process overhead: thread stacks, HTTP server, tokenizer."),
             ResourceBreakdown("Draft Model", self.draft_model_mb,
-                "Draft model weights on CPU for speculative decoding."),
+                "Draft model weights on the CPU for speculative decoding."),
             ResourceBreakdown("mmproj Model", self.mmproj_model_mb,
-                "Multimodal projector model on CPU."),
+                "Multimodal projector on the CPU."),
         ]
 
 
@@ -192,7 +238,7 @@ class ResourceEstimate:
     estimated_vram_mb: float = 0.0
 
     # Multi-GPU
-    gpu_breakdowns: list[GpuBreakdown] = field(default_factory=list)
+    gpu_breakdowns: list = field(default_factory=list)
     multi_gpu: bool = False
     split_mode: str = "layer"
 
@@ -202,7 +248,7 @@ class ResourceEstimate:
     # Warnings
     vram_exceeded: bool = False
     ram_warning: bool = False
-    warnings: list[str] = field(default_factory=list)
+    warnings: list = field(default_factory=list)
 
     # Breakdowns
     vram_breakdown: VramBreakdown = field(default_factory=VramBreakdown)
@@ -210,6 +256,11 @@ class ResourceEstimate:
 
     # Model metadata from GGUF
     model_metadata: ModelMetadata = field(default_factory=ModelMetadata)
+
+    #: How many of the model's layers (plus the output layer) the estimate
+    #: assumes are on the GPU, and the total count, as llama-server reports it.
+    offloaded_layers: int = 0
+    offloadable_layers: int = 0
 
     # Legacy fields for backward compat
     model_file_size_mb: float = 0.0
@@ -250,6 +301,18 @@ class ResourceEstimate:
         if p >= 1_000:
             return f"{p / 1_000:.0f}K"
         return str(p)
+
+    @property
+    def quant_display(self) -> str:
+        """Best available quantization label (file type, else dominant tensor type)."""
+        meta = self.model_metadata
+        if meta.file_type:
+            return meta.file_type
+        if meta.quant_types:
+            return max(meta.quant_types, key=meta.quant_types.get)
+        if self.quant_type and self.quant_type != "unknown":
+            return self.quant_type
+        return ""
 
     @property
     def arch_name(self) -> str:

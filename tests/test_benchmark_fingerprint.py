@@ -36,7 +36,6 @@ def test_full_150_field_config_stable():
         gpu_layers=-1,
         port=8080,
         host="127.0.0.1",
-        backend="auto",
         cache_type_k="q4_0",
         cache_type_v="q4_0",
         use_mmap=True,
@@ -52,7 +51,6 @@ def test_full_150_field_config_stable():
         gpu_layers=-1,
         port=8080,
         host="127.0.0.1",
-        backend="auto",
         cache_type_k="q4_0",
         cache_type_v="q4_0",
         use_mmap=True,
@@ -97,7 +95,7 @@ def test_fingerprint_changes_on_any_field():
         ("temp", 0.5),
         ("top_p", 0.99),
         ("seed", 42),
-        ("backend", "cuda"),
+        ("jinja", False),
         ("use_mmap", False),
     ]
     fp_base = config_fingerprint(base)

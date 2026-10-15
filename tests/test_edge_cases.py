@@ -134,13 +134,14 @@ class TestBooleanAndChoiceEdgeCases:
         """All valid choices in one config."""
         config = LlamaConfig(
             model_path="/m.gguf", host="127.0.0.1",
-            backend="cuda", cache_type_k="q4_0", cache_type_v="q4_0",
+            cache_type_k="q4_0", cache_type_v="q4_0",
             rope_scaling="yarn", split_mode="layer", flash_attn="on",
-            pooling="none", log_colors="auto", numa="",
+            pooling="none", log_colors="off", numa="distribute",
         )
         validate_config(config)
         cmd = build_command(config)
-        assert "--backend cuda" in cmd
+        assert "--log-colors off" in cmd
+        assert "--numa distribute" in cmd
 
 
 class TestEmptyVsNoneVsDefault:

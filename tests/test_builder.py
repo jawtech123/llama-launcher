@@ -5,14 +5,29 @@ from llama_launcher.core.builder import build_command
 from llama_launcher.core.config import LlamaConfig
 from llama_launcher.core.parser import parse_launch_command
 
+#: Flags every command carries even at defaults: llama-server's own defaults
+#: for these are model-dependent (ctx) or changed between builds (jinja).
+ALWAYS = ["--ctx-size", "4096", "--jinja"]
+
 
 # ---- Basic command building ----
 
-def test_default_config_emits_only_model():
+def test_default_config_emits_only_model_and_always_flags():
     cfg = LlamaConfig(model_path="/models/m.gguf")
     cmd = build_command(cfg)
     tokens = shlex.split(cmd)
-    assert tokens == ["llama-server", "--model", "/models/m.gguf"]
+    assert tokens == ["llama-server", "--model", "/models/m.gguf", *ALWAYS]
+
+
+def test_context_size_always_emitted():
+    tokens = shlex.split(build_command(LlamaConfig(model_path="/m.gguf", context_size=4096)))
+    assert tokens[tokens.index("--ctx-size") + 1] == "4096"
+
+
+def test_jinja_always_explicit():
+    assert "--jinja" in shlex.split(build_command(LlamaConfig(model_path="/m.gguf", jinja=True)))
+    off = shlex.split(build_command(LlamaConfig(model_path="/m.gguf", jinja=False)))
+    assert "--no-jinja" in off and "--jinja" not in off
 
 
 def test_non_default_values_are_emitted():
@@ -44,7 +59,7 @@ def test_paths_with_spaces_are_quoted_and_roundtrip():
     cfg = LlamaConfig(model_path="/my models/some model.gguf")
     cmd = build_command(cfg)
     tokens = shlex.split(cmd)
-    assert tokens == ["llama-server", "--model", "/my models/some model.gguf"]
+    assert tokens == ["llama-server", "--model", "/my models/some model.gguf", *ALWAYS]
 
 
 def test_invalid_legacy_flags_are_never_emitted():
@@ -169,10 +184,10 @@ def test_all_default_false_bools_not_in_default_command():
 # ---- Int/float emission ----
 
 def test_int_not_emitted_when_at_default():
-    cfg = LlamaConfig(model_path="/m.gguf", context_size=4096)
+    cfg = LlamaConfig(model_path="/m.gguf", threads=0, batch_size=2048)
     cmd = build_command(cfg)
     tokens = shlex.split(cmd)
-    assert "--ctx-size" not in tokens
+    assert "--threads" not in tokens and "--batch-size" not in tokens
 
 
 def test_int_emitted_when_different_from_default():
@@ -235,13 +250,17 @@ def test_choice_emitted_when_different_from_default():
     assert tokens[idx + 1] == "yarn"
 
 
-def test_choice_backend_emitted():
-    cfg = LlamaConfig(model_path="/m.gguf", backend="cuda")
-    cmd = build_command(cfg)
-    tokens = shlex.split(cmd)
-    assert "--backend" in tokens
-    idx = tokens.index("--backend")
-    assert tokens[idx + 1] == "cuda"
+def test_choice_reasoning_format_emitted():
+    cfg = LlamaConfig(model_path="/m.gguf", reasoning_format="deepseek")
+    tokens = shlex.split(build_command(cfg))
+    assert tokens[tokens.index("--reasoning-format") + 1] == "deepseek"
+
+
+def test_float_values_render_without_trailing_zero():
+    cfg = LlamaConfig(model_path="/m.gguf", rope_scale=2.0, rope_freq_scale=0.25)
+    tokens = shlex.split(build_command(cfg))
+    assert tokens[tokens.index("--rope-scale") + 1] == "2"
+    assert tokens[tokens.index("--rope-freq-scale") + 1] == "0.25"
 
 
 # ---- Str field emission ----
@@ -355,7 +374,7 @@ def test_command_all_model_types():
         cfg = LlamaConfig(model_path=f"/model{ext}")
         cmd = build_command(cfg)
         tokens = shlex.split(cmd)
-        assert tokens == ["llama-server", "--model", f"/model{ext}"]
+        assert tokens == ["llama-server", "--model", f"/model{ext}", *ALWAYS]
 
 
 # ---- Comprehensive field coverage ----
@@ -388,7 +407,6 @@ def test_comprehensive_config():
         frequency_penalty=0.3,
         seed=42,
         flash_attn="on",
-        backend="cuda",
     )
     cmd = build_command(cfg)
     tokens = shlex.split(cmd)
@@ -414,31 +432,39 @@ def test_comprehensive_config():
     assert "--frequency-penalty" in tokens
     assert "--seed" in tokens
     assert "--flash-attn" in tokens
-    assert "--backend" in tokens
+    assert "--backend" not in tokens
 
 
 def test_speculative_decoding_fields():
     cfg = LlamaConfig(
         model_path="/m.gguf",
-        spec_type="ngram",
+        spec_type="ngram-simple",
         spec_draft_n_max=5,
         spec_draft_n_min=2,
-        spec_draft_model="/draft.gguf",
+        draft_model_path="/draft.gguf",
         spec_draft_backend_sampling=False,
     )
     cmd = build_command(cfg)
     tokens = shlex.split(cmd)
-    assert "--spec-type" in tokens
+    assert tokens[tokens.index("--spec-type") + 1] == "ngram-simple"
     assert "--spec-draft-n-max" in tokens
     assert "--spec-draft-n-min" in tokens
-    assert "--spec-draft-model" in tokens
+    assert tokens[tokens.index("--model-draft") + 1] == "/draft.gguf"
+    assert "--spec-draft-model" not in tokens
     assert "--no-spec-draft-backend-sampling" in tokens
+
+
+def test_draft_model_aliases_import_to_one_field():
+    for flag in ("--model-draft", "-md", "--spec-draft-model", "--draft-model"):
+        params, unrec, _ = parse_launch_command(f"llama-server -m /m.gguf {flag} /d.gguf")
+        assert params["draft_model_path"] == "/d.gguf", flag
+        assert not unrec
 
 
 def test_numa_fields():
     cfg = LlamaConfig(
         model_path="/m.gguf",
-        numa="prefer",
+        numa="distribute",
         split_mode="row",
         main_gpu=1,
         op_offload=False,
@@ -472,7 +498,7 @@ def test_logging_fields():
         model_path="/m.gguf",
         log_file="/tmp/log.txt",
         verbose=True,
-        log_colors="enable",
+        log_colors="on",
         offline=True,
         verbosity=5,
     )
@@ -532,4 +558,4 @@ def test_special_chars_in_model_path_escaped():
     cfg = LlamaConfig(model_path="/path/with spaces/model.gguf")
     cmd = build_command(cfg)
     tokens = shlex.split(cmd)
-    assert tokens == ["llama-server", "--model", "/path/with spaces/model.gguf"]
+    assert tokens == ["llama-server", "--model", "/path/with spaces/model.gguf", *ALWAYS]

@@ -6,14 +6,21 @@ A desktop + CLI application that generates, saves, and launches `llama-server` (
 
 ## Features
 
-- **GUI (PySide6)**: Basic + Advanced configuration tabs, GPU info, model browser,
-  live command preview & launch, server management (local + SSH), benchmark stats,
-  and launch-command import.
+- **GUI (PySide6)**: Basic + Advanced configuration tabs (with a parameter search),
+  GPU info, model browser, editable command preview & launch, server management
+  (local + SSH), benchmark stats, and launch-command import.
+- **Verified against llama-server**: every flag in the registry is checked against
+  the real binary's `--help`; defaults that llama-server cannot know (context size)
+  or that changed between builds (`--jinja`) are always passed explicitly.
+- **Chat templates**: paste a Jinja template or a built-in name, load the one
+  embedded in the model to edit it, or point at a template file on the server.
 - **Config-First Architecture**: every UI action manipulates a shared `LlamaConfig`;
   commands are produced by a single `build_command(config)` and parsed back by `core/parser.py`.
 - **GPU Auto-Detection**: CUDA (NVIDIA), Metal (Apple), Vulkan, with CPU fallback.
-- **Resource Estimation**: VRAM/RAM usage estimated from GGUF metadata before launch,
-  plus realtime CPU/GPU utilization bars.
+- **Resource Estimation**: VRAM/RAM predicted from the GGUF tensor directory and
+  architecture metadata, calibrated to within ~1% of llama-server's own
+  allocations (dense, MoE, hybrid SSM, partial offload, vision projectors); see
+  [docs/ESTIMATOR.md](docs/ESTIMATOR.md). Plus realtime CPU/GPU utilization bars.
 - **Benchmark**: parses llama-server logs for tokens/second in/out and token usage,
   per session and in total. Benchmarks are linked to presets (ℹ button next to the
   preset selector) and automatically reset when any parameter changes.
@@ -42,9 +49,11 @@ venv/bin/llama-launcher-gui      # GUI entry point
 venv/bin/llama-launcher --help   # CLI entry point
 ```
 
-Requirements: Python 3.10+ (with `python3-venv` on Debian/Ubuntu), and a
-`llama-server` binary (from [llama.cpp](https://github.com/ggml-org/llama.cpp))
-either on `PATH` or configured per-server in Server Management.
+Requirements: Python 3.10+ (with `python3-venv` on Debian/Ubuntu), OpenSSH's
+`ssh`/`scp` for remote servers, and a `llama-server` binary (from
+[llama.cpp](https://github.com/ggml-org/llama.cpp)) either on `PATH` or
+configured per-server in Server Management. The flag registry tracks llama.cpp
+builds from 2026; much older builds may reject newer flags.
 See [docs/SETUP.md](docs/SETUP.md) for the full setup guide (manual install,
 remote servers, SSH keys, benchmarking, uninstall).
 
@@ -114,7 +123,7 @@ Legacy `~/.llama_launcher_*.json` files are migrated automatically on first run.
 ```
 llama_launcher/
 ├── core/
-│   ├── fields.py     # ★ declarative registry for all ~150 llama-server parameters
+│   ├── fields.py     # ★ declarative registry for ~180 llama-server parameters
 │   ├── config.py     # LlamaConfig schema + legacy preset migration
 │   ├── builder.py    # registry-driven command builder (shell-quoted)
 │   ├── parser.py     # registry-driven command importer
@@ -133,9 +142,9 @@ llama_launcher/
 │   └── resource_usage_panel.py
 ├── benchmark/     # log timing parser, session storage, config fingerprints
 ├── gpu/           # GPU auto-detection (CUDA, Metal, Vulkan)
-├── estimator/     # GGUF metadata reader (cached) + VRAM/RAM estimation
+├── estimator/     # GGUF header reader (gguf.py) + calibrated VRAM/RAM estimation
 ├── models/        # Model filesystem scanner + per-server scan cache
-├── remote/        # ServerManager: local (subprocess) and SSH (paramiko) connections
+├── remote/        # ServerManager: local (subprocess) and SSH (OpenSSH client) connections
 ├── cli/           # CLI entry point
 ├── utils/         # Config dir management, logging setup, helpers
 ├── app.py         # GUI bootstrap
@@ -147,9 +156,6 @@ command builder, command parser, validator, advanced-tab editor generation,
 and widget bindings are all driven by it. Adding a parameter means adding one
 `Field` entry.
 
-Retired subsystems (legacy benchmarks, quant recommender, VRAM optimizer, legacy
-profiles) are preserved under `_attic/` and are not part of the package.
-
 ## Configuration Flow
 
 ```
@@ -158,6 +164,6 @@ Command → Parser → LlamaConfig (import)
 ```
 
 All commands are generated via `build_command(config: LlamaConfig) -> str` and
-parsed via `parse_launch_command(command: str) -> (params, unrecognized)`.
+parsed via `parse_launch_command(command: str) -> (params, unrecognized, duplicates)`.
 The GUI never blocks on I/O: scanning, GPU detection, estimation, and all
 SSH/SFTP operations run in background workers.

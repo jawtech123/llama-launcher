@@ -55,6 +55,9 @@ _SCP_TIMEOUT = 6 * 60 * 60
 #: How often to re-measure the destination while a transfer runs.
 _PROGRESS_POLL_SECONDS = 0.5
 
+#: How long to wait for llama-server to exit after SIGTERM before SIGKILL.
+_STOP_GRACE_SECONDS = 10
+
 #: A ControlPath is a unix socket. ssh refuses one whose expanded length reaches
 #: ~108 bytes, and expands %C to 64 hex characters.
 _CONTROL_PATH_TOKEN_LEN = 64
@@ -118,7 +121,8 @@ class SSHServerConnection(IServerConnection):
     def _shared_options(self) -> List[str]:
         """Options common to ssh and scp: host checking, timeout, auth, reuse."""
         opts = [
-            "-o", "StrictHostKeyChecking=no",
+            # Trust a host the first time, but refuse one whose key changed.
+            "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=10",
         ]
         control_path = _control_path() if self._allow_multiplexing else None
@@ -714,17 +718,23 @@ class SSHServerConnection(IServerConnection):
 
     def stop_server(self) -> bool:
         # Only ever signal a process the launcher started, never one merely
-        # discovered by port or pgrep.
+        # discovered by port or pgrep. One round trip: TERM, wait for the
+        # process to exit (it has to flush and free the GPU), then KILL -- a
+        # Restart that followed an unfinished TERM used to die on the port.
         pid = self._tracked_pid()
         if not pid:
             logger.info("stop_server: no tracked llama-server process to stop")
             return True
         try:
-            success, _ = self._run_remote(f"kill {int(pid)}", timeout=10)
-            if not success:
-                self._run_remote(f"kill -9 {int(pid)}", timeout=10)
+            script = (
+                f"kill {int(pid)} 2>/dev/null; "
+                f"for i in $(seq 1 {_STOP_GRACE_SECONDS * 2}); do "
+                f"kill -0 {int(pid)} 2>/dev/null || break; sleep 0.5; done; "
+                f"kill -0 {int(pid)} 2>/dev/null && kill -9 {int(pid)}; "
+                f"rm -f {shlex.quote(self._remote_pid_file())}; true"
+            )
+            self._run_remote(script, timeout=_STOP_GRACE_SECONDS + 15)
             self._stored_pid = None
-            self._run_remote(f"rm -f {shlex.quote(self._remote_pid_file())}", timeout=10)
             return True
         except Exception:
             logger.exception("stop_server failed for pid %s", pid)
@@ -732,7 +742,6 @@ class SSHServerConnection(IServerConnection):
 
     def restart_server(self, command: str) -> bool:
         self.stop_server()
-        time.sleep(1)
         return self.start_server(command)
 
     def tail_log(self, lines: int = 100) -> str:
@@ -746,7 +755,8 @@ class SSHServerConnection(IServerConnection):
         Classification is shared with the local scanner so both transports label
         family and quantization identically.
         """
-        ext_clauses = " -o ".join(f"-name {ext}" for ext in MODEL_EXTENSIONS)
+        # Quoted so the remote shell cannot expand the globs against its cwd.
+        ext_clauses = " -o ".join(f"-name {shlex.quote(ext)}" for ext in MODEL_EXTENSIONS)
         find_cmd = (f"find {shlex.quote(directory)} -type f \\( {ext_clauses} \\) "
                     f'-printf "%s\\t%p\\n"')
         success, output = self._run_remote(find_cmd, capture=True, timeout=60)

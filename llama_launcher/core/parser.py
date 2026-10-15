@@ -11,7 +11,7 @@ import shlex
 from typing import Any, Dict, List, Tuple
 
 from llama_launcher.core.config import LlamaConfig
-from llama_launcher.core.fields import FLAG_TO_FIELD
+from llama_launcher.core.fields import FLAG_TO_FIELD, NEGATION_FLAGS
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ def parse_launch_command(command_str: str) -> Tuple[Dict[str, Any], List[str], L
                     logger.warning("Duplicate flag: %s (keeping last value)", arg)
                 else:
                     seen_fields.add(field.name)
-                params[field.name] = not arg.startswith("--no-")
+                params[field.name] = arg not in NEGATION_FLAGS
                 i += 1
                 continue
 

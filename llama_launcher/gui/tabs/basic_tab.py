@@ -3,7 +3,7 @@ import logging
 
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from llama_launcher.core.fields import CACHE_TYPES
@@ -15,6 +15,10 @@ from llama_launcher.gui.widgets import info_label
 logger = logging.getLogger(__name__)
 
 _MODEL_FILTER = "Model Files (*.gguf *.bin *.safetensors);;All Files (*)"
+_TEMPLATE_FILTER = "Jinja templates (*.jinja *.j2 *.txt);;All Files (*)"
+
+#: Built-in template names llama-server accepts in --chat-template, for the hint.
+_BUILTIN_TEMPLATES = "chatml, llama3, llama4, gemma, deepseek3, mistral-v7, phi4, gpt-oss, kimi-k2 ..."
 
 
 class BasicTab(QWidget):
@@ -114,10 +118,12 @@ class BasicTab(QWidget):
 
         self.gpu_spin = QSpinBox()
         self.gpu_spin.setRange(-1, 999)
-        self.gpu_spin.setSpecialValueText("all")
-        self.gpu_spin.setToolTip("Max number of layers to store in VRAM. -1 = all.")
+        self.gpu_spin.setSpecialValueText("auto")
+        self.gpu_spin.setToolTip(
+            "Layers to keep in VRAM. auto = llama-server offloads everything that fits "
+            "(--fit); the estimate below assumes all layers.")
         self.gpu_spin.setMinimumWidth(120)
-        form.addRow(info_label("GPU Layers:", "Max layers to VRAM (-1 = all)."),
+        form.addRow(info_label("GPU Layers:", "Layers kept in VRAM (auto = all that fit)."),
                     self.gpu_spin)
 
         self.batch_spin = QSpinBox()
@@ -155,6 +161,61 @@ class BasicTab(QWidget):
 
         config_layout.addLayout(form)
         layout.addWidget(config_group)
+
+        # Chat template: some models (and some clients, e.g. coding agents that
+        # rely on tool calls) need a template other than the one baked into the
+        # GGUF. Jinja templates are multi-line, hence a real editor.
+        template_group = QGroupBox("Chat Template (optional)")
+        template_layout = QVBoxLayout(template_group)
+        template_layout.setSpacing(4)
+
+        template_hint = QLabel(
+            "Leave empty to use the template embedded in the model. Enter a built-in "
+            f"name ({_BUILTIN_TEMPLATES}) or paste a full Jinja template; or point at a "
+            "template file on the server.")
+        template_hint.setWordWrap(True)
+        template_hint.setStyleSheet("color: #9d9d9d; font-size: 11px;")
+        template_layout.addWidget(template_hint)
+
+        self.chat_template_edit = QPlainTextEdit()
+        self.chat_template_edit.setPlaceholderText(
+            "chatml   -or-   {%- for message in messages %} ... {%- endfor %}")
+        self.chat_template_edit.setMaximumHeight(140)
+        self.chat_template_edit.setTabChangesFocus(False)
+        self.chat_template_edit.setToolTip(
+            "Passed as --chat-template. A built-in name or a complete Jinja template.")
+        template_layout.addWidget(self.chat_template_edit)
+
+        template_buttons = QHBoxLayout()
+        self.load_template_btn = QPushButton("Load Model's Template")
+        self.load_template_btn.setToolTip(
+            "Copy the chat template embedded in the selected (local) model into the "
+            "editor so it can be adjusted.")
+        template_buttons.addWidget(self.load_template_btn)
+        self.import_template_btn = QPushButton("Import From File...")
+        self.import_template_btn.setToolTip("Paste a template file from this machine into the editor.")
+        self.import_template_btn.clicked.connect(self._import_template_file)
+        template_buttons.addWidget(self.import_template_btn)
+        self.clear_template_btn = QPushButton("Clear")
+        self.clear_template_btn.clicked.connect(self.chat_template_edit.clear)
+        template_buttons.addWidget(self.clear_template_btn)
+        template_buttons.addStretch()
+        template_layout.addLayout(template_buttons)
+
+        file_row = QHBoxLayout()
+        file_row.addWidget(info_label(
+            "Template file:",
+            "Passed as --chat-template-file: a Jinja file that exists on the machine "
+            "running llama-server."))
+        self.chat_template_file_edit = QLineEdit()
+        self.chat_template_file_edit.setPlaceholderText("/path/on/server/template.jinja")
+        file_row.addWidget(self.chat_template_file_edit, 1)
+        browse_template_btn = QPushButton("Browse...")
+        browse_template_btn.clicked.connect(self._browse_template_file)
+        file_row.addWidget(browse_template_btn)
+        template_layout.addLayout(file_row)
+
+        layout.addWidget(template_group)
         layout.addStretch()
 
     def _path_combo(self, placeholder: str) -> QComboBox:
@@ -206,6 +267,16 @@ class BasicTab(QWidget):
                self.cache_combo.setCurrentText, self.cache_combo.currentTextChanged)
         self.cache_combo.currentTextChanged.connect(
             lambda v: c.set("cache_type_v", v))
+        c.bind("chat_template", self.chat_template_edit.toPlainText,
+               self._set_template_text, self.chat_template_edit.textChanged)
+        c.bind("chat_template_file", self.chat_template_file_edit.text,
+               self.chat_template_file_edit.setText, self.chat_template_file_edit.textChanged)
+
+    def _set_template_text(self, text: str):
+        # setPlainText resets the cursor; skip it when nothing changed so typing
+        # (which echoes back through the controller) is not disturbed.
+        if self.chat_template_edit.toPlainText() != (text or ""):
+            self.chat_template_edit.setPlainText(text or "")
 
     # ------------------------------------------------------------------
     # Browse handlers + context rounding
@@ -263,3 +334,36 @@ class BasicTab(QWidget):
         path = self._pick_model_file("Select Draft Model File")
         if path:
             self.draft_combo.setEditText(path)
+
+    def _browse_template_file(self):
+        """Pick a template file on the machine that will run llama-server."""
+        manager = getattr(self, "_manager", None)
+        provider = getattr(self, "_server_name_provider", None)
+        server_name = ""
+        if manager is not None and provider is not None:
+            try:
+                server_name = provider() or ""
+            except Exception:
+                logger.debug("Could not determine the selected server", exc_info=True)
+        if server_name and manager is not None and manager.is_remote(server_name):
+            conn = manager.get_connection(server_name)
+            if conn is not None:
+                path = RemotePathDialog.get_path(
+                    self, conn, mode="file", title=f"Select chat template on {server_name}")
+                if path:
+                    self.chat_template_file_edit.setText(path)
+                return
+        path, _ = QFileDialog.getOpenFileName(self, "Select Chat Template File", "", _TEMPLATE_FILTER)
+        if path:
+            self.chat_template_file_edit.setText(path)
+
+    def _import_template_file(self):
+        """Load a local template file's text into the inline editor."""
+        path, _ = QFileDialog.getOpenFileName(self, "Import Chat Template", "", _TEMPLATE_FILTER)
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.chat_template_edit.setPlainText(f.read())
+        except OSError as e:
+            logger.warning("Could not read template %s: %s", path, e)

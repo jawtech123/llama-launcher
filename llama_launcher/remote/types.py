@@ -8,6 +8,7 @@ from typing import List, Optional
 #: configured path turns out not to be runnable on a host.
 LLAMA_SERVER_CANDIDATES = (
     "~/llama.cpp/build/bin/llama-server",
+    "~/llama.cpp/llama-server",
     "/workspace/llama.cpp/build/bin/llama-server",
     "/opt/llama.cpp/build/bin/llama-server",
     "/usr/local/bin/llama-server",
