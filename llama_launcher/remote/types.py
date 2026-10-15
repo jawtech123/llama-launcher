@@ -76,6 +76,53 @@ class ServerConfig:
     #: ``remember_password`` is set, since servers.json is plaintext.
     password: str = ""
     remember_password: bool = False
+    #: Extra environment for llama-server, one ``KEY=VALUE`` per line
+    #: (e.g. ``HSA_OVERRIDE_GFX_VERSION=11.0.0`` for unsupported AMD cards).
+    environment: str = ""
+
+
+def parse_environment(text: str) -> List[tuple]:
+    """``KEY=VALUE`` lines -> [(key, value)]; blank lines and comments ignored.
+
+    Raises ValueError on a malformed line so the dialog can refuse it.
+    """
+    pairs = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not key or not all(c.isalnum() or c == "_" for c in key) or key[0].isdigit():
+            raise ValueError(f"Not a KEY=VALUE line: {raw.strip()!r}")
+        pairs.append((key, value.strip()))
+    return pairs
+
+
+def environment_prefix(config: "ServerConfig") -> str:
+    """Shell prefix applying the server's environment, "" when none.
+
+    Produces ``env K=V K2=V2 `` so it works in front of ``exec`` on any host.
+    Malformed lines are skipped (the dialog validates on save).
+    """
+    import shlex
+    try:
+        pairs = parse_environment(config.environment)
+    except ValueError:
+        pairs = [p for p in _lenient_environment(config.environment)]
+    if not pairs:
+        return ""
+    return "env " + " ".join(shlex.quote(f"{k}={v}") for k, v in pairs) + " "
+
+
+def _lenient_environment(text: str):
+    for raw in (text or "").splitlines():
+        try:
+            yield from parse_environment(raw)
+        except ValueError:
+            continue
 
 
 @dataclass

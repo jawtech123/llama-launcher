@@ -22,6 +22,7 @@ from .procinfo import (
 from .types import (
     LEGACY_PID_FILE,
     LLAMA_SERVER_CANDIDATES,
+    environment_prefix,
     pid_file_name,
     ConnectionState,
     ServerConfig,
@@ -312,11 +313,12 @@ class LocalServerConnection(IServerConnection):
         rather than subtly different measurements of the same quantities.
         """
         try:
+            own = self._own_pids()
             result = subprocess.run(
-                ["sh", "-c", build_usage_probe()],
+                ["sh", "-c", build_usage_probe(own)],
                 capture_output=True, text=True, timeout=20,
             )
-            return parse_usage_probe(result.stdout, self._own_pids())
+            return parse_usage_probe(result.stdout, own)
         except Exception:
             logger.debug("usage sample failed", exc_info=True)
             return ResourceSample()
@@ -375,7 +377,8 @@ class LocalServerConnection(IServerConnection):
         # so subprocess.run sees pipe EOF immediately.
         start_cmd = (
             f"(cd {shlex.quote(str(self._working_dir()))} && "
-            f"exec nohup {command} > {shlex.quote(log_path)} 2>&1 < /dev/null) & echo $!"
+            f"exec nohup {environment_prefix(self._config)}{command} "
+            f"> {shlex.quote(log_path)} 2>&1 < /dev/null) & echo $!"
         )
 
         try:

@@ -10,6 +10,7 @@ benchmarking. For a feature overview see the [README](../README.md).
 | Python 3.10+ | `python3 --version`; on Debian/Ubuntu also install `python3-venv` |
 | `llama-server` binary | from [llama.cpp](https://github.com/ggml-org/llama.cpp), on `PATH` or configured per server |
 | NVIDIA drivers + `nvidia-smi` | optional; enables GPU detection and the live GPU bars |
+| AMD: `amdgpu` kernel driver (any distro); ROCm (`amd-smi`/`rocm-smi`) optional | detection and live stats work without ROCm via sysfs; ROCm adds the gfx target and per-process VRAM |
 | OpenSSH client (`ssh`, `scp`, `ssh-keygen`) | only for remote servers |
 | Qt/X11 or Wayland desktop | the GUI needs a display; the CLI does not |
 
@@ -115,6 +116,25 @@ are trusted on first contact; a host whose key later changes is refused.
 Once connected you can start/stop the remote `llama-server`, watch the live
 log, browse/upload/download remote files, and import the remote log into the
 Benchmark tab.
+
+### AMD GPUs (ROCm / Vulkan)
+
+The GPU Info tab detects AMD cards through `amd-smi` or `rocm-smi` when ROCm is
+installed and through the `amdgpu` driver's sysfs files otherwise, so it works
+on any Linux box with an AMD card, local or remote. It tells you which
+llama.cpp build to use:
+
+- ROCm installed: build with `-DGGML_HIP=ON -DAMDGPU_TARGETS=gfx...` (the
+  target is shown as *Compute target*). Cards ROCm does not officially support
+  (RX 7600/7700, 780M/880M iGPUs, RX 6600/6700) usually run with
+  `HSA_OVERRIDE_GFX_VERSION=11.0.0` (RDNA3) or `10.3.0` (RDNA2); the tab names
+  the value for the detected card.
+- No ROCm: build with `-DGGML_VULKAN=ON`. No extra setup beyond the Vulkan
+  driver (`mesa-vulkan-drivers`).
+
+Set such variables per server in *Server Management → Edit Server →
+Environment* (one `KEY=VALUE` per line); they are applied whenever the
+launcher starts that server, and the status panel shows them.
 
 ## 6. Benchmarking
 

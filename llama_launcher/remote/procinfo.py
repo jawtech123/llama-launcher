@@ -8,7 +8,10 @@ import logging
 import re
 import shlex
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
+
+from llama_launcher.gpu.probe import build_live_probe, parse_gpu_probe, split_sections
+from llama_launcher.gpu.types import GPUInfo
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,8 @@ class ResourceSample:
     gpu_mem_total_mb: float = -1.0
     #: VRAM held by this server's own llama-server, if one is running.
     own_vram_mb: float = 0.0
+    #: Full live reading (per card, temperature, power, processes), if any.
+    gpu: Optional[GPUInfo] = None
 
 
 def parse_listener_pid(ss_output: str) -> Optional[int]:
@@ -59,14 +64,21 @@ def parse_ps_stats(ps_output: str) -> Tuple[float, float, float]:
         return (0.0, 0.0, 0.0)
 
 
-def parse_gpu_stats(nvidia_output: str) -> Tuple[float, float]:
-    """Parse nvidia-smi utilization/memory CSV into (util_pct, mem_mb).
+def parse_gpu_stats(gpu_output: str) -> Tuple[float, float]:
+    """Parse the status probe's GPU section into (util_pct, mem_used_mb).
 
-    Multi-GPU: utilization is the max across devices, memory the sum, so a model
-    split over several cards reports its true total footprint.
+    Accepts either the sectioned live probe (NVIDIA or AMD) or the legacy
+    ``utilization, memory`` nvidia-smi CSV. Multi-GPU: utilization is the max
+    across devices, memory the sum, so a model split over several cards
+    reports its true total footprint.
     """
+    if "@@GPU:" in (gpu_output or ""):
+        gpu = parse_gpu_probe(gpu_output)
+        if gpu is None or gpu.vram_mb <= 0:
+            return (0.0, 0.0)
+        return (max(gpu.utilization_pct, 0.0), max(gpu.used_vram_mb, 0.0))
     utils, mems = [], []
-    for line in (nvidia_output or "").strip().splitlines():
+    for line in (gpu_output or "").strip().splitlines():
         values = [v.strip() for v in line.split(",")]
         if len(values) < 2:
             continue
@@ -169,8 +181,7 @@ def build_status_probe(pid: Optional[int], port: int) -> str:
         f"echo {shlex.quote(_SECTION)}; "
         f"ss -tlnpH 'sport = :{int(port)}' 2>/dev/null; "
         f"echo {shlex.quote(_SECTION)}; "
-        "nvidia-smi --query-gpu=utilization.gpu,memory.used "
-        "--format=csv,noheader,nounits 2>/dev/null"
+        + build_live_probe()
     )
 
 
@@ -180,12 +191,14 @@ def split_status_probe(output: str) -> Tuple[str, str, str]:
     return (ps_out, ss_out, gpu_out)
 
 
-def build_usage_probe() -> str:
+def build_usage_probe(own_pids: Iterable[int] = ()) -> str:
     """One shell command sampling CPU, RAM and GPU utilization.
 
     The CPU figure needs two /proc/stat reads separated in time; doing that
     inside a single command keeps it to one SSH round trip instead of two, and
-    keeps the interval accurate regardless of network latency.
+    keeps the interval accurate regardless of network latency. The GPU part is
+    the shared live probe (NVIDIA or AMD); ``own_pids`` lets an AMD host report
+    the VRAM our own llama-server holds.
     """
     return (
         f"echo {shlex.quote(_SECTION)}; grep '^cpu ' /proc/stat; "
@@ -193,11 +206,7 @@ def build_usage_probe() -> str:
         f"echo {shlex.quote(_SECTION)}; grep '^cpu ' /proc/stat; "
         f"echo {shlex.quote(_SECTION)}; cat /proc/meminfo 2>/dev/null; "
         f"echo {shlex.quote(_SECTION)}; "
-        "nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
-        "--format=csv,noheader,nounits 2>/dev/null; "
-        f"echo {shlex.quote(_SECTION)}; "
-        "nvidia-smi --query-compute-apps=pid,used_memory "
-        "--format=csv,noheader,nounits 2>/dev/null"
+        + build_live_probe(own_pids)
     )
 
 
@@ -209,6 +218,18 @@ def parse_usage_probe(output: str, own_pids=()) -> ResourceSample:
     sample.cpu_percent = cpu_percent_from_samples(cpu_first, cpu_second)
     sample.ram_used_mb, sample.ram_total_mb = parse_meminfo(meminfo)
 
+    if "@@GPU:" in gpu_text:
+        gpu = parse_gpu_probe(gpu_text)
+        if gpu is not None and gpu.vram_mb > 0:
+            sample.gpu = gpu
+            sample.gpu_percent = gpu.utilization_pct
+            sample.gpu_mem_used_mb = gpu.used_vram_mb
+            sample.gpu_mem_total_mb = float(gpu.vram_mb)
+            wanted = {int(p) for p in own_pids if p}
+            sample.own_vram_mb = sum(p.vram_mb for p in gpu.processes if p.pid in wanted)
+        return sample
+
+    # Legacy layout: "util, used, total" rows then "pid, used" rows.
     utils, useds, totals = [], [], []
     for line in (gpu_text or "").strip().splitlines():
         values = [v.strip() for v in line.split(",")]
@@ -230,9 +251,15 @@ def parse_usage_probe(output: str, own_pids=()) -> ResourceSample:
 
 
 def _split_sections(output: str, count: int) -> list:
-    """Split marker-delimited probe output into exactly ``count`` sections."""
+    """Split marker-delimited probe output into exactly ``count`` sections.
+
+    The last section absorbs any surplus, so a trailing multi-section GPU
+    probe stays intact.
+    """
     sections = (output or "").split(_SECTION)
     sections = sections[1:] if len(sections) > 1 else sections
+    if len(sections) > count:
+        sections = sections[:count - 1] + [_SECTION.join(sections[count - 1:])]
     while len(sections) < count:
         sections.append("")
     return [s.strip() for s in sections[:count]]

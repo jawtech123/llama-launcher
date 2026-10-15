@@ -140,12 +140,14 @@ class TestDetectGpuFallback:
             mock_vulkan.assert_not_called()
 
     def test_detect_gpu_fallback_to_cpu(self):
-        with patch("llama_launcher.gpu.detector._detect_cuda") as mock_cuda:
-            with patch("llama_launcher.gpu.detector._detect_metal") as mock_metal:
-                with patch("llama_launcher.gpu.detector._detect_vulkan") as mock_vulkan:
+        with patch("llama_launcher.gpu.detector._detect_cuda") as mock_cuda, \
+                patch("llama_launcher.gpu.detector._detect_metal") as mock_metal, \
+                patch("llama_launcher.gpu.detector._detect_vulkan") as mock_vulkan, \
+                patch("llama_launcher.gpu.detector.run_gpu_probe") as mock_probe:
                     mock_cuda.return_value = None
                     mock_metal.return_value = None
                     mock_vulkan.return_value = None
+                    mock_probe.return_value = None
                     info = detect_gpu()
         assert info.backend == "cpu"
         assert info.vram_mb == 0

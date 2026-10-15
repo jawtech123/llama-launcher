@@ -16,7 +16,13 @@ A desktop + CLI application that generates, saves, and launches `llama-server` (
   embedded in the model to edit it, or point at a template file on the server.
 - **Config-First Architecture**: every UI action manipulates a shared `LlamaConfig`;
   commands are produced by a single `build_command(config)` and parsed back by `core/parser.py`.
-- **GPU Auto-Detection**: CUDA (NVIDIA), Metal (Apple), Vulkan, with CPU fallback.
+- **GPU Auto-Detection**: NVIDIA (nvidia-smi), AMD (amd-smi / rocm-smi, or the amdgpu
+  driver's sysfs files when ROCm is not installed), Apple Metal, Vulkan, with CPU
+  fallback. The same probe describes remote hosts over SSH. The GPU Info tab shows
+  per-card VRAM, utilization, temperature, power and clocks live, which processes hold
+  VRAM, and which llama.cpp build (CUDA / HIP / Vulkan) and build flags to use.
+- **Per-server environment**: extra variables for llama-server (e.g.
+  `HSA_OVERRIDE_GFX_VERSION=11.0.0` for AMD cards ROCm does not officially support).
 - **Resource Estimation**: VRAM/RAM predicted from the GGUF tensor directory and
   architecture metadata, calibrated to within ~1% of llama-server's own
   allocations (dense, MoE, hybrid SSM, partial offload, vision projectors); see

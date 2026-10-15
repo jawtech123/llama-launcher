@@ -36,6 +36,7 @@ def _config_to_dict(config: ServerConfig) -> Dict:
     # the user asked for it. Key auth is the supported way to avoid this.
     d["remember_password"] = config.remember_password
     d["password"] = config.password if config.remember_password else ""
+    d["environment"] = config.environment
     return d
 
 
@@ -64,6 +65,7 @@ def _dict_to_config(d: Dict) -> ServerConfig:
         key_path=d.get("key_path", ""),
         password=stored_password,
         remember_password=remember_password,
+        environment=d.get("environment", "") or "",
     )
 
 

@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from llama_launcher.gpu.detector import NVIDIA_SMI_QUERY, parse_nvidia_smi_gpus
+from llama_launcher.gpu.probe import build_full_probe, parse_gpu_probe
 from llama_launcher.gpu.types import GPUInfo
 from llama_launcher.models.scanner import build_model_info
 from llama_launcher.models.types import ModelInfo
@@ -36,6 +36,7 @@ from .procinfo import (
 from .types import (
     LEGACY_PID_FILE,
     LLAMA_SERVER_CANDIDATES,
+    environment_prefix,
     pid_file_name,
     ConnectionState,
     ServerConfig,
@@ -586,30 +587,18 @@ class SSHServerConnection(IServerConnection):
         return (output or "").strip()
 
     def detect_gpu(self) -> GPUInfo:
-        """Describe the *remote* GPU, parsed exactly like the local one.
+        """Describe the *remote* GPU(s) with the same probe used locally.
 
-        nvidia-smi exits non-zero when the driver and library disagree, so the
-        exit code is ignored in favour of whatever it printed -- that text is the
-        diagnosis, and reporting "no GPU" instead would be actively misleading.
+        The probe's exit code is ignored in favour of what it printed: a
+        driver/library mismatch makes nvidia-smi exit non-zero, and that text
+        is the diagnosis the user needs to see.
         """
-        _, output = self._run_remote(
-            " ".join(shlex.quote(part) for part in NVIDIA_SMI_QUERY),
-            capture=True, timeout=20)
-        parsed = parse_nvidia_smi_gpus(output)
+        _, output = self._run_remote(build_full_probe(), capture=True, timeout=40)
+        parsed = parse_gpu_probe(output, self._last_stderr)
         if parsed is not None:
             return parsed
-
-        detail = [line.strip() for line in
-                  f"{output}\n{self._last_stderr}".splitlines() if line.strip()]
-        if any("nvidia-smi" in line and "not found" in line.lower() for line in detail):
-            return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0,
-                           device_name="No NVIDIA GPU on this host", supported=True)
-        if detail:
-            # e.g. "Failed to initialize NVML: Driver/library version mismatch"
-            return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0,
-                           device_name=detail[0][:140], supported=False)
         return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0,
-                       device_name="No NVIDIA GPU on this host", supported=True)
+                       device_name="No NVIDIA GPU or AMD GPU found on this host", supported=True)
 
     def total_ram_mb(self) -> float:
         _, output = self._run_remote("cat /proc/meminfo", capture=True, timeout=20)
@@ -620,8 +609,9 @@ class SSHServerConnection(IServerConnection):
         # The probe's exit status is whatever its last command returned, so a
         # host without a working nvidia-smi would otherwise throw away its
         # perfectly good CPU and RAM figures.
-        _, output = self._run_remote(build_usage_probe(), capture=True, timeout=30)
-        return parse_usage_probe(output, self._own_pids())
+        own = self._own_pids()
+        _, output = self._run_remote(build_usage_probe(own), capture=True, timeout=30)
+        return parse_usage_probe(output, own)
 
     def _own_pids(self) -> List[int]:
         pid = self._stored_pid
@@ -689,7 +679,7 @@ class SSHServerConnection(IServerConnection):
         # their own PID file rather than sharing one.
         start_cmd = (
             f"(cd {working_dir} && "
-            f"exec nohup {command} > {log_path} 2>&1 < /dev/null) & "
+            f"exec nohup {environment_prefix(self._config)}{command} > {log_path} 2>&1 < /dev/null) & "
             f"pid=$!; echo $pid > {pid_file}; echo $pid"
         )
         success, output = self._run_remote(start_cmd, capture=True)

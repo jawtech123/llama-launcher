@@ -6,7 +6,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-    QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox,
+    QLabel, QLineEdit, QComboBox, QSpinBox, QCheckBox, QPlainTextEdit,
     QGroupBox, QFormLayout, QDialog, QFileDialog,
     QMessageBox, QInputDialog, QSplitter, QListWidget, QListWidgetItem,
     QTextEdit, QTabWidget, QHeaderView,
@@ -21,6 +21,8 @@ from llama_launcher.remote.types import (
     LOCAL_SERVER_NAME,
     ServerConfig,
     ConnectionState,
+    environment_prefix,
+    parse_environment,
 )
 from llama_launcher.remote.manager import ServerManager, create_connection
 from llama_launcher.gui.dialogs.path_picker import (
@@ -121,6 +123,15 @@ class ServerEditDialog(QDialog):
             "Browse for the llama-server binary (needed when it is not on PATH)"))
         paths_layout.addRow("Log File:", self.log_file_edit)
         paths_layout.addRow("Server Port:", self.server_port_spin)
+        self.env_edit = QPlainTextEdit()
+        self.env_edit.setPlaceholderText(
+            "One KEY=VALUE per line, e.g.\nHSA_OVERRIDE_GFX_VERSION=11.0.0\nCUDA_VISIBLE_DEVICES=0")
+        self.env_edit.setMaximumHeight(64)
+        self.env_edit.setToolTip(
+            "Environment variables set for llama-server when this launcher starts it.\n"
+            "AMD cards that ROCm does not officially support usually need "
+            "HSA_OVERRIDE_GFX_VERSION; CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES pick a GPU.")
+        paths_layout.addRow("Environment:", self.env_edit)
         layout.addWidget(paths)
 
         connection = QGroupBox("Connection")
@@ -427,6 +438,7 @@ class ServerEditDialog(QDialog):
         self.server_path_edit.setText(self._config.llama_server_path)
         self.log_file_edit.setText(self._config.log_file)
         self.server_port_spin.setValue(self._config.server_port)
+        self.env_edit.setPlainText(self._config.environment or "")
         self.enabled_check.setChecked(self._config.enabled)
 
         self.model_dirs_list.clear()
@@ -488,7 +500,16 @@ class ServerEditDialog(QDialog):
             password=self.password_edit.text() if is_remote else "",
             remember_password=(
                 self.remember_password_check.isChecked() and is_remote and not auth_key),
+            environment=self.env_edit.toPlainText().strip(),
         )
+
+    def accept(self):
+        try:
+            parse_environment(self.env_edit.toPlainText())
+        except ValueError as e:
+            QMessageBox.warning(self, "Environment", f"{e}\n\nUse one KEY=VALUE per line.")
+            return
+        super().accept()
 
 
 class ServerListWidget(QWidget):
@@ -781,6 +802,11 @@ class ServerStatusWidget(QWidget):
         self.command_preview_text.setMaximumHeight(80)
         self.command_preview_text.setFontFamily("monospace")
         command_layout.addWidget(self.command_preview_text)
+        self.env_label = QLabel("")
+        self.env_label.setStyleSheet(f"color: {theme.FG_DIM}; font-size: 11px;")
+        self.env_label.setWordWrap(True)
+        self.env_label.setVisible(False)
+        command_layout.addWidget(self.env_label)
         layout.addWidget(command_group)
 
         control_layout = QHBoxLayout()
@@ -926,6 +952,10 @@ class ServerStatusWidget(QWidget):
         if getattr(self, '_closing', False):
             return
         self.command_preview_text.setPlainText(self._launch_command())
+        conn = self._manager.get_connection(self._selected_server)
+        prefix = environment_prefix(conn.config) if conn else ""
+        self.env_label.setText(f"Runs with: {prefix.strip()}" if prefix else "")
+        self.env_label.setVisible(bool(prefix))
         worker = _ServerStatusWorker(self._manager, self._selected_server)
         worker.setParent(self)
         worker.done.connect(self._on_status_done)

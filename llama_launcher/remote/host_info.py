@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
-from llama_launcher.gpu.types import GPUInfo
+from llama_launcher.gpu.types import GPUInfo, gpu_from_dict, gpu_to_dict
 from llama_launcher.utils.paths import config_file
 
 logger = logging.getLogger(__name__)
@@ -37,39 +37,8 @@ def _cache_file() -> Path:
     return config_file("hosts.json")
 
 
-def _gpu_to_dict(gpu: Optional[GPUInfo]) -> Optional[Dict]:
-    if gpu is None:
-        return None
-    return {
-        "backend": gpu.backend,
-        "vram_mb": gpu.vram_mb,
-        "available_vram_mb": gpu.available_vram_mb,
-        "device_name": gpu.device_name,
-        "driver_version": gpu.driver_version,
-        "supported": gpu.supported,
-        "gpu_count": gpu.gpu_count,
-        "gpu_infos": [_gpu_to_dict(sub) for sub in (gpu.gpu_infos or [])],
-    }
-
-
-def _gpu_from_dict(data: Optional[Dict]) -> Optional[GPUInfo]:
-    if not data:
-        return None
-    try:
-        nested = [g for g in (_gpu_from_dict(sub) for sub in data.get("gpu_infos", [])) if g]
-        return GPUInfo(
-            backend=data.get("backend", "cpu"),
-            vram_mb=int(data.get("vram_mb", 0)),
-            available_vram_mb=int(data.get("available_vram_mb", 0)),
-            device_name=data.get("device_name"),
-            driver_version=data.get("driver_version"),
-            supported=bool(data.get("supported", True)),
-            gpu_count=int(data.get("gpu_count", 1)),
-            gpu_infos=nested,
-        )
-    except (TypeError, ValueError):
-        logger.debug("Skipping malformed cached GPU entry", exc_info=True)
-        return None
+_gpu_to_dict = gpu_to_dict
+_gpu_from_dict = gpu_from_dict
 
 
 def _load_cache() -> Dict[str, Dict]:

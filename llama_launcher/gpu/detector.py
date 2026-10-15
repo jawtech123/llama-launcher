@@ -5,34 +5,49 @@ import subprocess
 import sys
 import re
 from typing import Optional
+from .probe import build_full_probe, build_live_probe, parse_gpu_probe
 from .types import GPUInfo
 
 logger = logging.getLogger(__name__)
 
 
 def detect_gpu() -> GPUInfo:
-    """Detect available GPU and backend.
+    """Detect the GPU(s) of this machine and the llama.cpp backend for them.
 
-    For CUDA, detects all GPUs and returns a GPUInfo with nested gpu_infos.
+    On POSIX hosts one shell probe covers NVIDIA (nvidia-smi), AMD (amd-smi,
+    rocm-smi, or the amdgpu sysfs files when ROCm is not installed) and
+    Vulkan-only devices; it is the same probe that describes remote hosts.
+    Windows falls back to calling nvidia-smi directly.
     """
-    # Check for CUDA (NVIDIA)
-    cuda_info = _detect_cuda()
-    if cuda_info:
-        return cuda_info
-
-    # Check for Metal (Apple macOS)
     if sys.platform == 'darwin':
         metal_info = _detect_metal()
         if metal_info:
             return metal_info
 
-    # Check for Vulkan
-    vulkan_info = _detect_vulkan()
-    if vulkan_info:
-        return vulkan_info
+    if sys.platform != 'win32':
+        info = run_gpu_probe()
+        if info:
+            return info
+    else:
+        cuda_info = _detect_cuda()
+        if cuda_info:
+            return cuda_info
+        vulkan_info = _detect_vulkan()
+        if vulkan_info:
+            return vulkan_info
 
-    # Fallback to CPU
     return GPUInfo(backend="cpu", vram_mb=0, available_vram_mb=0, device_name="CPU", supported=True)
+
+
+def run_gpu_probe(timeout: float = 20.0) -> Optional[GPUInfo]:
+    """Run the full GPU probe locally; None when nothing usable was found."""
+    try:
+        result = subprocess.run(["sh", "-c", build_full_probe()],
+                                capture_output=True, text=True, timeout=timeout)
+    except (subprocess.SubprocessError, OSError):
+        logger.debug("GPU probe failed", exc_info=True)
+        return None
+    return parse_gpu_probe(result.stdout, result.stderr)
 
 
 #: The nvidia-smi query whose output parse_nvidia_smi_gpus() understands. Shared
@@ -274,50 +289,23 @@ class VramSample:
 def sample_vram(own_pids=()) -> VramSample:
     """Read current GPU memory, attributing what our own processes hold.
 
-    Returns an invalid sample when there is no NVIDIA GPU, so callers can fall
+    Returns an invalid sample when there is no usable GPU, so callers can fall
     back to the totals from detection.
     """
     try:
-        totals = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total,memory.free",
-             "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if totals.returncode != 0 or not totals.stdout.strip():
-            return VramSample()
-        total_mb = free_mb = 0.0
-        for line in totals.stdout.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 2:
-                continue
-            try:
-                total_mb += float(parts[0])
-                free_mb += float(parts[1])
-            except ValueError:
-                continue
-        if total_mb <= 0:
-            return VramSample()
-
-        own_used_mb = 0.0
-        wanted = {int(p) for p in own_pids if p}
-        if wanted:
-            apps = subprocess.run(
-                ["nvidia-smi", "--query-compute-apps=pid,used_memory",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if apps.returncode == 0:
-                for line in apps.stdout.strip().splitlines():
-                    parts = [p.strip() for p in line.split(",")]
-                    if len(parts) < 2:
-                        continue
-                    try:
-                        if int(parts[0]) in wanted:
-                            own_used_mb += float(parts[1])
-                    except ValueError:
-                        continue
-        return VramSample(total_mb=total_mb, free_mb=free_mb,
-                          own_used_mb=own_used_mb, valid=True)
-    except Exception:
+        result = subprocess.run(["sh", "-c", build_live_probe(own_pids)],
+                                capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
         logger.debug("VRAM sample failed", exc_info=True)
         return VramSample()
+    return vram_sample_from_gpu(parse_gpu_probe(result.stdout), own_pids)
+
+
+def vram_sample_from_gpu(gpu: Optional[GPUInfo], own_pids=()) -> VramSample:
+    """Derive a VramSample from a live GPU reading."""
+    if gpu is None or gpu.vram_mb <= 0 or gpu.used_vram_mb < 0:
+        return VramSample()
+    wanted = {int(p) for p in own_pids if p}
+    own = sum(p.vram_mb for p in gpu.processes if p.pid in wanted)
+    return VramSample(total_mb=float(gpu.vram_mb), free_mb=float(gpu.vram_mb - gpu.used_vram_mb),
+                      own_used_mb=own, valid=True)

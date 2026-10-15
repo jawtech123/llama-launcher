@@ -37,7 +37,6 @@ from llama_launcher.gui.tabs.import_tab import ImportTab
 from llama_launcher.gui.tabs.models_tab import ModelsTab
 from llama_launcher.gui.tabs.preview_tab import PreviewTab
 from llama_launcher.gui import theme
-from llama_launcher.gui.widgets import format_gpu_info
 from llama_launcher.remote.host_info import (
     load_profile as load_host_profile, save_profile as save_host_profile,
 )
@@ -770,13 +769,14 @@ class LlamaLauncherGUI(QMainWindow):
         if profile is None:
             self.gpu_tab.set_staleness(
                 f"'{server_name}' has not been connected yet — connect to read its GPU.")
-            self.gpu_tab.set_info_text("No GPU information for this server.")
+            self.gpu_tab.set_profile(None)
+            self.gpu_tab.set_info_text("No GPU information for this server yet.")
             self._host_ram_mb = -1.0
             return
 
         self.gpu_info = profile.gpu or GPUInfo(backend="cpu", device_name="Unknown")
         self._host_ram_mb = profile.total_ram_mb
-        self.gpu_tab.set_info_text(format_gpu_info(self.gpu_info, profile.total_ram_mb))
+        self.gpu_tab.set_profile(self.gpu_info, profile.total_ram_mb)
         self.gpu_tab.set_staleness(
             "" if connected else
             f"Not connected — showing what '{server_name}' reported "
@@ -982,6 +982,7 @@ class LlamaLauncherGUI(QMainWindow):
             # Nothing is polled behind the user's back; a disconnected server
             # simply shows no live figures.
             self.resource_panel.clear_live_usage(name)
+            self.gpu_tab.clear_live()
             return
 
         self._rt_worker = UsageSampleWorker(self.server_manager, name)
@@ -997,6 +998,7 @@ class LlamaLauncherGUI(QMainWindow):
         if server_name != self._get_current_server():
             return
         self.resource_panel.update_live_usage(sample, server_name)
+        self.gpu_tab.update_live(sample.gpu)
         self._last_usage_sample = sample
         if self.benchmark_tab.is_recording():
             self.benchmark_tab.record_usage_sample(sample)

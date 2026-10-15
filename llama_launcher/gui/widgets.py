@@ -3,37 +3,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QSpinBox, QStyle, QToolButton, QWidget
 
 
-def format_gpu_info(gpu_info, total_ram_mb: float = -1.0) -> str:
-    """Render a GPUInfo for the GPU tab.
-
-    Shared by the local detection path and the per-server profile so both
-    describe hardware the same way.
-    """
-    if gpu_info is None:
-        return "No GPU information available."
-
-    lines = [
-        f"Backend: {gpu_info.backend}",
-        f"Device: {gpu_info.device_name or 'Unknown'}",
-        f"VRAM: {gpu_info.vram_mb} MB",
-    ]
-    if gpu_info.available_vram_mb > 0 and gpu_info.available_vram_mb != gpu_info.vram_mb:
-        lines.append(f"Available VRAM: {gpu_info.available_vram_mb} MB")
-    if gpu_info.driver_version:
-        lines.append(f"Driver: {gpu_info.driver_version}")
-    if total_ram_mb and total_ram_mb > 0:
-        lines.append(f"System RAM: {total_ram_mb / 1024:.1f} GB")
-    lines.append(f"Supported: {gpu_info.supported}")
-
-    if (gpu_info.gpu_infos or []) and len(gpu_info.gpu_infos) > 1:
-        lines.append("")
-        lines.append(f"--- {len(gpu_info.gpu_infos)} GPUs ---")
-        for index, gpu in enumerate(gpu_info.gpu_infos):
-            lines.append(f"GPU {index}: {gpu.device_name or 'Unknown'} "
-                         f"({gpu.vram_mb} MB, {gpu.available_vram_mb} MB free)")
-    return "\n".join(lines)
-
-
 def info_label(text: str, tooltip: str) -> QWidget:
     """Create a label with an information icon button showing a tooltip."""
     widget = QWidget()
