@@ -111,6 +111,11 @@ llama-launcher launch --preset "Small 8GB" --model model.gguf
 python -m pytest
 ```
 
+## License
+
+MIT, see [LICENSE](LICENSE). Qt/PySide6 is LGPLv3, see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
 ## Configuration & Data
 
 Runtime state lives in `~/.config/llama-launcher/` (honors `XDG_CONFIG_HOME`):

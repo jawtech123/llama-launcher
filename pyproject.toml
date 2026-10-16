@@ -3,7 +3,22 @@ name = "llama-launcher"
 version = "2.1.0"
 description = "A desktop + CLI application that generates and manages llama-server launch configurations"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jay Walker" }]
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/jawtech123/llama-launcher"
+Issues = "https://github.com/jawtech123/llama-launcher/issues"
 dependencies = [
     "PySide6>=6.5.0",
 ]

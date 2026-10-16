@@ -219,7 +219,7 @@ class LlamaLauncherGUI(QMainWindow):
             f"<b>llama-launcher</b> v{__version__}<br><br>"
             "Generates and manages llama-server launch configurations.<br><br>"
             "Created by Jay Walker.<br><br>"
-            "© 2026 Jay Walker. All rights reserved.<br>"
+            "© 2026 Jay Walker. Released under the MIT License.<br>"
             "Built with PySide6 (Qt), licensed under LGPLv3 — "
             "see THIRD-PARTY-NOTICES.md.")
 
